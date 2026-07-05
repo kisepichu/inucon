@@ -13,12 +13,12 @@
 ## Global Constraints
 
 - vmid 規約: `9000` = tpl-ubuntu-noble、`9100` = tpl-private-isu、`9200` = benchvm、チーム VM = `1000 + チーム番号×100 + 連番`(例: team1-1 → `1101`、team2-1 → `1201`)
-- IP 規約: チーム N のサブネット `10.100.N.0/24`、GW(eevee) `10.100.N.1`、benchvm `10.100.N.2`、チーム VM M 台目 `10.100.N.1M`(team1-1 → `10.100.1.11`)
+- IP 規約: チーム N のサブネット `10.100.N.0/24`、GW(eevee) `10.100.N.1`、benchvm `10.100.N.2`、チーム VM M 台目はホスト部 `10 + M`(team1-1 → `10.100.1.11`、team1-3 → `10.100.1.13`。M は最大 3 なので溢れない)
 - VM 名: `inucon-team{N}-{M}`。VNet 名: `team{N}`。SDN zone 名: `inucon`
 - スペック: チーム VM `2vCPU / 4GB / 20GB`、benchvm `4vCPU / 4GB`(スペックの公平性設計を参照。RAM 4GB 未満に下げない)
 - eevee: `192.0.2.10`(API: `https://192.0.2.10:8006`)。apphost: `192.0.2.20`
 - Phase 1 のチーム構成: 2 チーム × 1 台(team1-1, team2-1)。メンバーの GitHub アカウントは仮に全チーム `kisepichu`
-- コミットは必ず `/commit` スキルで行う。タスク単位で develop から切ったブランチに積み、`/pr` → `/pr-review` で develop へ入れる
+- コミットは必ず `/commit` スキルで行う。タスク単位で develop から切ったブランチに積み、`/pr` → `/pr-review` で develop へ入れる(`/commit` 等はこのリポジトリのオーナーのローカル Claude Code スキル。人間が手で作業する場合は「コミット → PR 作成 → レビュー」と読み替える)
 - Task 5(benchvm 定義)と Task 8 の NixOS 変更は `~/repos/nixos-config-private`(別リポジトリ)での作業。コミットはそのリポジトリの流儀(直コミット)でよい
 - 秘密情報(API トークン、tunnel credential)は git に入れない。Terraform は `terraform.tfvars`(gitignore 済み)、NixOS は agenix
 - Cloudflare の DNS / Access 設定は Phase 1 ではダッシュボード手動で行い、手順を runbook に記録する(TF 化は Phase 3 でポータル自動化と一緒に検討)
@@ -51,7 +51,8 @@ Expected: `qm list` に apphost(running)。ARC size が数 GB あり、「apphos
 
 ```bash
 echo 4294967296 > /sys/module/zfs/parameters/zfs_arc_max
-echo "options zfs zfs_arc_max=4294967296" > /etc/modprobe.d/zfs.conf
+cat /etc/modprobe.d/zfs.conf 2>/dev/null   # 既存設定の有無を確認(あれば重複キーに注意して統合)
+echo "options zfs zfs_arc_max=4294967296" > /etc/modprobe.d/zfs-arc-max.conf   # 専用ファイルにして既存を潰さない
 update-initramfs -u -k all
 free -h   # ARC が縮み available が増えることを確認(縮小は数分かかる場合あり)
 ```
@@ -74,6 +75,8 @@ Expected: `grep -A3 "dir: local" /etc/pve/storage.cfg` の content 行に snippe
 
 ```bash
 pveum user add terraform@pve --comment "inucon terraform"
+# Administrator は Phase 1 の簡便設定(トークン漏洩時の影響範囲が全体に及ぶ)。
+# Phase 3 でポータルに常駐させる際は VM.*/Datastore.*/SDN.* に絞ったカスタムロールへ移行する。
 pveum aclmod / -user terraform@pve -role Administrator
 pveum user token add terraform@pve tf --privsep 0
 ```
@@ -541,10 +544,9 @@ matsuu cfg が Proxmox で動かなかった場合: 素の Ubuntu VM を 9100 �
   users.users.kise = {
     isNormalUser = true;
     extraGroups = [ "wheel" ];
+    # hosts/apphost/configuration.nix の users.users.kise.openssh.authorizedKeys.keys と同じ 3 鍵をコピーする
     openssh.authorizedKeys.keys = [
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDpDOuDyuKLBk1yx1gllddSlS24VazMYx67BAvdajh4T kise@desktop"
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO+Njr/K9t1iQ15NhM852beR+qsMJXRrsJ6KYEM6OheJ kise@laptop"
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOu48S2bzp1N5siaQWGjrObpRY/5hIyCHydT86iCj7N/ kise@phone"
+      # (apphost と同じ公開鍵をここに)
     ];
   };
 
@@ -669,10 +671,11 @@ resource "proxmox_virtual_environment_file" "team_user_data" {
     file_name = "inucon-${each.key}.yaml"
     data = templatefile("${path.module}/templates/team-user-data.yaml.tftpl", {
       hostname = "inucon-${each.key}"
-      ssh_keys = distinct(flatten([
+      # compact: 鍵未登録/typo のユーザーで空行が混ざり cloud-config を壊すのを防ぐ
+      ssh_keys = distinct(compact(flatten([
         for u in each.value.github_users :
         split("\n", trimspace(data.http.github_keys[u].response_body))
-      ]))
+      ])))
     })
   }
 }
