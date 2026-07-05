@@ -119,11 +119,12 @@ Expected: パスワードなしで eevee に入れる。
 
 ```
 .terraform/
-.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 terraform.tfvars
 ```
+
+(`.terraform.lock.hcl` は provider バージョン固定のためコミットする)
 
 `infra/providers.tf`:
 
