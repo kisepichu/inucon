@@ -62,10 +62,12 @@ Expected: 再起動不要で available が増える。apphost は無停止。
 - [ ] **Step 3: local ストレージに snippets を許可**
 
 ```bash
-pvesm status                       # 現在の content を確認
-grep -A3 "dir: local" /etc/pve/storage.cfg
-# 既存の content 一覧に snippets を「追加」する(既存を消さないこと):
+grep -A5 "^dir: local$" /etc/pve/storage.cfg   # 現在の content 行を確認
+# 注意: pvesm set の --content は「追加」ではなく指定一覧への上書き。
+# 上で確認した既存一覧の末尾に snippets を足した文字列を指定する。
+# 例: content 行が backup,iso,vztmpl だった場合:
 pvesm set local --content backup,iso,vztmpl,snippets
+grep -A5 "^dir: local$" /etc/pve/storage.cfg   # 既存種別が残ったまま snippets が増えたことを確認
 mkdir -p /var/lib/vz/snippets
 ```
 
@@ -647,7 +649,7 @@ locals {
       "team${tnum}-${i}" => {
         team         = tnum
         vmid         = 1000 + tonumber(tnum) * 100 + i
-        ip           = "10.100.${tnum}.1${i}"
+        ip           = "10.100.${tnum}.${10 + i}" # ホスト部 = 10 + M (Global Constraints)
         github_users = t.github_users
       }
     }
