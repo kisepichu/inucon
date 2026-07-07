@@ -45,3 +45,9 @@ variable "teams" {
     error_message = "teams のキーは 1〜254 の数値文字列(先頭ゼロなし)にすること。IP の第 3 オクテット (10.100.<key>.0/24) に使われる。"
   }
 }
+
+variable "pve_ssh_username" {
+  description = "snippets アップロード等に使う Proxmox ノードへの SSH ユーザー(Phase 3 で最小権限ユーザーへの移行を検討)"
+  type        = string
+  default     = "root"
+}

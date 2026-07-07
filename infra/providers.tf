@@ -19,6 +19,6 @@ provider "proxmox" {
 
   ssh {
     agent    = true
-    username = "root"
+    username = var.pve_ssh_username
   }
 }
