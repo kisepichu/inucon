@@ -17,7 +17,7 @@ private-isu(Pixiv 社内 ISUCON 2016)の問題テンプレート VM を構築す
 ```bash
 scp problems/private-isu/user-data.build.yaml root@192.0.2.10:/var/lib/vz/snippets/private-isu-build.yaml
 ssh root@192.0.2.10 'bash -s' < problems/private-isu/build-template.sh
-# アプリ動作検証(下記)ののち
+# アプリ動作検証(下記)を行ったあと
 ssh root@192.0.2.10 'bash -s' < problems/private-isu/finalize-template.sh
 ```
 

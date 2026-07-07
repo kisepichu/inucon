@@ -5,7 +5,10 @@ VMID=9100
 
 qm guest exec "$VMID" -- bash -c \
   'cloud-init clean --logs && truncate -s 0 /etc/machine-id && rm -f /etc/ssh/ssh_host_*'
-qm shutdown "$VMID" --timeout 180
+qm shutdown "$VMID" --timeout 180 || {
+  echo "graceful shutdown failed; forcing stop" >&2
+  qm stop "$VMID"
+}
 qm set "$VMID" --name tpl-private-isu --delete cicustom --ipconfig0 ip=dhcp
 qm template "$VMID"
 echo "done: tpl-private-isu ($VMID)"

@@ -385,7 +385,12 @@ qm start "$VMID"
 
 echo "waiting for cloud-init (初回は 10 分以上かかる)..."
 SECONDS=0
+MAX_WAIT=${MAX_WAIT:-2400}
 while true; do
+  if [ "$SECONDS" -ge "$MAX_WAIT" ]; then
+    echo "timeout: cloud-init が ${MAX_WAIT}s 以内に完了しなかった。VM は残したままにする。" >&2
+    exit 1
+  fi
   out=$(qm guest exec "$VMID" -- cloud-init status 2>/dev/null || true)
   echo "$out" | grep -q "status: done" && break
   if echo "$out" | grep -q "status: error"; then
@@ -434,7 +439,10 @@ VMID=9100
 
 qm guest exec "$VMID" -- bash -c \
   'cloud-init clean --logs && truncate -s 0 /etc/machine-id && rm -f /etc/ssh/ssh_host_*'
-qm shutdown "$VMID" --timeout 180
+qm shutdown "$VMID" --timeout 180 || {
+  echo "graceful shutdown failed; forcing stop" >&2
+  qm stop "$VMID"
+}
 qm set "$VMID" --name tpl-private-isu --delete cicustom --ipconfig0 ip=dhcp
 qm template "$VMID"
 echo "done: tpl-private-isu ($VMID)"
