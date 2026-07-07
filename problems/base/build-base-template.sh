@@ -3,14 +3,20 @@
 set -euxo pipefail
 
 VMID=9000
-IMG=/root/noble-server-cloudimg-amd64.img
+# current を使う(最新のセキュリティ更新入りイメージで作る)。過去イメージで再現したい場合は
+# BASE_URL=https://cloud-images.ubuntu.com/releases/noble/release-YYYYMMDD 等で上書きする。
+BASE_URL=${BASE_URL:-https://cloud-images.ubuntu.com/noble/current}
+IMG_NAME=noble-server-cloudimg-amd64.img
+IMG=/root/$IMG_NAME
 
 if qm status "$VMID" &>/dev/null; then
   echo "vmid $VMID already exists" >&2
   exit 1
 fi
 
-wget -q -O "$IMG" https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+wget -q -O "$IMG" "$BASE_URL/$IMG_NAME"
+wget -q -O /root/SHA256SUMS "$BASE_URL/SHA256SUMS"
+(cd /root && grep "[ *]$IMG_NAME\$" SHA256SUMS | sha256sum -c -)
 
 qm create "$VMID" --name tpl-ubuntu-noble --ostype l26 \
   --memory 4096 --cores 2 --cpu host \
