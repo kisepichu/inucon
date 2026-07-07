@@ -28,6 +28,9 @@ matsuu の cloud-config が Proxmox(qm cicustom + NoCloud)でそのまま動く�
 - **構築所要時間**: スクリプト開始 02:54:16 JST → cloud-init 完了 03:08:12 JST(約 14 分。
   full clone 含む)。ゲスト内の cloud-init ログでは `finished ... Up 822.51 seconds`
   (VM 起動から約 13 分 43 秒)。Ansible の結果は `ok=93 changed=77 failed=0`。
+  なおスクリプト自身の `cloud-init done in NNNNs` 出力は、実行元 ssh セッションが
+  途中で切断されたため得られておらず、上記はゲスト内ログからの実測値(構築自体は
+  VM 内で継続するため切断の実害はない。長時間ビルドは tmux/nohup 推奨)。
 - **アプリ動作検証**: `curl http://<VM IP>/` → HTTP `200`。
 - **確認したサービス名**(すべて active/running):
   - `nginx.service`
