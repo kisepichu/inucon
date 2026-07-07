@@ -191,7 +191,7 @@ variable "teams" {
 `infra/terraform.tfvars.example`:
 
 ```hcl
-pve_api_token = "terraform@pve!tf=00000000-0000-0000-0000-000000000000"
+pve_api_token = "terraform@pve!tf=<REPLACE_WITH_TOKEN_VALUE>"
 ```
 
 `infra/sdn.tf`:
@@ -212,7 +212,8 @@ resource "proxmox_virtual_environment_sdn_vnet" "team" {
 resource "proxmox_virtual_environment_sdn_subnet" "team" {
   for_each = var.teams
 
-  subnet  = "10.100.${each.key}.0/24"
+  # provider >= 0.111 では引数名が subnet から cidr に変更されている
+  cidr    = "10.100.${each.key}.0/24"
   vnet    = proxmox_virtual_environment_sdn_vnet.team[each.key].id
   gateway = "10.100.${each.key}.1"
   snat    = true
