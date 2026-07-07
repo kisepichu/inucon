@@ -1,0 +1,11 @@
+#cloud-config
+hostname: ${hostname}
+users:
+  - name: isucon
+    groups: [sudo]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+%{ for key in ssh_keys ~}
+      - ${key}
+%{ endfor ~}
