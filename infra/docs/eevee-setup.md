@@ -65,6 +65,9 @@ cat /etc/modprobe.d/zfs.conf 2>/dev/null   # 既存設定の存在と値(6GiB)�
 # 既存の zfs.conf を書き換えて統合(実際に実行したコマンド):
 sed -i "s/zfs_arc_max=6442450944/zfs_arc_max=4294967296/" /etc/modprobe.d/zfs.conf
 rm /etc/modprobe.d/zfs-arc-max.conf   # WebUI シェルで作成済みだった重複ファイルを削除
+# 再実行する場合は値に依存しない冪等な形を使うこと:
+#   sed -i "s/^options zfs zfs_arc_max=.*/options zfs zfs_arc_max=4294967296/" /etc/modprobe.d/zfs.conf
+#   rm -f /etc/modprobe.d/zfs-arc-max.conf
 update-initramfs -u -k all
 free -h
 ```
@@ -138,7 +141,7 @@ ssh-copy-id root@192.0.2.10
 ssh root@192.0.2.10 hostname  # => eevee
 ```
 
-結果: Mac の公開鍵は root@eevee に**既に登録済み**であり、`ssh-copy-id` は "already exist" として skip された。`ssh root@192.0.2.10` でパスワードなしにログインできることを確認済み。
+結果: Mac の公開鍵は root@eevee に**既に登録済み**であり、`ssh-copy-id` は "All keys were skipped because they already exist on the remote system."(原文ママ)として skip された。`ssh root@192.0.2.10` でパスワードなしにログインできることを確認済み。
 
 注意: root への公開鍵登録はホスト全体の掌握と等価であり、鍵の漏洩・端末紛失時の影響が最も大きい。この構成は「自宅 LAN 内からのみ到達可能なホストへ、管理者本人の端末から接続する」前提の簡便設定である。bpg provider の snippets アップロードが SSH を要求するため Phase 1 では root を使うが、リスクを下げるなら (1) 専用ユーザー + 必要ディレクトリへの書き込み権限、(2) `authorized_keys` の `from="192.0.2.0/24"` オプションによる接続元制限、を検討する。
 
