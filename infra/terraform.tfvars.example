@@ -1,1 +1,1 @@
-pve_api_token = "terraform@pve!tf=00000000-0000-0000-0000-000000000000"
+pve_api_token = "terraform@pve!tf=<REPLACE_WITH_TOKEN_VALUE>"

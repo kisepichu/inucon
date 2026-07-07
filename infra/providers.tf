@@ -3,7 +3,7 @@ terraform {
   required_providers {
     proxmox = {
       source  = "bpg/proxmox"
-      version = ">= 0.80"
+      version = ">= 0.111.0, < 1.0.0"
     }
     http = {
       source  = "hashicorp/http"
@@ -13,9 +13,9 @@ terraform {
 }
 
 provider "proxmox" {
-  endpoint  = "https://192.0.2.10:8006"
+  endpoint  = var.pve_endpoint
   api_token = var.pve_api_token
-  insecure  = true # 自己署名証明書のため
+  insecure  = var.pve_insecure
 
   ssh {
     agent    = true
