@@ -55,15 +55,16 @@ ARC status:
 
 ## Step 2: ZFS ARC 上限を 4GiB に制限(即時 + 永続)
 
-計画からの変更点: 計画では `zfs-arc-max.conf` という専用ファイルを新規作成する想定だったが、確認したところ `/etc/modprobe.d/zfs.conf` が**既に存在**しており、PVE インストーラによる `options zfs zfs_arc_max=6442450944`(6GiB)が入っていた。この状態で計画どおり別ファイル `zfs-arc-max.conf` を追加すると、`/etc/modprobe.d/` はアルファベット順に読み込まれるため `zfs.conf`(6GiB)が `zfs-arc-max.conf`(4GiB)より後に読まれて再起動時に上書き・優先されてしまう。そのため **既存の `zfs.conf` の値を直接 4294967296 に書き換え、`zfs-arc-max.conf` は作成しない(=専用ファイル方式は不採用)** という方針に変更した。この書き換えのみ SSH 経由(Mac から `ssh root@192.0.2.10`)で実施した。
+計画からの変更点: 計画では `zfs-arc-max.conf` という専用ファイルを新規作成する想定だったが、確認したところ `/etc/modprobe.d/zfs.conf` が**既に存在**しており、PVE インストーラによる `options zfs zfs_arc_max=6442450944`(6GiB)が入っていた。この状態で計画どおり別ファイル `zfs-arc-max.conf` を追加すると、`/etc/modprobe.d/` はアルファベット順に読み込まれるため `zfs.conf`(6GiB)が `zfs-arc-max.conf`(4GiB)より後に読まれて再起動時に上書き・優先されてしまう。そのため方針を変更し、**既存の `zfs.conf` の値を直接 4294967296 に書き換え、(WebUI シェルで一度作成してしまった)`zfs-arc-max.conf` は削除して 1 ファイルに統合**した。この統合作業のみ SSH 経由(Mac から `ssh root@192.0.2.10`)で実施した。
 
 実行コマンド:
 
 ```bash
 echo 4294967296 > /sys/module/zfs/parameters/zfs_arc_max
 cat /etc/modprobe.d/zfs.conf 2>/dev/null   # 既存設定の存在と値(6GiB)を確認
-# 既存の zfs.conf を書き換え(zfs-arc-max.conf は作成しない)
-# options zfs zfs_arc_max=4294967296 に変更
+# 既存の zfs.conf を書き換えて統合(実際に実行したコマンド):
+sed -i "s/zfs_arc_max=6442450944/zfs_arc_max=4294967296/" /etc/modprobe.d/zfs.conf
+rm /etc/modprobe.d/zfs-arc-max.conf   # WebUI シェルで作成済みだった重複ファイルを削除
 update-initramfs -u -k all
 free -h
 ```
