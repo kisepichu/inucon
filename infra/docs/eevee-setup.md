@@ -7,7 +7,7 @@ Proxmox ホスト `eevee`(192.0.2.10)は Terraform をはじめとする以後�
 
 ## 実施日
 
-2026-07-08
+2026-07-08 (JST)
 
 ## 実施方法
 
@@ -121,6 +121,8 @@ pveum aclmod / -user terraform@pve -role Administrator
 pveum user token add terraform@pve tf --privsep 0
 ```
 
+`--privsep 0` はトークンがユーザー(terraform@pve)の権限をそのまま継承する設定。簡便な反面、トークン単体の漏洩がユーザー権限の漏洩と等価になる。より安全にするなら `--privsep 1` で発行し、トークン ID(`terraform@pve!tf`)に対して `pveum aclmod` で必要最小限の ACL を個別付与する選択肢がある(Phase 3 のカスタムロール移行時に合わせて検討)。
+
 結果: `full-tokenid = terraform@pve!tf` が発行された。**トークンの value(シークレット)はこの runbook には記載しない**(表示は一度きりのため、実施者が別途安全な方法で保管し、Task 3 の `terraform.tfvars` に設定する)。
 
 Administrator ロールの付与は Phase 1 における簡便設定であり、トークン漏洩時の影響範囲がクラスタ全体に及ぶ点に留意すること。Phase 3 でポータルに常駐させる際は `VM.*` / `Datastore.*` / `SDN.*` 等に絞ったカスタムロールへ移行する。
@@ -137,6 +139,8 @@ ssh root@192.0.2.10 hostname  # => eevee
 ```
 
 結果: Mac の公開鍵は root@eevee に**既に登録済み**であり、`ssh-copy-id` は "already exist" として skip された。`ssh root@192.0.2.10` でパスワードなしにログインできることを確認済み。
+
+注意: root への公開鍵登録はホスト全体の掌握と等価であり、鍵の漏洩・端末紛失時の影響が最も大きい。この構成は「自宅 LAN 内からのみ到達可能なホストへ、管理者本人の端末から接続する」前提の簡便設定である。bpg provider の snippets アップロードが SSH を要求するため Phase 1 では root を使うが、リスクを下げるなら (1) 専用ユーザー + 必要ディレクトリへの書き込み権限、(2) `authorized_keys` の `from="192.0.2.0/24"` オプションによる接続元制限、を検討する。
 
 ---
 
