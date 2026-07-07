@@ -389,6 +389,7 @@ MAX_WAIT=${MAX_WAIT:-2400}
 while true; do
   if [ "$SECONDS" -ge "$MAX_WAIT" ]; then
     echo "timeout: cloud-init が ${MAX_WAIT}s 以内に完了しなかった。VM は残したままにする。" >&2
+    echo "状況確認: qm guest exec $VMID -- cloud-init status" >&2
     exit 1
   fi
   out=$(qm guest exec "$VMID" -- cloud-init status 2>/dev/null || true)
