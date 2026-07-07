@@ -17,6 +17,13 @@ locals {
 data "http" "github_keys" {
   for_each = local.all_github_users
   url      = "https://github.com/${each.key}.keys"
+
+  lifecycle {
+    postcondition {
+      condition     = self.status_code == 200
+      error_message = "GitHub ユーザー ${each.key} の公開鍵取得に失敗 (HTTP ${self.status_code})。ユーザー名の typo の可能性。"
+    }
+  }
 }
 
 resource "proxmox_virtual_environment_file" "team_user_data" {
@@ -29,11 +36,13 @@ resource "proxmox_virtual_environment_file" "team_user_data" {
     file_name = "inucon-${each.key}.yaml"
     data = templatefile("${path.module}/templates/team-user-data.yaml.tftpl", {
       hostname = "inucon-${each.key}"
-      # compact: 鍵未登録/typo のユーザーで空行が混ざり cloud-config を壊すのを防ぐ
-      ssh_keys = distinct(compact(flatten([
-        for u in each.value.github_users :
-        split("\n", trimspace(data.http.github_keys[u].response_body))
-      ])))
+      # 公開鍵形式の行だけ通す(非 200 応答は postcondition で弾くが、念のため本文もフィルタ)
+      ssh_keys = distinct([
+        for line in compact(flatten([
+          for u in each.value.github_users :
+          split("\n", trimspace(data.http.github_keys[u].response_body))
+        ])) : line if can(regex("^(ssh-|ecdsa-|sk-)", line))
+      ])
     })
   }
 }
