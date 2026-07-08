@@ -188,14 +188,14 @@ deploy/            apphost k3s マニフェスト(Deployment/Service/Ingress/PVC
 
 ### 1. 認証(GitHub OAuth + セッション)
 
-- ログイン: `GET /auth/github` → GitHub authorize へリダイレクト → `GET /auth/github/callback?code=` → code をトークン交換(HttpClient、調査メモ §11)→ GitHub API でユーザー情報取得 → users を upsert → セッション発行
+- ログイン: `GET /auth/github` → ランダムな `state` を発行し(短命 cookie に保存)GitHub authorize へリダイレクト → `GET /auth/github/callback?code=&state=` で **`state` を必須検証**(不一致は 400。login CSRF 対策)→ code をトークン交換(HttpClient、調査メモ §11)→ GitHub API でユーザー情報取得 → users を upsert → セッション発行。PKCE は GitHub OAuth Apps がサーバーサイドフローで強制検証しないため採用せず、`state` + client secret(confidential client)で担保する
 - セッション: ランダム 256bit の sessionId を `sessions` テーブルに保存し、HttpOnly + Secure + SameSite=Lax の cookie で持つ。有効期限 30 日。JWT は使わない(失効管理が面倒、身内規模で DB 参照コストは無視できる)
 - 認可は HttpApiMiddleware で実装(調査メモ §3 の現行形):
   - `Authentication`(cookie → CurrentUser 提供)
   - `AdminOnly`(CurrentUser.isAdmin 必須)
   - `RunnerAuth`(`Authorization: Bearer <RUNNER_TOKEN>`、runner グループ専用)
 - admin の初期付与: 環境変数 `ADMIN_GITHUB_LOGINS`(カンマ区切り)に載っている githubLogin はログイン時に isAdmin=true
-- GitHub OAuth App の client secret / RUNNER_TOKEN / セッション署名鍵は `Config.redacted` で扱う(ログ非出力)
+- GitHub OAuth App の client secret / RUNNER_TOKEN は `Config.redacted` で扱う(ログ非出力)。セッションは DB 保存のランダム ID なので署名鍵は不要(改ざんは DB 照合で無効化される)
 
 ### 2. HTTP API(HttpApi グループ設計)
 
