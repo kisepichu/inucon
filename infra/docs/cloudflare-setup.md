@@ -56,12 +56,20 @@ benchvm 側の NixOS 設定は `hosts/benchvm/configuration.nix` の
 
 ダッシュボード操作を避け、API トークン(`infra/.cf-api-token`)で作成した。
 ポリシーは既存の `apphost ssh` アプリと同じ「メール個別許可」方式
-(Phase 1 は全チーム = kisepichu@gmail.com)。
+(Phase 1 の現行許可リストはオーナーのメール 1 件のみ)。
+
+トークンを curl の引数に直接展開すると同一ホストの他プロセスから `ps` で見えうるため、
+ヘッダーファイル経由で渡す(初回に一度だけ作成。gitignore 済み):
+
+```bash
+umask 077
+printf 'Authorization: Bearer %s\n' "$(cat infra/.cf-api-token)" > infra/.cf-auth-header
+```
 
 ```bash
 ACC=0000000000000000000000000000a001
 curl -sS --fail-with-body -X POST "https://api.cloudflare.com/client/v4/accounts/$ACC/access/apps" \
-  -H "Authorization: Bearer $(cat infra/.cf-api-token)" \
+  -H @infra/.cf-auth-header \
   -H "Content-Type: application/json" \
   --data '{
     "name": "inucon team1 ssh (inucon-team1-1)",
@@ -70,25 +78,26 @@ curl -sS --fail-with-body -X POST "https://api.cloudflare.com/client/v4/accounts
     "session_duration": "24h",
     "policies": [{
       "name": "team1 members", "decision": "allow", "precedence": 1,
-      "include": [{"email": {"email": "kisepichu@gmail.com"}}]
+      "include": [{"email": {"email": "<許可するメール>"}}]
     }]
   }'
 ```
 
-**メンバー追加**(実 ID 込みのコピペ可能な例。team1 に 1 人足す場合):
+**メンバー追加/変更**(実 ID 込みの例。`include` は**この PUT の内容で全置換される**ため、
+許可したい全メールを毎回明示的に列挙すること — 古い許可のコピペ残りを防ぐ):
 
 ```bash
 ACC=0000000000000000000000000000a001
 APP=0000cccc-0000-4000-8000-000000000001           # team1 アプリ(team2: 0000cccc-0000-4000-8000-000000000002)
 POL=0000dddd-0000-4000-8000-000000000001           # team1 members(team2: 0000dddd-0000-4000-8000-000000000002)
 curl -sS --fail-with-body -X PUT "https://api.cloudflare.com/client/v4/accounts/$ACC/access/apps/$APP/policies/$POL" \
-  -H "Authorization: Bearer $(cat infra/.cf-api-token)" \
+  -H @infra/.cf-auth-header \
   -H "Content-Type: application/json" \
   --data '{
     "name": "team1 members", "decision": "allow", "precedence": 1,
     "include": [
-      {"email": {"email": "kisepichu@gmail.com"}},
-      {"email": {"email": "<参加者のメール>"}}
+      {"email": {"email": "<メンバー1のメール>"}},
+      {"email": {"email": "<メンバー2のメール>"}}
     ]
   }'
 ```

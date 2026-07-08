@@ -4,3 +4,4 @@
 *.tfvars
 *.tfvars.json
 .cf-api-token
+.cf-auth-header
