@@ -3,8 +3,7 @@
 ## 背景・問題
 
 Task 6(`infra/team-vms.tf`)の検証で、チーム VM 間(`team1-1` ↔ `team2-1`)の通信が
-遮断されずに到達してしまう問題が見つかった(詳細は `.superpowers/sdd/task-6-report.md` の
-「チーム間分離失敗の原因調査」参照)。
+遮断されずに到達してしまう問題が見つかった。
 
 原因は Proxmox SDN の `simple` ゾーン(`infra/sdn.tf`)の仕様:
 
@@ -83,7 +82,8 @@ systemctl status inucon-team-isolation.service
 
 ## 検証結果(2026-07-08 実施)
 
-すべて eevee 経由の `qm guest exec`、および benchvm(`kise@192.0.2.14`)から実施。
+すべて eevee 経由の `qm guest exec`、および benchvm(`kise@192.0.2.14`、検証当時の IP。
+その後の再構築で現在は 192.0.2.5)から実施。
 
 ```
 == team1(1101) -> team2(10.100.2.11), 期待値 ISOLATED ==
@@ -97,7 +97,7 @@ ISOLATED
 == team1(1101) outbound curl https://github.com, 期待値 200 ==
 200
 
-== benchvm(kise@192.0.2.14) -> team1(10.100.1.11) / team2(10.100.2.11), 期待値 両方成功 ==
+== benchvm(kise@192.0.2.14、検証当時の IP。その後の再構築で現在は 192.0.2.5) -> team1(10.100.1.11) / team2(10.100.2.11), 期待値 両方成功 ==
 10.100.1.11: 64 bytes, 0% packet loss
 10.100.2.11: 64 bytes, 0% packet loss
 

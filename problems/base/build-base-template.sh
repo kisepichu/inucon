@@ -14,6 +14,8 @@ if qm status "$VMID" &>/dev/null; then
   exit 1
 fi
 
+# ダウンロードした image は /root に残置(約 3.5GiB)。再実行時に再利用されるため
+# 意図的に削除しない。不要になったら手動削除
 wget -q -O "$IMG" "$BASE_URL/$IMG_NAME"
 wget -q -O /root/SHA256SUMS "$BASE_URL/SHA256SUMS"
 (cd /root && grep "[ *]$IMG_NAME\$" SHA256SUMS | sha256sum -c -)
