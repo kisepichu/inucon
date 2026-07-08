@@ -12,7 +12,7 @@
 
 - ライブラリバージョン(`docs/superpowers/research/2026-07-09-effect-ts-current-practices.md` で確定): `effect@^3.21.4`, `@effect/platform@^0.96.0`, `@effect/platform-node@^0.107.0`, `@effect/sql@^0.51.0`, `@effect/sql-sqlite-node@^0.52.0`, `@effect/vitest@^0.29.0`, `vitest@^3.2.0`。**Effect v4(Beta)の API(`effect/unstable/*`)は使わない**
 - 旧 API 禁止: `Effect.gen(function* (_) { ... })` の adapter 形 / `@effect/schema` import / 非クラス形 `Context.Tag<Id, S>()`。現行形は調査メモの「新旧書き分け」表に従う
-- 層の依存規則: `portal/src/domain/` は effect の **Schema / Either / Option / Data / Match のみ** import 可(`Effect.Effect` 型・Layer・Context は禁止)。`application/` は domain と port(Context.Tag)のみ。Layer 合成は `portal/src/main.ts` の 1 箇所
+- 層の依存規則: `portal/src/domain/` は effect の **Schema / Either / Option / Data / Match のみ** import 可(`Effect.Effect` 型・Layer・Context は禁止)。`application/` は domain・自層で宣言する port(Context.Tag)・effect コア(Effect / Either / Option / Clock / Context / Layer 型)に依存してよいが、infrastructure(adapter 実装)は import しない。Layer 合成は `portal/src/main.ts` の 1 箇所
 - キュー不変条件(スペック §BenchJob): チームごと queued+running 合計 1 本まで / 全体で running 1 本まで / targetIp はチームサブネット `10.100.<teamNumber>.0/24` 内のみ / enqueue は Contest が running のときのみ / cancel は queued のみ(running は 409)/ running が `JOB_TIMEOUT`(既定 10 分)進捗途絶で failed
 - IP のサブネット判定は**オクテット単位の数値比較**で行う(文字列 prefix 比較は `10.100.1` が `10.100.10.5` に誤マッチするため禁止)
 - セッション cookie: HttpOnly + Secure + SameSite=Lax、有効期限 30 日。OAuth は `state` 必須検証。secret 類(GITHUB_CLIENT_SECRET / RUNNER_TOKEN)は `Config.redacted`
@@ -74,7 +74,7 @@ packages:
   - runner
 ```
 
-ルート `package.json`(private, scripts: `test: pnpm -r test`, `typecheck: pnpm -r typecheck`)。`tsconfig.base.json` は `strict: true`, `module: nodenext`, `target: es2022`, `moduleResolution: nodenext`。`shared` と `portal` の package.json は Global Constraints のバージョンで依存を宣言(portal は `shared: workspace:*` も)。portal の scripts には `"dev": "tsx watch src/main.ts"`, `"build": "tsc -p tsconfig.json"`, `"test": "vitest run"`, `"typecheck": "tsc --noEmit"` を定義し、devDependencies に `tsx` を追加する。
+ルート `package.json`(private, scripts: `test: pnpm -r test`, `typecheck: pnpm -r typecheck`)。`tsconfig.base.json` は `strict: true`, `module: nodenext`, `target: es2022`, `moduleResolution: nodenext`。`shared` と `portal` の package.json は Global Constraints のバージョンで依存を宣言(portal は `shared: workspace:*` も)。portal の scripts には `"dev": "tsx watch src/main.ts"`, `"build": "tsc -p tsconfig.json"`, `"test": "vitest run"`, `"typecheck": "tsc --noEmit"` を定義し(tsconfig の `outDir` は `dist` — Task 11 の Dockerfile が `portal/dist/main.js` を実行する前提)、devDependencies に `tsx` を追加する。
 
 - [ ] **Step 2: health エンドポイントの失敗テストを書く**
 
@@ -166,11 +166,11 @@ export const isTimedOut: (job: BenchJob, now: number, timeoutMillis: number) => 
 ```
 
 - [ ] **Step 1: 失敗テストを書く。**ケースは最低限以下(値まで具体的に):
-  - subnet: `ipInTeamSubnet("10.100.1.11", 1) === true` / `("10.100.2.11", 1) === false` / **`("10.100.10.5", 1) === false`(prefix 誤マッチ検出)** / `("10.100.1.999", 1) === false`(不正オクテット)/ `("::1", 1) === false`
+  - subnet: `ipInTeamSubnet("10.100.1.11", 1) === true` / `("10.100.2.11", 1) === false` / **`("10.100.10.5", 1) === false`(prefix 誤マッチ検出)** / `("10.100.1.999", 1) === false`(不正オクテット)/ `("10.100.01.11", 1) === false`(先頭ゼロ拒否)/ `("::1", 1) === false`
   - contest: preparing→start→running→finish→finished が成功、`startContest(running)` と `finishContest(preparing)` が `Either.left(InvalidContestTransition)`
   - benchJob: `checkEnqueueAllowed` の 4 分岐(contest preparing → ContestNotRunning / activeJobCountForTeam=1 → TeamJobAlreadyQueued / 外部 IP → TargetIpOutOfSubnet / 全て満たす → right)。`startJob(queued)` 成功・`startJob(running)` left。`cancelJob(queued)` 成功・`cancelJob(running)` は `CannotCancelRunning`・`cancelJob(finished)` は left。`finishJob`/`failJob` は running からのみ。`isTimedOut`: running + lastProgressAt=0, now=600_001, timeout=600_000 → true、599_999 → false、queued → 常に false
 - [ ] **Step 2: テストが失敗することを確認**(`pnpm --filter portal test`)
-- [ ] **Step 3: 実装。**遷移関数は `job.status` の分岐(`Match.value` か素朴な switch)+ `new BenchJob({ ...job, ... })` のイミュータブル更新。subnet は `ip.split(".")` → 4 要素・各 0-255 の整数(先頭ゼロ許容しない `/^\d{1,3}$/` + Number 変換)→ `[10, 100, teamNumber]` と前 3 オクテット一致
+- [ ] **Step 3: 実装。**遷移関数は `job.status` の分岐(`Match.value` か素朴な switch)+ `new BenchJob({ ...job, ... })` のイミュータブル更新。subnet は `ip.split(".")` → 4 要素・各オクテットが `/^(0|[1-9]\d{0,2})$/` に一致(先頭ゼロ拒否)かつ Number 変換で 0-255 → `[10, 100, teamNumber]` と前 3 オクテット一致
 - [ ] **Step 4: テスト全緑 + typecheck**
 - [ ] **Step 5: /commit → /pr → /pr-review → マージ**
 
@@ -452,7 +452,8 @@ poll → job なし: 2 秒 sleep(`Schedule.spaced`)→ 再 poll。job あり: `C
 ### Task 10: フロントエンド SPA + 静的配信
 
 **Files:**
-- Create: `portal/web/`(Vite react-ts テンプレート。`pnpm create vite` 相当の構成を手書きで): `package.json`, `vite.config.ts`, `index.html`, `src/main.tsx`, `src/App.tsx`, `src/api.ts`(fetch ラッパ、credentials: "same-origin")、`src/pages/{Login,Scoreboard,Team,JobDetail,Admin}.tsx`
+- Create: `portal/web/`(Vite react-ts テンプレート。`pnpm create vite` 相当の構成を手書きで): `package.json`(**`"name": "web"`** — `pnpm --filter web` はこの name を参照する)、`vite.config.ts`, `index.html`, `src/main.tsx`, `src/App.tsx`, `src/api.ts`(fetch ラッパ、credentials: "same-origin")、`src/pages/{Login,Scoreboard,Team,JobDetail,Admin}.tsx`
+- Modify: `pnpm-workspace.yaml`(packages に `portal/web` を追加 — Task 1 時点では未登録)
 - Create: `portal/src/infrastructure/http/static.ts`(`web/dist` の配信: `/assets/*` はファイル、その他非 `/api`・非 `/auth` パスは `index.html`。パストラバーサル対策として resolve 後に dist 配下チェック)
 - Modify: `portal/src/main.ts`, ルート `package.json`(build スクリプト: web build → portal build)
 
@@ -474,7 +475,7 @@ poll → job なし: 2 秒 sleep(`Schedule.spaced`)→ 再 poll。job あり: `C
 ### Task 11: デプロイ(apphost k3s + benchvm systemd)+ seed
 
 **Files:**
-- Create: `deploy/Dockerfile`(multi-stage: `node:22-slim` + pnpm → web build + portal build → 実行イメージは `node dist/main.js`)
+- Create: `deploy/Dockerfile`(multi-stage: `node:22-slim` + pnpm → web build + portal build → 実行ステージは workspace の本番 node_modules(`pnpm deploy --prod` か `--filter portal... install --prod`)+ `portal/dist` + `portal/web/dist` を含め、`CMD ["node", "portal/dist/main.js"]` — Task 1 で定めた outDir=dist と整合)
 - Create: `deploy/k8s/{namespace,deployment,service,ingress,pvc}.yaml`(namespace `inucon`、replicas=1、PVC `local-path` 1Gi を `/data` に、`DB_PATH=/data/portal.db`、secret `inucon-portal-env` から env 注入)
 - Create: `deploy/README.md`(runbook: イメージ build/push、secret 作成、apply 手順、cloudflared ホスト名追加手順)
 - Create: `portal/src/infrastructure/sql/seed.ts`(起動時: contests が空なら `{ name: "INUCON", problemKey: "private-isu", status: "preparing" }` を INSERT — 冪等)
