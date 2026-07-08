@@ -45,7 +45,7 @@ recipients は `secrets/secrets.nix` の定義どおり(benchvm-host + ユーザ
 
 ```bash
 age -r "<benchvm-host鍵>" -r "<macos鍵>" -r "<desktop鍵>" -r "<redmi鍵>" \
-  -o secrets/cloudflared-inucon.age <UUID>.json
+  -o secrets/cloudflared-inucon.age ~/.cloudflared/<UUID>.json
 ```
 
 benchvm 側の NixOS 設定は `hosts/benchvm/configuration.nix` の
@@ -60,7 +60,7 @@ benchvm 側の NixOS 設定は `hosts/benchvm/configuration.nix` の
 
 ```bash
 ACC=0000000000000000000000000000a001
-curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$ACC/access/apps" \
+curl -sS --fail-with-body -X POST "https://api.cloudflare.com/client/v4/accounts/$ACC/access/apps" \
   -H "Authorization: Bearer $(cat infra/.cf-api-token)" \
   -H "Content-Type: application/json" \
   --data '{
@@ -81,7 +81,7 @@ curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$ACC/access/apps"
 ACC=0000000000000000000000000000a001
 APP=0000cccc-0000-4000-8000-000000000001           # team1 アプリ(team2: 0000cccc-0000-4000-8000-000000000002)
 POL=0000dddd-0000-4000-8000-000000000001           # team1 members(team2: 0000dddd-0000-4000-8000-000000000002)
-curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/$ACC/access/apps/$APP/policies/$POL" \
+curl -sS --fail-with-body -X PUT "https://api.cloudflare.com/client/v4/accounts/$ACC/access/apps/$APP/policies/$POL" \
   -H "Authorization: Bearer $(cat infra/.cf-api-token)" \
   -H "Content-Type: application/json" \
   --data '{
@@ -107,7 +107,7 @@ curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/$ACC/access/apps/$
 
 ## 4. 参加者の接続方法
 
-`~/.ssh/config` に追加([cloudflared のインストール](https://developers.cloudflare.com/cloudflare-one/connections/connect-devices/warp/download-warp/)が必要):
+`~/.ssh/config` に追加([cloudflared のインストール](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)が必要。macOS: `brew install cloudflared`):
 
 ```
 Host inucon-*.kisen.one
