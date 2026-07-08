@@ -1,7 +1,9 @@
 # INUCON 設計ドキュメント
 
 日付: 2026-07-04
-ステータス: 承認済み (2026-07-05)
+ステータス: 承認済み (2026-07-05) / **Phase 1 完了 (2026-07-08)**
+
+Phase 1(手動 MVP)は 2026-07-08 に完了した。実測・検証結果は「リスク・未確認事項」節と「リソース計画」節に追記済み。以後 Phase 2(ポータル)の設計・実装に進む。
 
 ## 背景・目的
 
@@ -47,6 +49,8 @@ AI の登場で ISUCON の競技性は「当日手でチューニングを詰め
 | 外部アクセス   | Cloudflare Tunnel + Access。VPN には入れない                                               |
 | ホスト名       | フラット命名 `inucon-*.kisen.one`(sub-subdomain は無料プランで TLS 不可のため)             |
 | 認証           | GitHub OAuth(SSH 鍵も GitHub 登録鍵を流用するため一貫する)                                 |
+
+> **Phase 1 での逸脱注記(2026-07-08)**: 上記「認証」はポータル(Phase 2)の GitHub OAuth を指し、これは変更なし。一方 Cloudflare **Access**(チーム SSH の認可)は当初想定した「GitHub IdP」を Phase 1 では採用せず、既存 Zero Trust 組織(`example.cloudflareaccess.com`)のログイン方式 + メール許可リストで運用した(GitHub OAuth App 新規作成というブラウザ作業を避けるため。詳細: `infra/docs/cloudflare-setup.md` の設計メモ)。IdP を GitHub に切り替える必要が生じたら開催前に追加する。
 
 ## 全体アーキテクチャ
 
@@ -125,6 +129,23 @@ eevee (Proxmox, 6C12T/28GB)
 - vCPU はアイドル VM が多いためオーバーコミット許容。ベンチ実行中のみ対象チーム VM + benchvm が CPU を使う。
 - ディスク: linked clone のため競技 VM の増分はわずか。local-zfs の空きは十分(1.79TB 中ほぼ未使用)。
 
+### 実測(2026-07-08、Phase 1 完了時点)
+
+- **eevee 実メモリ**: 28.1GiB(前提節の「約 28GB」を実測で確認)。使用中 14GiB の内訳は
+  apphost 8GiB + ZFS ARC 3.7GiB + PVE ホスト約 2GiB(下記リスク項目 2 の検証結果)。
+  ARC 上限を PVE インストーラ既定の 6GiB から **4GiB に変更・`/etc/modprobe.d/zfs.conf` に統合**
+  (`infra/docs/eevee-setup.md`)。この変更後、Phase 1 のフル構成
+  (apphost 8G + benchvm 4G + チーム VM 4G×2 = 20G + ARC 4G = 24G)は 28.1GiB に問題なく収まった。
+- **benchvm**: 起動〜SSH 可能まで約 28 秒(wait-online 無効化前は約 120 秒)。
+  ディスクは cloud-init の growPartition で 4.6G → 21G に拡張して運用(ベンチ用画像展開の
+  容量不足対策。詳細は `problems/private-isu/README.md` のベンチ実行節)。
+- **テンプレート実容量**: `tpl-private-isu`(vmid 9100)は 7.24G(`zfs list` 実測、
+  `problems/private-isu/README.md`)。linked clone によるチーム VM 側の追加ディスク使用量は
+  わずか。
+- **linked clone 所要時間**: チーム VM 2 台の `terraform apply` が 18.9〜19.4 秒。
+- **ベンチ実行中のホスト負荷**: eevee は約 81% アイドル・スワップなしで余裕あり(下記リスク
+  項目 7 参照)。apphost の既存サービスへの影響は確認されなかった。
+
 ## 命名規則
 
 - 物理/基盤: `eevee`(Proxmox ホスト)、`apphost`(ポータル+既存サービス)、`benchvm`(ベンチ)
@@ -156,7 +177,38 @@ docs/      本ドキュメント等
 ## リスク・未確認事項
 
 - matsuu/cloud-init-isucon の Proxmox 動作は未検証(汎用 cloud-config なので動く見込みだが Phase 1 冒頭で確認。`cicustom` 使用時は GUI の IP/SSH 鍵設定が無効になるため user-data 側に統合する)
+  → **解決済み(2026-07-08)**: 動作した。実ファイルは `private-isu/app.cfg`。qemu-guest-agent
+  対応(packages 追加 + runcmd 先頭で enable --now)を統合した cloud-config を snippets +
+  `cicustom` で投入し構築成功(ゲスト内実測 803〜822 秒 ≈ 13.4 分、Ansible `ok=93 changed=77
+  failed=0`)。フォールバック(ansible-isucon 直接適用)は不要だった。詳細:
+  `problems/private-isu/README.md`。
 - eevee の使用中 RAM 14GB の内訳が未確認(apphost 8GB + 残り 6GB が何か)
+  → **解決済み(2026-07-08)**: ARC 仮説どおり。apphost 8GiB + ZFS ARC 3.7GiB + PVE ホスト
+  約 2GiB。ARC 上限は 6GiB(PVE インストーラ設定、`/etc/modprobe.d/zfs.conf` に既存)だった
+  ものを 4GiB に変更・統合済み(`infra/docs/eevee-setup.md`)。
 - 縮小スペック(特にベンチの `/initialize` タイムアウト)は問題ごとに Phase 1 で実測
+  → **解決済み(2026-07-08)**: private-isu について 2vCPU/4GB で通ることを確認。`/initialize`
+  通過、3 回連続 `pass:true`(score 1032/1030/1041、fail:0、ばらつき約 1%)、実行時間約 77 秒
+  (60 秒本負荷完走)。ただし前提として下記「(新規発見)ベンチ環境バグ」の恒久修正が必要
+  だった。
 - Effect.ts は学習コストが高い(Phase 1 と並行して素振りする前提)
+  → Phase 1(手動 MVP)ではポータルに未着手のため未検証。Phase 2 冒頭で引き続き検証する。
 - Cloudflare Access 無料枠は 50 ユーザーまで(身内規模では十分)
+  → Phase 1 では Access アプリ 2 件・メール許可ポリシーで運用し、枠超過の懸念は発生しな
+  かった(`infra/docs/cloudflare-setup.md`)。
+- **(新規発見・2026-07-08)ベンチ環境バグ**: private-isu ベンチマーカー(Go
+  `net/http.Client`)が画像投稿 `POST /` への 302 を追従して送る `GET /posts/:id` に、元
+  POST の `Content-Type: multipart/form-data; boundary=...` をそのまま引き継ぐ(Go 標準
+  ライブラリの既定動作)。一方 Rack 3.2.6 の `Request#form_data?` は HTTP メソッドを見ず
+  Content-Type の値だけで multipart 判定するため、ボディの無い GET を multipart 解析しようと
+  して `400 Bad Request` になり、ベンチが本負荷フェーズに到達する前に `pass:false` で終了
+  する(タイミング非依存・100% 決定的)。nginx リバースプロキシ層で GET/HEAD の
+  Content-Type を除去する恒久パッチ(`problems/private-isu/patch-app.sh`)を作成し、
+  テンプレートに焼き込んで解決した(再ベンチ 3 回とも `pass:true`)。
+- **(新規発見・2026-07-08)チーム間ネットワーク分離**: Proxmox SDN Simple zone はデフォルトで
+  は vnet 間ルーティングを遮断しない(zone 分離だけではチーム間到達性が残る)。eevee の
+  `FORWARD` チェーンに `10.100.0.0/16 → 10.100.0.0/16 DROP` ルールを追加し、再起動後も
+  失われないよう systemd unit(`inucon-team-isolation.service`)で永続化して解決した。
+  双方向 ISOLATED であること、および SNAT・ベンチ経路に悪影響がないことを検証済み
+  (`infra/docs/team-isolation.md`)。この分離ルールは Terraform 管理外(手動 + systemd
+  unit)であり、IaC 化は Issue #6 でフォローアップする。
