@@ -75,14 +75,35 @@ curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$ACC/access/apps"
   }'
 ```
 
-**メンバー追加**: 該当アプリのポリシー `include` 配列に
-`{"email": {"email": "<参加者のメール>"}}` を追加して PUT する
-(`/access/apps/<app_id>/policies/<policy_id>`)。チーム VM 側の SSH 鍵は
-Terraform の `var.teams.github_users` に GitHub アカウントを足して apply。
+**メンバー追加**(実 ID 込みのコピペ可能な例。team1 に 1 人足す場合):
 
-設計メモ: スペックでは「GitHub IdP」としていたが、Phase 1 は既存 Zero Trust
-組織のログイン方式 + メール許可リストで運用する(GitHub OAuth App の作成という
-ブラウザ作業を避けるため。IdP 追加は開催前に必要になったら実施)。
+```bash
+ACC=0000000000000000000000000000a001
+APP=0000cccc-0000-4000-8000-000000000001           # team1 アプリ(team2: 0000cccc-0000-4000-8000-000000000002)
+POL=0000dddd-0000-4000-8000-000000000001           # team1 members(team2: 0000dddd-0000-4000-8000-000000000002)
+curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/$ACC/access/apps/$APP/policies/$POL" \
+  -H "Authorization: Bearer $(cat infra/.cf-api-token)" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "name": "team1 members", "decision": "allow", "precedence": 1,
+    "include": [
+      {"email": {"email": "kisepichu@gmail.com"}},
+      {"email": {"email": "<参加者のメール>"}}
+    ]
+  }'
+```
+
+チーム VM 側の SSH 鍵は Terraform の `var.teams.github_users` に GitHub アカウントを
+足して apply。
+
+設計メモ:
+- スペックでは「GitHub IdP」としていたが、Phase 1 は既存 Zero Trust 組織
+  (auth domain: `example.cloudflareaccess.com`)に設定済みのログイン方式 +
+  メール許可リストで運用する(既存の `apphost ssh` アプリと同方式。GitHub OAuth App
+  の作成というブラウザ作業を避けるため。IdP 追加は開催前に必要になったら実施)
+- `cloudflared-inucon.age` の recipients は benchvm-host + ユーザー鍵 3 つの 4 鍵
+  (既存 secret 群の apphost-host に相当するのが benchvm-host。apphost はこの secret を
+  読む必要がないため recipients に含めていない)
 
 ## 4. 参加者の接続方法
 
@@ -104,7 +125,10 @@ ssh inucon-team1-1.kisen.one   # 初回はブラウザが開いて Access 認証
   (isucon ユーザーで hostname 確認)。2 アプリ目は組織セッションの引き継ぎで
   ブラウザ操作なしに認可された
 - Tunnel は Cloudflare edge (nrt) に 4 コネクション登録
-- 未許可アカウントの拒否は Access の default-deny(ポリシー外は全部拒否)による。
-  別アカウントでの実測は未実施 — 身内開催の前に一度確認しておくとよい
+- 未認証アクセスの遮断は実測済み: `curl https://inucon-team1-1.kisen.one/` →
+  **HTTP 302 で example.cloudflareaccess.com のログインへリダイレクト**(オリジン非到達)
+- 「許可リスト外のアカウントでログインした場合の拒否」は Access の default-deny に
+  よる設計保証だが、別アカウントでの実測は未実施 — **身内開催の前に必ず一度確認する
+  (TODO、Phase 1 クローズ時の申し送り)**
 - VPN・家 LAN への到達経路は存在しない(トンネルの ingress は各チーム VM の
   22 番と 404 のみ)
