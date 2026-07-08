@@ -46,6 +46,8 @@ nginx リバースプロキシ層で **GET/HEAD リクエストのみ** upstream
 
 - `/etc/nginx/conf.d/strip-get-content-type.conf`(新規): `map $request_method $upstream_content_type { default $http_content_type; GET ""; HEAD ""; }`
 - `/etc/nginx/sites-available/isucon.conf` の `location /` に `proxy_set_header Content-Type $upstream_content_type;` を 1 行追加
+  (`sites-enabled/isucon.conf` は `sites-available/isucon.conf` への symlink で同一実体。
+  デバッグレポートの `sites-enabled` 表記と本書の `sites-available` 表記は同じファイルを指す)
 
 matsuu 由来の `user-data.build.yaml` は原本無改変ポリシーのため変更せず、
 ビルドフローの独立ステップ(`patch-app.sh`、`qm guest exec 9100` 経由)として適用する。
@@ -216,7 +218,7 @@ ssh kise@<benchvm> 'cd private-isu/benchmarker && ./bin/benchmarker -u ./userdat
   (`/initialize` タイムアウトではなく、CPU を倍にしても症状が不変)。
 - 検証後、`qm set 1101 --cores 2` → `qm reboot 1101` で 2vCPU に復旧済み。
 
-### 根本原因の切り分け(read-after-write の競合と推定)
+### 根本原因の切り分け(read-after-write の競合と推定)[この仮説は後の調査で誤りと判明。正しい原因は上記「恒久修正パッチ」参照]
 
 `curl` で同じ POST → redirect 追跡を手動再現したところ:
 

@@ -30,6 +30,7 @@ qm status "$VMID" &>/dev/null || { echo "vmid $VMID が存在しない" >&2; exi
 read -r -d '' GUEST_SCRIPT <<'GUEST_EOF' || true
 set -euxo pipefail
 CONF_D=/etc/nginx/conf.d/strip-get-content-type.conf
+# sites-enabled/isucon.conf は sites-available/isucon.conf への symlink(同一実体、実機確認済み)
 SITE_CONF=/etc/nginx/sites-available/isucon.conf
 
 # GET/HEAD の Content-Type を空にする map(新規ファイル。上書きなので冪等)。
@@ -49,6 +50,11 @@ NGINX_MAP
 if ! grep -q 'upstream_content_type' "$SITE_CONF"; then
   sed -i '/proxy_set_header Host \$host;/a\    proxy_set_header Content-Type $upstream_content_type;' "$SITE_CONF"
 fi
+# sed はアンカー行が見つからなくても黙って成功するため、挿入結果を必ず検証する
+grep -q 'upstream_content_type' "$SITE_CONF" || {
+  echo "FATAL: $SITE_CONF への proxy_set_header 挿入に失敗(アンカー行の書式変更?)" >&2
+  exit 1
+}
 
 nginx -t
 systemctl reload nginx
