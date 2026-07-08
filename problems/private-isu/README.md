@@ -164,6 +164,7 @@ cd private-isu/benchmarker
    展開(198ファイル, 93MB)して `img.zip` を削除。これでベンチは正常に動作した
    (画像バリエーションが全量 10,005 枚中 198 枚に減るが、ベンチ動作自体には支障なし)。
    **benchvm のディスクは 4.6GB → 実運用では増設を推奨**(懸念として記録)。
+   [→ その後 21G に拡張済み+growPartition 有効化(spec の実測節参照)]
 3. `unzip`/`gcc` は `nix shell nixpkgs#<pkg> -c <cmd>` で都度取得する運用で問題なし。
 
 ```bash

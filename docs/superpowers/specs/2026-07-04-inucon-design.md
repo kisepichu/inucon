@@ -78,7 +78,7 @@ eevee (Proxmox, 6C12T/28GB)
 - **テンプレート作成**: matsuu/cloud-init-isucon の cloud-config を Ubuntu cloud イメージに一度流して問題環境を構築し(初回 10 分超)、`qm template` 化。以後はチーム分を linked clone(数秒)で払い出す。テンプレート化時に machine-id / SSH ホスト鍵のリセットを行う。
 - **静的 IaC(Terraform, bpg/proxmox provider)**: テンプレート、benchvm、SDN Zone/VNet などの土台。リポジトリの `infra/` に置く。
 - **動的払い出し(ポータルから)**: Terraform ではなく Proxmox API を直接叩く(clone / status / destroy)。インスタンス追加ボタンの実体。
-- **cloud-init 注入**: チームメンバーの GitHub アカウントから `ssh_import_id: gh:<user>` で SSH 鍵を投入。IP は静的割り当て(`10.100.<team>.1<n>` = team{N}-{n} の規則)。snippets は `local` ストレージ(Content に Snippets を追加)+ `cicustom` で渡す。
+- **cloud-init 注入**: チームメンバーの GitHub アカウントから `ssh_import_id: gh:<user>` で SSH 鍵を投入(Phase 1 実装: TF 側で `data.http` により `https://github.com/<user>.keys` を取得し user-data に埋め込む方式。`ssh_import_id` は不採用 — VM の外部到達に依存するため)。IP は静的割り当て(`10.100.<team>.1<n>` = team{N}-{n} の規則)。snippets は `local` ストレージ(Content に Snippets を追加)+ `cicustom` で渡す。
 - **ガード**: (1) チームごとのインスタンス上限(コンテスト設定、全チーム同数)、(2) クローン前に Proxmox API でホスト空き RAM を確認し不足なら拒否、(3) VM スペックは固定(2vCPU/4GB)でチーム間の同一性を保証。
 - **普段使い**: 同じ払い出し層で `inucon-<app>` VM を作れる。競技用と同じ仕組みの別テナント扱い。
 
@@ -137,8 +137,9 @@ eevee (Proxmox, 6C12T/28GB)
   (`infra/docs/eevee-setup.md`)。この変更後、Phase 1 のフル構成
   (apphost 8G + benchvm 4G + チーム VM 4G×2 = 20G + ARC 4G = 24G)は 28.1GiB に問題なく収まった。
 - **benchvm**: 起動〜SSH 可能まで約 28 秒(wait-online 無効化前は約 120 秒)。
-  ディスクは cloud-init の growPartition で 4.6G → 21G に拡張して運用(ベンチ用画像展開の
-  容量不足対策。詳細は `problems/private-isu/README.md` のベンチ実行節)。
+  ディスクは 4.6G → 21G に拡張済み(2026-07-08 に growpart/resize2fs をオンラインで実施済み、
+  現在 21G/16% 使用。ベンチ用画像展開の容量不足対策。詳細は `problems/private-isu/README.md`
+  のベンチ実行節)。
 - **テンプレート実容量**: `tpl-private-isu`(vmid 9100)は 7.24G(`zfs list` 実測、
   `problems/private-isu/README.md`)。linked clone によるチーム VM 側の追加ディスク使用量は
   わずか。

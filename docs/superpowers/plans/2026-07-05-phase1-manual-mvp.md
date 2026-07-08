@@ -33,7 +33,7 @@ eevee に手を入れる唯一の「手作業」タスク。以後の全タス�
 - Create: `infra/docs/eevee-setup.md`(実行したコマンドと出力を記録する runbook)
 
 **Interfaces:**
-- Produces: `terraform@pve!tf` API トークン(Task 3 の `terraform.tfvars` に入れる)、snippets が置ける `local` ストレージ、Mac から `ssh root@192.0.2.10` できる状態
+- Produces: `terraform@pve!tf` API トークン(Task 2 の `terraform.tfvars` に入れる)、snippets が置ける `local` ストレージ、Mac から `ssh root@192.0.2.10` できる状態
 
 - [ ] **Step 1: 現状把握(RAM 内訳・ZFS ARC)**
 

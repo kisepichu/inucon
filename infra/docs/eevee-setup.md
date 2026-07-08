@@ -126,7 +126,7 @@ pveum user token add terraform@pve tf --privsep 0
 
 `--privsep 0` はトークンがユーザー(terraform@pve)の権限をそのまま継承する設定。簡便な反面、トークン単体の漏洩がユーザー権限の漏洩と等価になる。より安全にするなら `--privsep 1` で発行し、トークン ID(`terraform@pve!tf`)に対して `pveum aclmod` で必要最小限の ACL を個別付与する選択肢がある(Phase 3 のカスタムロール移行時に合わせて検討)。
 
-結果: `full-tokenid = terraform@pve!tf` が発行された。**トークンの value(シークレット)はこの runbook には記載しない**(表示は一度きりのため、実施者が別途安全な方法で保管し、Task 3 の `terraform.tfvars` に設定する)。
+結果: `full-tokenid = terraform@pve!tf` が発行された。**トークンの value(シークレット)はこの runbook には記載しない**(表示は一度きりのため、実施者が別途安全な方法で保管し、Task 2 の `terraform.tfvars` に設定する)。
 
 Administrator ロールの付与は Phase 1 における簡便設定であり、トークン漏洩時の影響範囲がクラスタ全体に及ぶ点に留意すること。Phase 3 でポータルに常駐させる際は `VM.*` / `Datastore.*` / `SDN.*` 等に絞ったカスタムロールへ移行する。
 

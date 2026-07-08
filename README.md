@@ -34,7 +34,7 @@ Phase 2(ポータル)以降の計画は設計ドキュメントの「フェー�
 
 ```
 infra/     Terraform(テンプレート・チーム VM・SDN の定義)、eevee 等の runbook (infra/docs/)
-problems/  問題テンプレートの構築手順(cloud-config)とアダプタ
+problems/  問題テンプレートの構築手順(cloud-config)とアダプタ(アダプタは Phase 2 で追加予定)
 docs/      設計ドキュメント・実装計画
 ```
 
