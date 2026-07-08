@@ -10,15 +10,55 @@ private-isu(Pixiv 社内 ISUCON 2016)の問題テンプレート VM を構築す
 | --- | --- |
 | `user-data.build.yaml` | matsuu の `app.cfg` に qemu-guest-agent(packages 追加 + runcmd 先頭で enable --now)を統合した cloud-config |
 | `build-template.sh` | eevee 上で実行。tpl-ubuntu-noble (9000) を full clone して 9100 を作り、cloud-init 完了までポーリング |
+| `patch-app.sh` | eevee 上で実行。ベンチ失敗の恒久修正(下記)を nginx 設定へ適用して reload。冪等 |
 | `finalize-template.sh` | eevee 上で実行。cloud-init clean 等のクリーンアップ後にテンプレート化 |
 
-## 使い方
+## 使い方(build → patch → 検証 → finalize)
 
 ```bash
 scp problems/private-isu/user-data.build.yaml root@192.0.2.10:/var/lib/vz/snippets/private-isu-build.yaml
 ssh root@192.0.2.10 'bash -s' < problems/private-isu/build-template.sh
-# アプリ動作検証(下記)を行ったあと
+# ベンチ失敗の恒久修正パッチを適用(必須。下記「恒久修正パッチ」参照)
+ssh root@192.0.2.10 'bash -s' < problems/private-isu/patch-app.sh
+# アプリ動作検証(下記)とパッチ効果確認を行ったあと
 ssh root@192.0.2.10 'bash -s' < problems/private-isu/finalize-template.sh
+```
+
+## 恒久修正パッチ(patch-app.sh)
+
+### 根本原因(詳細: `.superpowers/sdd/task-7-debug.md`)
+
+private-isu ベンチマーカー(Go `net/http.Client`)は画像投稿 `POST /` への 302 を
+自動追従して `GET /posts/:id` を送る際、**同一ホスト内リダイレクトでは元 POST の
+`Content-Type: multipart/form-data; boundary=...` ヘッダをボディの無い GET にも
+そのまま引き継ぐ**(Go 標準ライブラリの既定動作)。一方 Rack 3.2.6 の
+`Request#form_data?` は **HTTP メソッドを見ず Content-Type の値だけで multipart
+判定する**ため、ボディの無い GET を multipart として解析しようとして
+`Rack::Multipart::EmptyContentError` → Sinatra が `400 Bad Request` を返す。
+ベンチは起動直後のサニティチェック(`postImageScenario`)でこの 400 を踏んで
+1 件 fail し、即 `pass:false` 終了する(60 秒の本負荷フェーズに到達しない)。
+タイミング非依存の 100% 決定的なバグ。
+
+### 修正内容
+
+nginx リバースプロキシ層で **GET/HEAD リクエストのみ** upstream(Unicorn)へ渡す
+`Content-Type` を空にする(POST 等ボディを伴うリクエストには影響しない)。
+
+- `/etc/nginx/conf.d/strip-get-content-type.conf`(新規): `map $request_method $upstream_content_type { default $http_content_type; GET ""; HEAD ""; }`
+- `/etc/nginx/sites-available/isucon.conf` の `location /` に `proxy_set_header Content-Type $upstream_content_type;` を 1 行追加
+
+matsuu 由来の `user-data.build.yaml` は原本無改変ポリシーのため変更せず、
+ビルドフローの独立ステップ(`patch-app.sh`、`qm guest exec 9100` 経由)として適用する。
+スクリプトは冪等(二重適用ガード付き。何度実行しても同じ結果)で、適用後に
+`nginx -t` と `systemctl reload nginx` を行う。
+
+### 効果確認(eevee から。`<VMのIP>` は `qm guest cmd 9100 network-get-interfaces` で確認)
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" http://<VMのIP>/          # -> 200(通常動作)
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -H "Content-Type: multipart/form-data; boundary=x" http://<VMのIP>/posts/1
+# -> 200(パッチ前は 400。これがベンチ fail の再現条件)
 ```
 
 ## 実測記録(2026-07-08 構築)
@@ -44,7 +84,50 @@ matsuu の cloud-config が Proxmox(qm cicustom + NoCloud)でそのまま動く�
   rpool/data/vm-9100-cloudinit    76K   904G    76K  -
   ```
 
+## 実測記録(2026-07-08 パッチ焼き込み再ビルド)
+
+恒久修正パッチをテンプレートに焼き込むため、テンプレート(9100)とチーム VM を
+破棄して build → patch → 検証 → finalize → terraform apply を通しで再実施した。
+
+- **再ビルド所要時間**: `build-template.sh` の `cloud-init done in 803s`(約 13.4 分。
+  full clone 含む)。
+- **patch-app.sh 適用**: `nginx -t` OK → reload OK。再実行して冪等性も確認
+  (`proxy_set_header Content-Type` 行が重複しないこと)。
+- **効果確認**(eevee から、パッチ適用後・finalize 前):
+  - `GET /` → `200`
+  - `GET /posts/1`(`Content-Type: multipart/form-data; boundary=x` 付き)→ `200`
+    (パッチ前は `400`)
+- **チーム VM 再払い出し**: `terraform apply` 19.4 秒(4 added / 0 destroyed。
+  linked clone のため高速)。
+- **再ベンチ(benchvm → team1-1 = 10.100.1.11, 2vCPU/4GB)3 回**、全て `pass:true` / `fail:0`:
+
+  | 回 | score | success | fail | 実行時間 |
+  | --- | --- | --- | --- | --- |
+  | 1 | 1032 | 899 | 0 | 1m17.6s |
+  | 2 | 1030 | 897 | 0 | 約1m17s |
+  | 3 | 1041 | 908 | 0 | 約1m17s |
+
+  実行時間は毎回約 77 秒(60 秒の本負荷フェーズ + 10 秒待機 + 前処理)で、
+  本負荷フェーズを完走している。スコアのばらつきは 1030〜1041(約 1%)と小さく、
+  順番実行なら計測として十分安定している。
+- **ベンチ中の eevee ホスト負荷**(run 1 中に `top -b -n3 -d5; free -h` で取得):
+
+  ```
+  load average: 0.53, 0.39, 0.65
+  %Cpu(s): 9.1 us, 9.1 sy, 81.1 id
+  MiB Mem: 28802.9 total, 8493.3 free, 19982.4 used, 805.9 buff/cache
+  ```
+
+  team1-1 の kvm プロセスが CPU 約 109%(2vCPU 中 約 1.1 コア相当)、ホスト全体は
+  81% アイドルで余裕あり。スワップ使用なし。2vCPU/4GB で 60 秒本負荷を問題なく
+  完走できることを確認した。
+
 ## ベンチ実行(benchvm から)(2026-07-08 実測)
+
+> **注**: 本節の `pass:false` は調査時点の記録。その後の再調査で根本原因は
+> read-after-write 競合ではなく「Go リダイレクト GET の Content-Type 引き継ぎ ×
+> Rack 3.2.6 の multipart 判定」と判明し(`.superpowers/sdd/task-7-debug.md`)、
+> 上記「恒久修正パッチ」で解消済み(再ベンチ 3 回 `pass:true`)。
 
 benchvm(192.0.2.5, NixOS)から inucon-team1-1(10.100.1.11, 2vCPU/4GB, vmid 1101)
 に対して private-isu の公式ベンチマーカーを実行し、縮小スペックでの動作を検証した。
