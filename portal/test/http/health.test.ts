@@ -21,7 +21,7 @@ const TestLayer = Layer.mergeAll(HttpServerLive, MigratorTest, NodeHttpServer.la
 it.effect("GET /api/health は { status: \"ok\" } を返す", () =>
   Effect.gen(function* () {
     const client = yield* HttpApiClient.make(api)
-    const result = yield* client.health.get()
+    const result = yield* client.health.getHealth()
     expect(result).toEqual({ status: "ok" })
   }).pipe(Effect.provide(TestLayer))
 )
