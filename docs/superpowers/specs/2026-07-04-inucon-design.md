@@ -195,8 +195,8 @@ docs/      本ドキュメント等
 - Effect.ts は学習コストが高い(Phase 1 と並行して素振りする前提)
   → Phase 1(手動 MVP)ではポータルに未着手のため未検証。Phase 2 冒頭で引き続き検証する。
 - Cloudflare Access 無料枠は 50 ユーザーまで(身内規模では十分)
-  → Phase 1 では Access アプリ 2 件・メール許可ポリシーで運用し、枠超過の懸念は発生しな
-  かった(`infra/docs/cloudflare-setup.md`)。
+  → Phase 1 では Access アプリ 2 件・メール許可ポリシーで運用し、枠超過の懸念は
+  発生しなかった(`infra/docs/cloudflare-setup.md`)。
 - **(新規発見・2026-07-08)ベンチ環境バグ**: private-isu ベンチマーカー(Go
   `net/http.Client`)が画像投稿 `POST /` への 302 を追従して送る `GET /posts/:id` に、元
   POST の `Content-Type: multipart/form-data; boundary=...` をそのまま引き継ぐ(Go 標準
@@ -206,8 +206,8 @@ docs/      本ドキュメント等
   する(タイミング非依存・100% 決定的)。nginx リバースプロキシ層で GET/HEAD の
   Content-Type を除去する恒久パッチ(`problems/private-isu/patch-app.sh`)を作成し、
   テンプレートに焼き込んで解決した(再ベンチ 3 回とも `pass:true`)。
-- **(新規発見・2026-07-08)チーム間ネットワーク分離**: Proxmox SDN Simple zone はデフォルトで
-  は vnet 間ルーティングを遮断しない(zone 分離だけではチーム間到達性が残る)。eevee の
+- **(新規発見・2026-07-08)チーム間ネットワーク分離**: Proxmox SDN Simple zone は
+  デフォルトでは vnet 間ルーティングを遮断しない(zone 分離だけではチーム間到達性が残る)。eevee の
   `FORWARD` チェーンに `10.100.0.0/16 → 10.100.0.0/16 DROP` ルールを追加し、再起動後も
   失われないよう systemd unit(`inucon-team-isolation.service`)で永続化して解決した。
   双方向 ISOLATED であること、および SNAT・ベンチ経路に悪影響がないことを検証済み
