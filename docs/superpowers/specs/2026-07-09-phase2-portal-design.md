@@ -58,7 +58,7 @@ Phase 2 のもう一つの目的は **Effect.ts + DDD の実践**である。doc
 - フィールド: `id`, `name`, `problemKey`, `status`
 - 状態機械: `preparing → running → finished`(前方一方向)
 - 不変条件: **ベンチの enqueue は `running` のときだけ許可**(閉会後・準備中の誤爆を防ぐ)
-- Phase 2 では 1 レコードのみ(seed で作成し admin API で状態遷移)。複数開催は Phase 4
+- Phase 2 では 1 レコードのみ(seed で作成し admin API で状態遷移)。複数開催はスコープ節のとおり Phase 3 以降
 
 ```mermaid
 stateDiagram-v2
@@ -220,7 +220,7 @@ piscon-portal-v2 / 本家 portal と同じ **DB テーブル + status カラム�
 
 - enqueue(ユースケース): `withTransaction` 内で (a) Contest が running か、(b) チームに queued/running が無いか、(c) targetIp がチームサブネット内か、を検証して INSERT
 - dequeue(runner poll): `withTransaction` 内で「`running` が全体に 1 本も無いこと」を確認し、`UPDATE bench_jobs SET status='running', started_at=... WHERE id = (SELECT id FROM bench_jobs WHERE status='queued' ORDER BY enqueued_at LIMIT 1) RETURNING *` のアトミック更新。空なら 204 相当(`Option.none`)を返す
-- SQLite は単一プロセス・WAL なのでこの排他で十分。行ロック競合の考慮は不要
+- 排他の根拠: ポータルは単一 Node プロセスで、better-sqlite3(@effect/sql-sqlite-node)は同期実行の単一コネクションのため、書き込みはプロセス内で直列化される。`SQLITE_BUSY` が起きうるのは複数コネクション/複数プロセスで書き込む構成にした場合で、その際は `busy_timeout` の設定が必要(Phase 2 の構成では該当しない)
 - タイムアウト回収: ポータル内の常駐 fiber(`Layer.scopedDiscard` + `Effect.repeat(Schedule.spaced("30 seconds"))`、調査メモ §12)が「`running` かつ最終進捗更新から `JOB_TIMEOUT` 経過」を `failed` に落とす
 
 ### 4. ベンチランナー(benchvm)
