@@ -44,6 +44,13 @@ variable "teams" {
     ])
     error_message = "teams のキーは 1〜254 の数値文字列(先頭ゼロなし)にすること。IP の第 3 オクテット (10.100.<key>.0/24) に使われる。"
   }
+
+  validation {
+    condition = alltrue([
+      for k, t in var.teams : t.instances >= 0 && t.instances <= 3
+    ])
+    error_message = "instances は 0〜3 にすること(設計上のクォータ。また vmid = 1000 + チーム×100 + 連番 のため大きい値は隣接チームのレンジと衝突する)。"
+  }
 }
 
 variable "pve_ssh_username" {

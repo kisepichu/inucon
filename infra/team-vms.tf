@@ -24,6 +24,10 @@ data "http" "github_keys" {
       condition     = self.status_code == 200
       error_message = "GitHub ユーザー ${each.key} の公開鍵取得に失敗 (HTTP ${self.status_code})。ユーザー名の typo の可能性。"
     }
+    postcondition {
+      condition     = can(regex("(?m)^(ssh-|ecdsa-|sk-)", self.response_body))
+      error_message = "GitHub ユーザー ${each.key} に登録済みの公開鍵が 1 件もない。このままだと VM に SSH できないため中断する。"
+    }
   }
 }
 

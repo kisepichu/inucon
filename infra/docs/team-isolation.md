@@ -62,15 +62,16 @@ After=network.target pve-firewall.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/sh -c 'iptables -C FORWARD -s 10.100.0.0/16 -d 10.100.0.0/16 -j DROP 2>/dev/null || iptables -I FORWARD 1 -s 10.100.0.0/16 -d 10.100.0.0/16 -j DROP'
+ExecStart=/bin/sh -c 'while iptables -D FORWARD -s 10.100.0.0/16 -d 10.100.0.0/16 -j DROP 2>/dev/null; do :; done; iptables -I FORWARD 1 -s 10.100.0.0/16 -d 10.100.0.0/16 -j DROP'
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-`ExecStart` は `iptables -C`(チェック)で既存ルールの有無を確認し、無い場合のみ
-`-I`(挿入)する冪等な実装になっている。そのため再起動時だけでなく、手動で
-`systemctl restart inucon-team-isolation.service` しても二重にルールが積まれない。
+`ExecStart` は同一ルールを全て削除してから先頭(位置 1)へ 1 個だけ挿入するため、
+**存在だけでなく順序も含めて冪等**になっている(他のルールが先頭に追加されて DROP が
+後ろへ押し出された場合も、`systemctl restart inucon-team-isolation.service` で先頭に
+戻せる)。二重挿入も起きない。
 
 有効化:
 
