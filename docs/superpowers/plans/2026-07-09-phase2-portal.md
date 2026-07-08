@@ -18,7 +18,7 @@
 - セッション cookie: HttpOnly + Secure + SameSite=Lax、有効期限 30 日。OAuth は `state` 必須検証。secret 類(GITHUB_CLIENT_SECRET / RUNNER_TOKEN)は `Config.redacted`
 - テスト: domain は素の vitest、Effect 絡みは `it.effect`(時間は TestClock)。DB テストは SQLite `:memory:` + Migrator
 - コミットは `/commit` スキル(`git commit --no-gpg-sign`)。タスクごとに develop からブランチ → PR → `/pr-review` → マージ(Phase 1 と同じ運用)
-- 各タスクの実装者は着手前にスペックの該当節を読むこと(このファイルと同じ PR でマージ済み)
+- 各タスクの実装者は着手前にスペックの該当節を読むこと(`docs/superpowers/specs/2026-07-09-phase2-portal-design.md`。PR #11 でマージ済み)
 
 ## ファイル構造(全体像)
 
@@ -74,7 +74,7 @@ packages:
   - runner
 ```
 
-ルート `package.json`(private, scripts: `test: pnpm -r test`, `typecheck: pnpm -r typecheck`)。`tsconfig.base.json` は `strict: true`, `module: nodenext`, `target: es2022`, `moduleResolution: nodenext`。`shared` と `portal` の package.json は Global Constraints のバージョンで依存を宣言(portal は `shared: workspace:*` も)。
+ルート `package.json`(private, scripts: `test: pnpm -r test`, `typecheck: pnpm -r typecheck`)。`tsconfig.base.json` は `strict: true`, `module: nodenext`, `target: es2022`, `moduleResolution: nodenext`。`shared` と `portal` の package.json は Global Constraints のバージョンで依存を宣言(portal は `shared: workspace:*` も)。portal の scripts には `"dev": "tsx watch src/main.ts"`, `"build": "tsc -p tsconfig.json"`, `"test": "vitest run"`, `"typecheck": "tsc --noEmit"` を定義し、devDependencies に `tsx` を追加する。
 
 - [ ] **Step 2: health エンドポイントの失敗テストを書く**
 
@@ -438,7 +438,7 @@ export interface ProblemAdapter {
 export interface BenchResult { readonly passed: boolean; readonly score: number; readonly messages: ReadonlyArray<string> }
 ```
 
-**privateIsu.ts:** `cmd: "./bin/benchmarker"`, `args: ["-u", "./userdata", "-t", \`http://${ip}:${port}/\`]`, `cwd: BENCH_DIR`(env、既定 `/home/kise/bench`。実パスは `problems/private-isu/README.md` のベンチ実行節を確認して合わせる)。`parseResult` は stdout の**最後の `{` 始まり行**を JSON.parse し `{ pass, score, messages }` → `{ passed: pass, score, messages }`。パース不能は `AdapterParseError`。`parsePartialScore` は private-isu では `Option.none`(途中スコア出力なし)
+**privateIsu.ts:** `cmd: "./bin/benchmarker"`, `args: ["-u", "./userdata", "-t", \`http://${ip}:${port}/\`]`, `cwd: BENCH_DIR`(env、既定 `/home/kise/private-isu/benchmarker` — `problems/private-isu/README.md` のベンチ実行節 `cd ~/private-isu/benchmarker && ./bin/benchmarker ...` と整合)。`parseResult` は stdout の**最後の `{` 始まり行**を JSON.parse し `{ pass, score, messages }` → `{ passed: pass, score, messages }`。パース不能は `AdapterParseError`。`parsePartialScore` は private-isu では `Option.none`(途中スコア出力なし)
 
 **loop.ts:** `HttpApiClient.make(api, { baseUrl: PORTAL_URL })` + bearer RUNNER_TOKEN で:
 poll → job なし: 2 秒 sleep(`Schedule.spaced`)→ 再 poll。job あり: `Command.make`(@effect/platform)で起動 → stdout/stderr を蓄積しつつ **5 秒ごとに増分を progress POST**(`Effect.fork` したタイマー fiber、`Effect.ensuring` で止める)→ プロセス終了で parseResult → finish POST(パース不能・非ゼロ exit は `passed:false, score:0, errorMessage`)。ループ全体は `Effect.catchAllCause(logError)` で不死身に。progress/finish の POST 失敗は 3 回リトライ(`Effect.retry(Schedule.exponential("1 second").pipe(Schedule.compose(Schedule.recurs(3))))`)して落ちたらログだけ残して次へ
