@@ -1,5 +1,6 @@
 locals {
-  team_instances = merge([
+  # concat 先頭の空 map は teams が空のときも merge を評価可能にするため
+  team_instances = merge(concat([{}], [
     for tnum, t in var.teams : {
       for i in range(1, t.instances + 1) :
       "team${tnum}-${i}" => {
@@ -9,7 +10,7 @@ locals {
         github_users = t.github_users
       }
     }
-  ]...)
+  ])...)
 
   all_github_users = toset(flatten([for t in var.teams : t.github_users]))
 }
@@ -52,6 +53,10 @@ resource "proxmox_virtual_environment_vm" "team" {
   name      = "inucon-${each.key}"
   node_name = var.node_name
   vm_id     = each.value.vmid
+
+  # bridge "team{N}" は SDN applier 反映後に存在する。文字列参照では暗黙の依存が
+  # 張られず、新規ホストで VM 作成が先行して失敗しうるため明示する
+  depends_on = [proxmox_virtual_environment_sdn_applier.apply]
 
   clone {
     vm_id = var.problem_template_vmid
