@@ -83,7 +83,7 @@ stateDiagram-v2
 
 #### BenchJob(キューの中心)
 
-- フィールド: `id`, `teamId`, `targetIp`, `targetPort`(既定 80)、`status`, `score`, `passed`, `errorMessage`, `log`, `enqueuedAt`, `startedAt`, `finishedAt`
+- フィールド: `id`, `teamId`, `targetIp`, `targetPort`(既定 80)、`status`, `score`, `passed`, `errorMessage`, `log`(永続化は `bench_job_logs` 別テーブル — DB 設計 §6 参照)、`enqueuedAt`, `startedAt`, `finishedAt`
 - 状態機械:
 
 ```mermaid
@@ -208,7 +208,7 @@ deploy/            apphost k3s マニフェスト(Deployment/Service/Ingress/PVC
 | scoreboard | `GET /api/scoreboard` | セッション | チームごとの最新/最高スコア一覧 |
 | teams | `GET /api/teams` / `POST /api/teams` / `PUT /api/teams/:id/members` | 参照はセッション、変更は admin | チーム一覧、作成、メンバー割当 |
 | instances | `GET /api/teams/:id/instances` / `POST /api/instances` / `DELETE /api/instances/:id` | 参照は当該チーム or admin、変更は admin | インスタンス台帳 |
-| bench | `POST /api/bench-jobs`(enqueue)/ `GET /api/bench-jobs?teamId=` / `GET /api/bench-jobs/:id` / `POST /api/bench-jobs/:id/cancel` | enqueue/cancel はチームメンバー(自チームのみ)。一覧(スコア・状態)は全員可、**詳細(ログ)は自チーム + admin のみ**(ログはチューニング戦略が漏れるため) | エンキュー、履歴、詳細(ログ含む)、キャンセル |
+| bench | `POST /api/bench-jobs`(enqueue)/ `GET /api/bench-jobs?teamId=` / `GET /api/bench-jobs/:id` / `POST /api/bench-jobs/:id/cancel` | enqueue/cancel はチームメンバー(自チームのみ)。一覧(スコア・状態)は全員可、**詳細(ログ)は自チーム + admin のみ**(ログはチューニング戦略が漏れるため) | エンキュー、履歴、詳細(ログ含む)、キャンセル。**キャンセルは `queued` のみ可**(dequeue 前のみ。`running` 以降は 409 — 実行中断はランナー側の中断処理が必要になるため Phase 2 ではしない) |
 | admin | `POST /api/admin/contest/start` / `POST /api/admin/contest/finish` | admin | コンテスト状態遷移 |
 | runner | `POST /api/runner/jobs/poll` / `POST /api/runner/jobs/:id/progress` / `POST /api/runner/jobs/:id/finish` | RunnerAuth | 後述 |
 
