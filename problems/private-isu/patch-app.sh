@@ -4,7 +4,7 @@
 # build-template.sh の後、finalize-template.sh の前に実行すること
 # (build → patch → 検証 → finalize)。
 #
-# 根本原因(詳細: .superpowers/sdd/task-7-debug.md):
+# 根本原因(詳細: 本ディレクトリの README.md「恒久修正パッチ」節):
 #   Go net/http のリダイレクト追従は同一ホスト内では POST の Content-Type
 #   ヘッダをボディの無い GET にもそのまま引き継ぎ、Rack 3.2.6 の
 #   Request#form_data? が HTTP メソッドを見ず Content-Type の値だけで
@@ -35,7 +35,7 @@ SITE_CONF=/etc/nginx/sites-available/isucon.conf
 
 # GET/HEAD の Content-Type を空にする map(新規ファイル。上書きなので冪等)。
 cat > "$CONF_D" <<'NGINX_MAP'
-# 恒久修正(詳細: .superpowers/sdd/task-7-debug.md)
+# 恒久修正(詳細: inucon リポジトリ problems/private-isu/README.md「恒久修正パッチ」節)
 # 根本原因: Go net/http のリダイレクト追従が同一ホスト内では GET にも
 # 直前 POST の Content-Type を引き継ぎ、Rack 3.2.6 の form_data? が
 # メソッドを見ず Content-Type だけで multipart 判定するため 400 になる。
@@ -46,12 +46,13 @@ map $request_method $upstream_content_type {
 }
 NGINX_MAP
 
-# site conf への1行挿入は二重適用ガード付き(grep で既存チェック)。
-if ! grep -q 'upstream_content_type' "$SITE_CONF"; then
+# site conf への1行挿入は二重適用ガード付き(挿入する 1 行そのものを固定文字列で検出)。
+INSERTED_LINE='proxy_set_header Content-Type $upstream_content_type;'
+if ! grep -qF "$INSERTED_LINE" "$SITE_CONF"; then
   sed -i '/proxy_set_header Host \$host;/a\    proxy_set_header Content-Type $upstream_content_type;' "$SITE_CONF"
 fi
 # sed はアンカー行が見つからなくても黙って成功するため、挿入結果を必ず検証する
-grep -q 'upstream_content_type' "$SITE_CONF" || {
+grep -qF "$INSERTED_LINE" "$SITE_CONF" || {
   echo "FATAL: $SITE_CONF への proxy_set_header 挿入に失敗(アンカー行の書式変更?)" >&2
   exit 1
 }
@@ -62,11 +63,14 @@ systemctl reload nginx
 echo "---- $CONF_D ----"
 cat "$CONF_D"
 echo "---- $SITE_CONF (location /) ----"
-grep -A4 'location / {' "$SITE_CONF"
+grep -A4 'location / {' "$SITE_CONF" || true  # デバッグ出力: 不一致でも処理は成功扱い
 GUEST_EOF
 
+# base64 の巨大文字列で xtrace ログを汚さないよう、この区間だけ set -x を外す
+set +x
 B64=$(printf '%s' "$GUEST_SCRIPT" | base64 -w0)
 qm guest exec "$VMID" --timeout 60 -- bash -c "echo $B64 | base64 -d | bash -s"
+set -x
 
 echo "patch-app.sh: 適用完了 (vmid $VMID)"
 echo "効果確認の例:"

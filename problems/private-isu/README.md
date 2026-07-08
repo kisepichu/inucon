@@ -26,7 +26,7 @@ ssh root@192.0.2.10 'bash -s' < problems/private-isu/finalize-template.sh
 
 ## 恒久修正パッチ(patch-app.sh)
 
-### 根本原因(詳細: `.superpowers/sdd/task-7-debug.md`)
+### 根本原因
 
 private-isu ベンチマーカー(Go `net/http.Client`)は画像投稿 `POST /` への 302 を
 自動追従して `GET /posts/:id` を送る際、**同一ホスト内リダイレクトでは元 POST の
@@ -128,7 +128,7 @@ matsuu の cloud-config が Proxmox(qm cicustom + NoCloud)でそのまま動く�
 
 > **注**: 本節の `pass:false` は調査時点の記録。その後の再調査で根本原因は
 > read-after-write 競合ではなく「Go リダイレクト GET の Content-Type 引き継ぎ ×
-> Rack 3.2.6 の multipart 判定」と判明し(`.superpowers/sdd/task-7-debug.md`)、
+> Rack 3.2.6 の multipart 判定」と判明し(詳細は上記「恒久修正パッチ」節)、
 > 上記「恒久修正パッチ」で解消済み(再ベンチ 3 回 `pass:true`)。
 
 benchvm(192.0.2.5, NixOS)から inucon-team1-1(10.100.1.11, 2vCPU/4GB, vmid 1101)
