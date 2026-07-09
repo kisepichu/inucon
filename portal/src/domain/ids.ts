@@ -1,6 +1,8 @@
 import { Schema } from "effect"
 
-// 全 ID は UUID 文字列のブランド型。
+// ID は一意な不透明文字列のブランド型。形式は生成側の責務
+// (infrastructure の UuidGen が UUID を、SessionRepo が hex 乱数を生成)で、
+// domain では形式を仮定しない。
 
 export const UserId = Schema.String.pipe(Schema.brand("UserId"))
 export type UserId = typeof UserId.Type

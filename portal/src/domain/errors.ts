@@ -12,10 +12,12 @@ export class InvalidContestTransition extends Data.TaggedError("InvalidContestTr
   to: ContestStatus
 }> {}
 
+export type JobAction = "start" | "recordProgress" | "finish" | "fail" | "cancel"
+
 export class InvalidJobTransition extends Data.TaggedError("InvalidJobTransition")<{
   jobId: BenchJobId
   from: BenchJobStatus
-  action: string
+  action: JobAction
 }> {}
 
 export class CannotCancelRunning extends Data.TaggedError("CannotCancelRunning")<{
