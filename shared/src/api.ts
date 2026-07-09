@@ -84,9 +84,14 @@ export const authGroup = HttpApiGroup.make("auth")
   .add(HttpApiEndpoint.get("githubLogin", "/auth/github").addSuccess(HttpApiSchema.Empty(302)))
   .add(
     HttpApiEndpoint.get("githubCallback", "/auth/github/callback")
-      // code / state が欠落したリクエストはデコード失敗(HttpApiDecodeError)
-      // として 400 になる。
-      .setUrlParams(Schema.Struct({ code: Schema.String, state: Schema.String }))
+      // code / state はどちらも省略可能にし、欠落チェックはハンドラ側で行う。
+      // こうしないと欠落時に Schema デコード失敗(400 だがボディが契約と
+      // 無関係かつ state cookie 破棄も走らない)になってしまうため。
+      // ハンドラは欠落を state 不一致と同じ 400(InvalidOAuthState)として
+      // 扱い、state cookie を破棄する。
+      .setUrlParams(
+        Schema.Struct({ code: Schema.optional(Schema.String), state: Schema.optional(Schema.String) })
+      )
       .addSuccess(HttpApiSchema.Empty(302))
       .addError(InvalidOAuthState)
       .addError(OAuthExchangeFailed)

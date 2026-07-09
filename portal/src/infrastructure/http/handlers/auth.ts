@@ -35,17 +35,25 @@ export const AuthLive = HttpApiBuilder.group(api, "auth", (handlers) =>
     .handleRaw("githubCallback", ({ urlParams }) =>
       Effect.gen(function* () {
         // login CSRF 対策: state cookie と query の state の一致を必須にする。
+        // code / state はどちらも省略可能な契約になっているため、欠落も
+        // ここでチェックする(欠落は state 不一致と同じ扱いにする)。
         const request = yield* HttpServerRequest.HttpServerRequest
         const stateCookie = request.cookies[STATE_COOKIE]
-        if (stateCookie === undefined || stateCookie !== urlParams.state) {
-          // state 不一致: 400 を返す(state cookie を破棄)
-          return yield* HttpServerResponse.empty({ status: 400 }).pipe(
+        const { code, state } = urlParams
+        if (code === undefined || state === undefined || stateCookie === undefined || stateCookie !== state) {
+          // state 不一致 / 欠落: 400 を返す(state cookie を破棄)。
+          // ボディは契約(InvalidOAuthState)の encode と同形の JSON にする。
+          const response = yield* HttpServerResponse.schemaJson(InvalidOAuthState)(
+            new InvalidOAuthState(),
+            { status: 400 }
+          ).pipe(Effect.orDie)
+          return yield* response.pipe(
             HttpServerResponse.setCookie(STATE_COOKIE, "", { ...secureCookie, maxAge: Duration.zero }),
             Effect.orDie
           )
         }
 
-        const result = yield* handleOAuthCallback({ code: urlParams.code }).pipe(
+        const result = yield* handleOAuthCallback({ code }).pipe(
           Effect.catchTags({
             OAuthFailed: () => Effect.succeed(null),
             RepoError: (e) => Effect.die(e)
@@ -53,8 +61,13 @@ export const AuthLive = HttpApiBuilder.group(api, "auth", (handlers) =>
         )
 
         if (result === null) {
-          // トークン交換失敗: 502 を返す(state cookie を破棄)
-          return yield* HttpServerResponse.empty({ status: 502 }).pipe(
+          // トークン交換失敗: 502 を返す(state cookie を破棄)。
+          // ボディは契約(OAuthExchangeFailed)の encode と同形の JSON にする。
+          const response = yield* HttpServerResponse.schemaJson(OAuthExchangeFailed)(
+            new OAuthExchangeFailed(),
+            { status: 502 }
+          ).pipe(Effect.orDie)
+          return yield* response.pipe(
             HttpServerResponse.setCookie(STATE_COOKIE, "", { ...secureCookie, maxAge: Duration.zero }),
             Effect.orDie
           )

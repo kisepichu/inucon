@@ -2,15 +2,17 @@ import {
   Cookies,
   HttpApi,
   HttpApiBuilder,
+  HttpApiClient,
   HttpApiEndpoint,
   HttpApiGroup,
-  HttpClient
+  HttpClient,
+  HttpClientRequest
 } from "@effect/platform"
 import { NodeHttpServer } from "@effect/platform-node"
 import { it } from "@effect/vitest"
 import { Clock, ConfigProvider, Duration, Effect, Layer, Option, Schema } from "effect"
 import { describe, expect } from "vitest"
-import { AdminOnly, RunnerAuth, SESSION_COOKIE, STATE_COOKIE } from "shared"
+import { AdminOnly, api, InvalidOAuthState, OAuthExchangeFailed, RunnerAuth, SESSION_COOKIE, STATE_COOKIE } from "shared"
 import { TeamId } from "../../src/domain/ids.js"
 import { Team } from "../../src/domain/team.js"
 import { SessionRepo, TeamRepo } from "../../src/application/ports.js"
@@ -27,6 +29,14 @@ const TestLayer = makeAppTestLayer({ stubCodes, adminGithubLogins: ["admin-login
 
 const getCookie = (cookies: Cookies.Cookies, name: string) =>
   Option.getOrThrowWith(Cookies.get(cookies, name), () => new Error(`cookie ${name} not set`))
+
+// 契約(shared/src/api.ts)経由で叩き、宣言されたエラー(InvalidOAuthState /
+// OAuthExchangeFailed)が型付きで decode できることを確認するためのクライアント。
+// cookie ヘッダは HttpApiClient の request 引数に無いため transformClient で注入する。
+const makeApiClient = (cookieHeader: string) =>
+  HttpApiClient.make(api, {
+    transformClient: (client) => HttpClient.mapRequest(client, HttpClientRequest.setHeader("cookie", cookieHeader))
+  })
 
 describe("GET /auth/github", () => {
   it.effect("302 で GitHub authorize へ。state cookie(HttpOnly/Secure/Lax/600s)が付く", () =>
@@ -84,52 +94,120 @@ describe("GET /auth/github/callback", () => {
     }).pipe(Effect.provide(TestLayer))
   )
 
-  it.effect("state 不一致は 400(state cookie も破棄される)", () =>
-    Effect.gen(function* () {
-      const client = yield* HttpClient.HttpClient
-      const res = yield* client.get("/auth/github/callback?code=code-taro&state=evil", {
-        headers: { cookie: `${STATE_COOKIE}=st-1` }
-      })
-      expect(res.status).toBe(400)
+  it.effect(
+    "state 不一致は 400(state cookie も破棄され、ボディは契約どおり InvalidOAuthState として decode できる)",
+    () =>
+      Effect.gen(function* () {
+        const client = yield* HttpClient.HttpClient
+        const res = yield* client.get("/auth/github/callback?code=code-taro&state=evil", {
+          headers: { cookie: `${STATE_COOKIE}=st-1` }
+        })
+        expect(res.status).toBe(400)
 
-      // state cookie が破棄されることを確認
-      const state = getCookie(res.cookies, STATE_COOKIE)
-      expect(state.value).toBe("")
-      expect(state.options?.maxAge).toStrictEqual(Duration.zero)
-    }).pipe(Effect.provide(TestLayer))
+        // state cookie が破棄されることを確認
+        const state = getCookie(res.cookies, STATE_COOKIE)
+        expect(state.value).toBe("")
+        expect(state.options?.maxAge).toStrictEqual(Duration.zero)
+
+        // ボディは契約(InvalidOAuthState)の encode と同形の JSON
+        const body = yield* res.json
+        expect(body).toStrictEqual({ _tag: "InvalidOAuthState" })
+
+        // HttpApiClient(契約)経由でも型付きエラーとして decode できる
+        const apiClient = yield* makeApiClient(`${STATE_COOKIE}=st-1`)
+        const error = yield* apiClient.auth.githubCallback({ urlParams: { code: "code-taro", state: "evil" } }).pipe(
+          Effect.flip
+        )
+        expect(error).toBeInstanceOf(InvalidOAuthState)
+      }).pipe(Effect.provide(TestLayer))
   )
 
-  it.effect("state cookie 欠落は 400", () =>
+  it.effect("state cookie 欠落は 400(state cookie も破棄される)", () =>
     Effect.gen(function* () {
       const client = yield* HttpClient.HttpClient
       const res = yield* client.get("/auth/github/callback?code=code-taro&state=st-1")
       expect(res.status).toBe(400)
+
+      const state = getCookie(res.cookies, STATE_COOKIE)
+      expect(state.value).toBe("")
+      expect(state.options?.maxAge).toStrictEqual(Duration.zero)
+
+      const body = yield* res.json
+      expect(body).toStrictEqual({ _tag: "InvalidOAuthState" })
     }).pipe(Effect.provide(TestLayer))
   )
 
-  it.effect("code / state クエリ欠落は 400(Schema デコード失敗)", () =>
+  it.effect("code / state クエリが両方欠落は 400(state cookie も破棄される)", () =>
     Effect.gen(function* () {
       const client = yield* HttpClient.HttpClient
       const res = yield* client.get("/auth/github/callback", {
         headers: { cookie: `${STATE_COOKIE}=st-1` }
       })
       expect(res.status).toBe(400)
+
+      const state = getCookie(res.cookies, STATE_COOKIE)
+      expect(state.value).toBe("")
+      expect(state.options?.maxAge).toStrictEqual(Duration.zero)
+
+      const body = yield* res.json
+      expect(body).toStrictEqual({ _tag: "InvalidOAuthState" })
     }).pipe(Effect.provide(TestLayer))
   )
 
-  it.effect("コード交換に失敗したら 502(state cookie も破棄される)", () =>
+  it.effect("code クエリのみ欠落は 400(state cookie も破棄される)", () =>
     Effect.gen(function* () {
       const client = yield* HttpClient.HttpClient
-      const res = yield* client.get("/auth/github/callback?code=unknown-code&state=st-1", {
+      const res = yield* client.get("/auth/github/callback?state=st-1", {
         headers: { cookie: `${STATE_COOKIE}=st-1` }
       })
-      expect(res.status).toBe(502)
+      expect(res.status).toBe(400)
 
-      // state cookie が破棄されることを確認
       const state = getCookie(res.cookies, STATE_COOKIE)
       expect(state.value).toBe("")
       expect(state.options?.maxAge).toStrictEqual(Duration.zero)
     }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("state クエリのみ欠落は 400(state cookie も破棄される)", () =>
+    Effect.gen(function* () {
+      const client = yield* HttpClient.HttpClient
+      const res = yield* client.get("/auth/github/callback?code=code-taro", {
+        headers: { cookie: `${STATE_COOKIE}=st-1` }
+      })
+      expect(res.status).toBe(400)
+
+      const state = getCookie(res.cookies, STATE_COOKIE)
+      expect(state.value).toBe("")
+      expect(state.options?.maxAge).toStrictEqual(Duration.zero)
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect(
+    "コード交換に失敗したら 502(state cookie も破棄され、ボディは契約どおり OAuthExchangeFailed として decode できる)",
+    () =>
+      Effect.gen(function* () {
+        const client = yield* HttpClient.HttpClient
+        const res = yield* client.get("/auth/github/callback?code=unknown-code&state=st-1", {
+          headers: { cookie: `${STATE_COOKIE}=st-1` }
+        })
+        expect(res.status).toBe(502)
+
+        // state cookie が破棄されることを確認
+        const state = getCookie(res.cookies, STATE_COOKIE)
+        expect(state.value).toBe("")
+        expect(state.options?.maxAge).toStrictEqual(Duration.zero)
+
+        // ボディは契約(OAuthExchangeFailed)の encode と同形の JSON
+        const body = yield* res.json
+        expect(body).toStrictEqual({ _tag: "OAuthExchangeFailed" })
+
+        // HttpApiClient(契約)経由でも型付きエラーとして decode できる
+        const apiClient = yield* makeApiClient(`${STATE_COOKIE}=st-1`)
+        const error = yield* apiClient.auth.githubCallback({
+          urlParams: { code: "unknown-code", state: "st-1" }
+        }).pipe(Effect.flip)
+        expect(error).toBeInstanceOf(OAuthExchangeFailed)
+      }).pipe(Effect.provide(TestLayer))
   )
 })
 
