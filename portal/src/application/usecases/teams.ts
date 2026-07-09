@@ -1,4 +1,4 @@
-import { Effect, Either, Option } from "effect"
+import { Effect, Option } from "effect"
 import { TeamId } from "../../domain/ids.js"
 import { Team } from "../../domain/team.js"
 import type { User } from "../../domain/user.js"
