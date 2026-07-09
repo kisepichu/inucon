@@ -2,14 +2,16 @@ import { Context, Effect, Either, Layer, Option, Ref } from "effect"
 import { cancelJob, failJob, finishJob, recordProgress, startJob } from "../../src/domain/benchJob.js"
 import type { BenchJob } from "../../src/domain/benchJob.js"
 import type { Contest } from "../../src/domain/contest.js"
-import { CannotCancelRunning, InvalidJobTransition, TeamJobAlreadyQueued } from "../../src/domain/errors.js"
-import type { BenchJobId, TeamId } from "../../src/domain/ids.js"
+import { CannotCancelRunning, DuplicateInstanceIndex, InvalidJobTransition, TeamJobAlreadyQueued } from "../../src/domain/errors.js"
+import type { BenchJobId, InstanceId, TeamId } from "../../src/domain/ids.js"
 import { UserId } from "../../src/domain/ids.js"
+import type { Instance } from "../../src/domain/instance.js"
 import { User } from "../../src/domain/user.js"
 import type { Team } from "../../src/domain/team.js"
 import {
   BenchJobRepo,
   ContestRepo,
+  InstanceRepo,
   RunnerConfig,
   SessionRepo,
   TeamRepo,
@@ -82,6 +84,38 @@ export const makeTeamRepoTest = (args: {
             const memberIds = new Set(members.filter((m) => m.teamId === teamId).map((m) => m.userId))
             return users.filter((u) => memberIds.has(u.id))
           })
+      }
+    })
+  )
+
+// InstanceRepo のインメモリ実装。create は本番 SQLite 実装(instanceRepo.ts の
+// INSERT ... WHERE NOT EXISTS ... RETURNING)と同じ意味論: 同一 (teamId, index)
+// が既にあれば Ref.modify 内の単一操作で判定して DuplicateInstanceIndex を返す
+// (TOCTOU を模した Ref 単一 update、makeBenchJobRepoTest.insertIfAllowed と同型)。
+export const makeInstanceRepoTest = (initial: ReadonlyArray<Instance> = []): Layer.Layer<InstanceRepo> =>
+  Layer.effect(
+    InstanceRepo,
+    Effect.gen(function* () {
+      const instancesRef = yield* Ref.make(initial)
+      return {
+        listByTeam: (teamId: TeamId) =>
+          Ref.get(instancesRef).pipe(
+            Effect.map((instances) =>
+              instances.filter((i) => i.teamId === teamId).sort((a, b) => a.index - b.index)
+            )
+          ),
+        create: (i: Instance) =>
+          Ref.modify(
+            instancesRef,
+            (instances): readonly [Either.Either<Instance, DuplicateInstanceIndex>, ReadonlyArray<Instance>] => {
+              const duplicate = instances.some((x) => x.teamId === i.teamId && x.index === i.index)
+              if (duplicate) {
+                return [Either.left(new DuplicateInstanceIndex({ teamId: i.teamId, index: i.index })), instances]
+              }
+              return [Either.right(i), [...instances, i]]
+            }
+          ).pipe(Effect.flatMap(Either.match({ onLeft: Effect.fail, onRight: Effect.succeed }))),
+        remove: (id: InstanceId) => Ref.update(instancesRef, (instances) => instances.filter((i) => i.id !== id))
       }
     })
   )

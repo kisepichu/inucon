@@ -92,6 +92,14 @@ export class TargetIpOutOfSubnet extends Schema.TaggedError<TargetIpOutOfSubnet>
   HttpApiSchema.annotations({ status: 422 })
 ) {}
 
+// POST /api/instances: 同一チーム内で index が重複(DB UNIQUE (team_id, idx)
+// 制約違反をマップ。TeamNumberConflict と同様の理由で 409)。
+export class DuplicateInstanceIndex extends Schema.TaggedError<DuplicateInstanceIndex>()(
+  "DuplicateInstanceIndex",
+  { teamId: TeamId, index: Schema.Int.pipe(Schema.positive()) },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
 // POST /api/admin/contest/{start,finish}: 不正な状態遷移(domain の
 // startContest/finishContest をマップ)。
 export class InvalidContestTransition extends Schema.TaggedError<InvalidContestTransition>()(
@@ -210,6 +218,7 @@ export const instancesGroup = HttpApiGroup.make("instances")
       .addSuccess(Instance)
       .addError(NotFound)
       .addError(TargetIpOutOfSubnet)
+      .addError(DuplicateInstanceIndex)
       .middleware(AdminOnly)
   )
   // 削除は admin のみ。logout と同様に冪等(存在しない id でも 204)。

@@ -43,3 +43,12 @@ export class ContestNotRunning extends Data.TaggedError("ContestNotRunning")<{
 export class TeamNumberConflict extends Data.TaggedError("TeamNumberConflict")<{
   teamNumber: number
 }> {}
+
+// instances.(team_id, idx) の UNIQUE 制約違反。TeamNumberConflict と同様、
+// リポジトリ(SQLite 実装)が「INSERT ... WHERE NOT EXISTS ... RETURNING」の
+// 単一原子的操作で検出して返す(TOCTOU 回避、benchJobRepo.ts の
+// insertIfAllowed と同じ形)。
+export class DuplicateInstanceIndex extends Data.TaggedError("DuplicateInstanceIndex")<{
+  teamId: TeamId
+  index: number
+}> {}

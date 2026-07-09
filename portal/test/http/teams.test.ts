@@ -1,7 +1,8 @@
-import { HttpBody, HttpClient } from "@effect/platform"
+import { HttpApiClient, HttpBody, HttpClient, HttpClientRequest } from "@effect/platform"
 import { it } from "@effect/vitest"
 import { Effect, Option } from "effect"
 import { describe, expect } from "vitest"
+import { api, DuplicateInstanceIndex } from "shared"
 import { Contest } from "../../src/domain/contest.js"
 import { Instance } from "../../src/domain/instance.js"
 import { ContestId, InstanceId, TeamId } from "../../src/domain/ids.js"
@@ -16,6 +17,13 @@ import { makeAppTestLayer } from "../support/testApi.js"
 const TestLayer = makeAppTestLayer({ adminGithubLogins: ["admin-login"] })
 
 const asAdmin = () => login({ githubLogin: "admin-login", githubId: 900, isAdmin: true })
+
+// cookie ヘッダは HttpApiClient の request 引数に無いため transformClient で
+// 注入する(test/http/auth.test.ts の makeApiClient と同じ形)。
+const makeApiClient = (cookieHeader: string) =>
+  HttpApiClient.make(api, {
+    transformClient: (client) => HttpClient.mapRequest(client, HttpClientRequest.setHeader("cookie", cookieHeader))
+  })
 
 describe("GET /api/contest", () => {
   it.effect("コンテスト未作成は404", () =>
@@ -225,6 +233,31 @@ describe("PUT /api/teams/:id/members", () => {
       expect(members.map((m) => m.id).slice().sort()).toStrictEqual([memberA.id, memberB.id].slice().sort())
     }).pipe(Effect.provide(TestLayer))
   )
+
+  it.effect("既存メンバーを含む同一チームへの再割当(冪等 PUT)はMemberConflictにならず成功する", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const team = new Team({ id: TeamId.make("team-members-idempotent"), name: "Members Idempotent", teamNumber: 36 })
+      yield* teams.create(team)
+
+      const { user: memberA } = yield* login({ githubLogin: "idem-a", githubId: 1101 })
+      const { user: memberB } = yield* login({ githubLogin: "idem-b", githubId: 1102 })
+      yield* teams.setMembers(team.id, [memberA.id])
+
+      const { cookieHeader } = yield* asAdmin()
+      // memberA は既に team のメンバー。setTeamMembers の
+      // findByUserId(memberA.id) === team.id となるため、既存メンバーを含む
+      // 再割当(memberB を追加)が MemberConflict(横取り判定)にならないことを
+      // 確認する。
+      const res = yield* put(cookieHeader, team.id, { githubLogins: ["idem-a", "idem-b"] })
+      expect(res.status).toBe(200)
+      const body = (yield* res.json) as { members: ReadonlyArray<{ githubLogin: string }> }
+      expect(body.members.map((m) => m.githubLogin).slice().sort()).toStrictEqual(["idem-a", "idem-b"])
+
+      const members = yield* teams.listMembers(team.id)
+      expect(members.map((m) => m.id).slice().sort()).toStrictEqual([memberA.id, memberB.id].slice().sort())
+    }).pipe(Effect.provide(TestLayer))
+  )
 })
 
 describe("GET /api/teams/:id/instances", () => {
@@ -357,6 +390,31 @@ describe("POST /api/instances", () => {
       expect(listed).toHaveLength(1)
     }).pipe(Effect.provide(TestLayer))
   )
+
+  it.effect("同一 (team, index) の二重登録は409(HttpApiClient でも型付きエラーとして decode できる)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const team = new Team({ id: TeamId.make("team-createinst-dup"), name: "CreateInst Dup", teamNumber: 54 })
+      yield* teams.create(team)
+
+      const { cookieHeader } = yield* asAdmin()
+      const first = yield* post(cookieHeader, { teamId: team.id, index: 1, privateIp: "10.100.54.10" })
+      expect(first.status).toBe(200)
+
+      const second = yield* post(cookieHeader, { teamId: team.id, index: 1, privateIp: "10.100.54.11" })
+      expect(second.status).toBe(409)
+      const body = yield* second.json
+      expect(body).toStrictEqual({ _tag: "DuplicateInstanceIndex", teamId: team.id, index: 1 })
+
+      // HttpApiClient(契約)経由でも型付きエラーとして decode できることを確認する
+      const apiClient = yield* makeApiClient(cookieHeader)
+      const error = yield* apiClient.instances
+        .createInstance({ payload: { teamId: team.id, index: 1, privateIp: "10.100.54.12" } })
+        .pipe(Effect.flip)
+      expect(error).toBeInstanceOf(DuplicateInstanceIndex)
+      expect(error).toStrictEqual(new DuplicateInstanceIndex({ teamId: team.id, index: 1 }))
+    }).pipe(Effect.provide(TestLayer))
+  )
 })
 
 describe("DELETE /api/instances/:id", () => {
@@ -476,6 +534,14 @@ describe("POST /api/admin/contest/finish", () => {
       const { cookieHeader } = yield* login({ isAdmin: false })
       const res = yield* finish(cookieHeader)
       expect(res.status).toBe(403)
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("コンテスト未作成は404", () =>
+    Effect.gen(function* () {
+      const { cookieHeader } = yield* asAdmin()
+      const res = yield* finish(cookieHeader)
+      expect(res.status).toBe(404)
     }).pipe(Effect.provide(TestLayer))
   )
 

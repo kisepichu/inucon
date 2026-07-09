@@ -3,6 +3,7 @@ import type { BenchJob } from "../domain/benchJob.js"
 import type { Contest } from "../domain/contest.js"
 import {
   CannotCancelRunning,
+  DuplicateInstanceIndex,
   InvalidJobTransition,
   TeamJobAlreadyQueued,
   TeamNumberConflict
@@ -79,7 +80,11 @@ export class InstanceRepo extends Context.Tag("app/InstanceRepo")<
   InstanceRepo,
   {
     readonly listByTeam: (teamId: TeamId) => Effect.Effect<ReadonlyArray<Instance>, RepoError>
-    readonly create: (i: Instance) => Effect.Effect<void, RepoError>
+    // instances.(team_id, idx) の UNIQUE 制約は「INSERT ... SELECT ... WHERE
+    // NOT EXISTS ... RETURNING」の単一原子的操作で検出する(TeamRepo.create /
+    // benchJobRepo.insertIfAllowed と同じ TOCTOU 回避パターン、SQLite 実装)。
+    // 0 行挿入なら DuplicateInstanceIndex。
+    readonly create: (i: Instance) => Effect.Effect<Instance, RepoError | DuplicateInstanceIndex>
     readonly remove: (id: InstanceId) => Effect.Effect<void, RepoError>
   }
 >() {}

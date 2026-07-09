@@ -1,6 +1,6 @@
 import { HttpApiBuilder } from "@effect/platform"
 import { Effect } from "effect"
-import { api, CurrentUser, Forbidden, NotFound, TargetIpOutOfSubnet } from "shared"
+import { api, CurrentUser, DuplicateInstanceIndex, Forbidden, NotFound, TargetIpOutOfSubnet } from "shared"
 import { createInstance, listTeamInstances, removeInstance } from "../../../application/usecases/teams.js"
 
 export const InstancesLive = HttpApiBuilder.group(api, "instances", (handlers) =>
@@ -19,7 +19,9 @@ export const InstancesLive = HttpApiBuilder.group(api, "instances", (handlers) =
       createInstance(payload).pipe(
         Effect.catchTags({
           TeamNotFound: () => Effect.fail(new NotFound()),
-          TargetIpOutOfSubnet: (e) => Effect.fail(new TargetIpOutOfSubnet({ ip: e.ip, teamNumber: e.teamNumber }))
+          TargetIpOutOfSubnet: (e) => Effect.fail(new TargetIpOutOfSubnet({ ip: e.ip, teamNumber: e.teamNumber })),
+          DuplicateInstanceIndex: (e) =>
+            Effect.fail(new DuplicateInstanceIndex({ teamId: e.teamId, index: e.index }))
         }),
         Effect.orDie
       )

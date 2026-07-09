@@ -98,7 +98,9 @@ export const listTeamInstances = (args: { user: User; teamId: TeamId }) =>
   })
 
 // POST /api/instances: privateIp がチームサブネット外なら domain の
-// validateBenchTarget が TargetIpOutOfSubnet を返す(422 にマップ)。
+// validateBenchTarget が TargetIpOutOfSubnet を返す(422 にマップ)。同一
+// (team, index) の重複は InstanceRepo.create が DuplicateInstanceIndex を
+// 返す(409 にマップ)。
 export const createInstance = (args: { teamId: TeamId; index: number; privateIp: string }) =>
   Effect.gen(function* () {
     const teams = yield* TeamRepo
@@ -122,8 +124,7 @@ export const createInstance = (args: { teamId: TeamId; index: number; privateIp:
     })
 
     const instances = yield* InstanceRepo
-    yield* instances.create(instance)
-    return instance
+    return yield* instances.create(instance)
   })
 
 // DELETE /api/instances/:id: logout と同様に冪等(存在しない id でも成功)にする。
