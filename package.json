@@ -2,6 +2,7 @@
   "name": "inucon",
   "private": true,
   "scripts": {
+    "build": "pnpm --filter web build && pnpm --filter portal build",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck"
   }

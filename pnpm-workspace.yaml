@@ -1,6 +1,7 @@
 packages:
   - shared
   - portal
+  - portal/web
   - runner
 allowBuilds:
   '@parcel/watcher': true

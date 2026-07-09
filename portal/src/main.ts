@@ -1,4 +1,5 @@
 import { createServer } from "node:http"
+import { fileURLToPath } from "node:url"
 import { HttpApiBuilder, HttpMiddleware } from "@effect/platform"
 import { NodeHttpClient, NodeHttpServer, NodeRuntime } from "@effect/platform-node"
 import { Config, Effect, Layer } from "effect"
@@ -15,6 +16,7 @@ import { RunnerLive } from "./infrastructure/http/handlers/runner.js"
 import { ScoreboardLive } from "./infrastructure/http/handlers/scoreboard.js"
 import { TeamsLive } from "./infrastructure/http/handlers/teams.js"
 import { AdminOnlyLive, AuthenticationLive, RunnerAuthLive } from "./infrastructure/http/middleware.js"
+import { makeStaticMiddleware } from "./infrastructure/http/static.js"
 import { MigratorLive, SqlLive } from "./infrastructure/sql/client.js"
 import { BenchJobRepoLive } from "./infrastructure/sql/repos/benchJobRepo.js"
 import { ContestRepoLive } from "./infrastructure/sql/repos/contestRepo.js"
@@ -97,11 +99,23 @@ const ServerLive = Layer.unwrapEffect(
   )
 )
 
+// web/dist(portal/web の Vite ビルド成果物)へのパス。dist/main.js(ビルド後)
+// と src/main.ts(tsx watch の開発時)はいずれも portal 直下の 1 階層下にある
+// ため、"../web/dist" で両方から同じ portal/web/dist を指せる(static.ts の
+// README 兼ねる)。
+const webDistPath = fileURLToPath(new URL("../web/dist", import.meta.url))
+
 // Migration 依存: migration 前に最初のリクエストが来ると "no such table"
 // になる潜在レース。MigratorLive を依存として挟むことで、HTTP サーバー起動
 // 前に migration の完了を待たせる(参照は MainLive の MigratorLive と同一なので
 // メモ化により 1 回だけ実行される)。WorkerLive と同じ根本原因。
-const HttpLive = HttpApiBuilder.serve(HttpMiddleware.logger).pipe(
+//
+// 静的配信(static.ts): /api・/auth・/docs 以外は web/dist を配信する
+// ミドルウェアを HttpApi ルータ(httpApp)の外側に挟む。logger はさらにその
+// 外側にすることで、静的ファイル配信も含め全リクエストがログされる。
+const HttpLive = HttpApiBuilder.serve((httpApp) =>
+  HttpMiddleware.logger(makeStaticMiddleware(webDistPath)(httpApp))
+).pipe(
   Layer.provide(ApiLive),
   Layer.provide(ServerLive),
   Layer.provide(MigratorLive)
