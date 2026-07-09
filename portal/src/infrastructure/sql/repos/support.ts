@@ -32,6 +32,9 @@ export const optionToNull = <A>(opt: Option.Option<A>): A | null => Option.getOr
 export const optionBoolToNullableInt = (opt: Option.Option<boolean>): number | null =>
   Option.match(opt, { onNone: () => null, onSome: (b) => (b ? 1 : 0) })
 
-export const nullableIntToBool = (n: number | null): boolean | null => (n === null ? null : n === 1)
+// 0/1/null 以外は boolean に丸めず生値のまま返し、後段の Schema.decodeUnknown を
+// 失敗させる(DB のデータ破損を黙って false に変換しないため)。
+export const nullableIntToBool = (n: number | null): boolean | null | number =>
+  n === null ? null : n === 1 ? true : n === 0 ? false : n
 
 export const boolToInt = (b: boolean): number => (b ? 1 : 0)

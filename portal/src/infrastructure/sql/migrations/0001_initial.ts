@@ -73,7 +73,7 @@ export default Effect.gen(function* () {
       target_port INTEGER NOT NULL DEFAULT 80,
       status TEXT NOT NULL CHECK (status IN ('queued','running','finished','canceled','failed')),
       score INTEGER,
-      passed INTEGER,
+      passed INTEGER CHECK (passed IN (0, 1)),
       error_message TEXT,
       enqueued_at INTEGER NOT NULL,
       started_at INTEGER,

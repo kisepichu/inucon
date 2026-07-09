@@ -6,7 +6,7 @@ import { CannotCancelRunning, InvalidJobTransition, TeamJobAlreadyQueued } from 
 import type { BenchJobId } from "../../../domain/ids.js"
 import { TeamId } from "../../../domain/ids.js"
 import { BenchJobRepo } from "../../../application/ports.js"
-import { boolToInt, decodeRow, optionBoolToNullableInt, optionToNull, wrapSqlError } from "./support.js"
+import { boolToInt, decodeRow, nullableIntToBool, optionBoolToNullableInt, optionToNull, wrapSqlError } from "./support.js"
 
 interface BenchJobRow {
   readonly id: string
@@ -34,7 +34,7 @@ const BENCH_JOB_COLUMNS = `
 const decodeBenchJob = (row: BenchJobRow) =>
   decodeRow(BenchJob, {
     ...row,
-    passed: row.passed === null ? null : row.passed === 1
+    passed: nullableIntToBool(row.passed)
   })
 
 export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlClient> = Layer.effect(
