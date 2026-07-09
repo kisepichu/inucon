@@ -3,7 +3,7 @@ import { UserId } from "./ids.js"
 
 export class User extends Schema.Class<User>("User")({
   id: UserId,
-  githubId: Schema.Number,
+  githubId: Schema.Int,
   githubLogin: Schema.String,
   displayName: Schema.String,
   isAdmin: Schema.Boolean

@@ -16,15 +16,15 @@ export class BenchJob extends Schema.Class<BenchJob>("BenchJob")({
   id: BenchJobId,
   teamId: TeamId,
   targetIp: Schema.String,
-  targetPort: Schema.Number,
+  targetPort: Schema.Int.pipe(Schema.between(1, 65535)),
   status: Schema.Literal("queued", "running", "finished", "canceled", "failed"),
-  score: Schema.OptionFromNullOr(Schema.Number),
+  score: Schema.OptionFromNullOr(Schema.Int),
   passed: Schema.OptionFromNullOr(Schema.Boolean),
   errorMessage: Schema.OptionFromNullOr(Schema.String),
-  enqueuedAt: Schema.Number,
-  startedAt: Schema.OptionFromNullOr(Schema.Number),
-  finishedAt: Schema.OptionFromNullOr(Schema.Number),
-  lastProgressAt: Schema.OptionFromNullOr(Schema.Number)
+  enqueuedAt: Schema.Int,
+  startedAt: Schema.OptionFromNullOr(Schema.Int),
+  finishedAt: Schema.OptionFromNullOr(Schema.Int),
+  lastProgressAt: Schema.OptionFromNullOr(Schema.Int)
 }) {}
 
 // キュー不変条件のチェック(スペック §BenchJob):
