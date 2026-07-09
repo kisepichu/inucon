@@ -4,9 +4,15 @@ import type { ConfigProvider } from "effect"
 import { Layer } from "effect"
 import { api } from "shared"
 import { AuthConfig } from "../../src/application/ports.js"
+import { AdminLive } from "../../src/infrastructure/http/handlers/admin.js"
 import { AuthLive } from "../../src/infrastructure/http/handlers/auth.js"
+import { ContestLive } from "../../src/infrastructure/http/handlers/contest.js"
 import { HealthLive } from "../../src/infrastructure/http/handlers/health.js"
-import { AuthenticationLive } from "../../src/infrastructure/http/middleware.js"
+import { InstancesLive } from "../../src/infrastructure/http/handlers/instances.js"
+import { TeamsLive } from "../../src/infrastructure/http/handlers/teams.js"
+import { AdminOnlyLive, AuthenticationLive } from "../../src/infrastructure/http/middleware.js"
+import { ContestRepoLive } from "../../src/infrastructure/sql/repos/contestRepo.js"
+import { InstanceRepoLive } from "../../src/infrastructure/sql/repos/instanceRepo.js"
 import { SessionRepoLive } from "../../src/infrastructure/sql/repos/sessionRepo.js"
 import { TeamRepoLive } from "../../src/infrastructure/sql/repos/teamRepo.js"
 import { UserRepoLive } from "../../src/infrastructure/sql/repos/userRepo.js"
@@ -18,7 +24,13 @@ import { MigratorTest, SqlTest } from "./sqlTest.js"
 // `:memory:` SQLite + 本番マイグレーション + 本番リポジトリ実装。
 // UserRepoLive は UuidGen に依存するため provideMerge で 1 インスタンスに
 // 集約する(repos.test.ts と同じ理由)。
-export const ReposTestLive = Layer.mergeAll(UserRepoLive, SessionRepoLive, TeamRepoLive).pipe(
+export const ReposTestLive = Layer.mergeAll(
+  UserRepoLive,
+  SessionRepoLive,
+  TeamRepoLive,
+  ContestRepoLive,
+  InstanceRepoLive
+).pipe(
   Layer.provideMerge(UuidGenLive),
   Layer.provideMerge(MigratorTest),
   Layer.provideMerge(SqlTest)
@@ -36,8 +48,9 @@ export const makeAppTestLayer = (options?: {
   HttpApiBuilder.serve().pipe(
     Layer.provideMerge(
       HttpApiBuilder.api(api).pipe(
-        Layer.provide(Layer.mergeAll(HealthLive, AuthLive)),
+        Layer.provide(Layer.mergeAll(HealthLive, AuthLive, ContestLive, TeamsLive, InstancesLive, AdminLive)),
         Layer.provide(AuthenticationLive),
+        Layer.provide(AdminOnlyLive),
         Layer.provide(makeGithubOAuthStub(options?.stubCodes ?? {})),
         Layer.provide(
           Layer.succeed(AuthConfig, { adminGithubLogins: options?.adminGithubLogins ?? [] })

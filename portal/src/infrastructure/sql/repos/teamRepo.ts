@@ -3,6 +3,7 @@ import { Clock, Effect, Layer, Option } from "effect"
 import type { TeamId, UserId } from "../../../domain/ids.js"
 import { Team } from "../../../domain/team.js"
 import { User } from "../../../domain/user.js"
+import { TeamNumberConflict } from "../../../domain/errors.js"
 import { TeamRepo } from "../../../application/ports.js"
 import { decodeRow, nullableIntToBool, wrapSqlError } from "./support.js"
 
@@ -56,12 +57,23 @@ export const TeamRepoLive: Layer.Layer<TeamRepo, never, SqlClient.SqlClient> = L
           )
         ),
 
+      // team_number の UNIQUE 制約は「INSERT ... SELECT ... WHERE NOT EXISTS
+      // ... RETURNING」の単一原子的操作で検出する(benchJobRepo.insertIfAllowed
+      // と同じ形。SQL エラーメッセージの文字列判定より TOCTOU 安全)。
       create: (t: Team) =>
         Effect.gen(function* () {
           const now = yield* Clock.currentTimeMillis
-          yield* wrapSqlError(
-            sql`INSERT INTO teams (id, name, team_number, created_at) VALUES (${t.id}, ${t.name}, ${t.teamNumber}, ${now})`
+          const rows = yield* wrapSqlError(
+            sql<{ id: string }>`
+              INSERT INTO teams (id, name, team_number, created_at)
+              SELECT ${t.id}, ${t.name}, ${t.teamNumber}, ${now}
+              WHERE NOT EXISTS (SELECT 1 FROM teams WHERE team_number = ${t.teamNumber})
+              RETURNING id
+            `
           )
+          if (rows.length === 0) {
+            return yield* Effect.fail(new TeamNumberConflict({ teamNumber: t.teamNumber }))
+          }
         }),
 
       // 既存メンバーを全消しして渡された userIds で置き換える(全量置換)。

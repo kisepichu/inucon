@@ -36,3 +36,10 @@ export class TeamJobAlreadyQueued extends Data.TaggedError("TeamJobAlreadyQueued
 export class ContestNotRunning extends Data.TaggedError("ContestNotRunning")<{
   status: ContestStatus
 }> {}
+
+// teams.team_number の UNIQUE 制約違反。TeamJobAlreadyQueued と同様、リポジトリ
+// (SQLite 実装)が「INSERT ... WHERE NOT EXISTS ... RETURNING」の単一原子的操作
+// で検出して返す(TOCTOU 回避、benchJobRepo.ts の insertIfAllowed と同じ形)。
+export class TeamNumberConflict extends Data.TaggedError("TeamNumberConflict")<{
+  teamNumber: number
+}> {}

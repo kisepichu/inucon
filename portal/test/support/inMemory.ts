@@ -241,7 +241,9 @@ export const makeAuthReposTest = (): Layer.Layer<UserRepo | SessionRepo> =>
             })
           }),
         findById: (id) =>
-          Ref.get(usersRef).pipe(Effect.map((users) => Option.fromNullable(users.find((u) => u.id === id))))
+          Ref.get(usersRef).pipe(Effect.map((users) => Option.fromNullable(users.find((u) => u.id === id)))),
+        findManyByGithubLogins: (logins) =>
+          Ref.get(usersRef).pipe(Effect.map((users) => users.filter((u) => logins.includes(u.githubLogin))))
       }
 
       const sessionRepo: Context.Tag.Service<SessionRepo> = {

@@ -7,7 +7,20 @@ import {
   HttpApiSecurity
 } from "@effect/platform"
 import { Context, Schema } from "effect"
-import { Me, User } from "./schemas.js"
+import {
+  Contest,
+  ContestStatus,
+  CreateInstanceRequest,
+  CreateTeamRequest,
+  Instance,
+  InstanceId,
+  Me,
+  SetTeamMembersRequest,
+  Team,
+  TeamId,
+  TeamWithMembers,
+  User
+} from "./schemas.js"
 
 // --- cookie 名(ポータルのハンドラ/ミドルウェアと契約側で共有する) ---
 
@@ -40,6 +53,51 @@ export class OAuthExchangeFailed extends Schema.TaggedError<OAuthExchangeFailed>
   "OAuthExchangeFailed",
   {},
   HttpApiSchema.annotations({ status: 502 })
+) {}
+
+// URL の :id が指す行が無い(コンテスト未作成 / チーム不存在など)。
+export class NotFound extends Schema.TaggedError<NotFound>()(
+  "NotFound",
+  {},
+  HttpApiSchema.annotations({ status: 404 })
+) {}
+
+// POST /api/teams: teamNumber の重複(DB UNIQUE 制約違反をマップ)。
+export class TeamNumberConflict extends Schema.TaggedError<TeamNumberConflict>()(
+  "TeamNumberConflict",
+  { teamNumber: Schema.Int },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// PUT /api/teams/:id/members: 未ログイン(users に不在)の githubLogin。
+export class UnknownGithubLogins extends Schema.TaggedError<UnknownGithubLogins>()(
+  "UnknownGithubLogins",
+  { logins: Schema.Array(Schema.String) },
+  HttpApiSchema.annotations({ status: 422 })
+) {}
+
+// PUT /api/teams/:id/members: 既に他チームに所属しているユーザーが含まれる
+// (setMembers の全量置換で横取りしないよう、黙って無視せず 409 で返す)。
+export class MemberConflict extends Schema.TaggedError<MemberConflict>()(
+  "MemberConflict",
+  { logins: Schema.Array(Schema.String) },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// POST /api/instances: privateIp がチームサブネット外(domain の
+// validateBenchTarget をマップ)。
+export class TargetIpOutOfSubnet extends Schema.TaggedError<TargetIpOutOfSubnet>()(
+  "TargetIpOutOfSubnet",
+  { ip: Schema.String, teamNumber: Schema.Int },
+  HttpApiSchema.annotations({ status: 422 })
+) {}
+
+// POST /api/admin/contest/{start,finish}: 不正な状態遷移(domain の
+// startContest/finishContest をマップ)。
+export class InvalidContestTransition extends Schema.TaggedError<InvalidContestTransition>()(
+  "InvalidContestTransition",
+  { from: ContestStatus, to: ContestStatus },
+  HttpApiSchema.annotations({ status: 409 })
 ) {}
 
 // --- 認証ミドルウェア(契約側は Tag のみ。実装 Layer は portal 側) ---
@@ -102,4 +160,87 @@ export const authGroup = HttpApiGroup.make("auth")
     HttpApiEndpoint.post("logout", "/api/auth/logout").addSuccess(HttpApiSchema.NoContent)
   )
 
-export const api = HttpApi.make("inucon").add(healthGroup).add(authGroup)
+// GET /api/contest(セッション): 現在のコンテスト。無ければ 404。
+export const contestGroup = HttpApiGroup.make("contest").add(
+  HttpApiEndpoint.get("getContest", "/api/contest")
+    .addSuccess(Contest)
+    .addError(NotFound)
+    .middleware(Authentication)
+)
+
+export const teamsGroup = HttpApiGroup.make("teams")
+  // 参照はセッションのみ(全チームのメンバー情報込みで返す)。
+  .add(
+    HttpApiEndpoint.get("listTeams", "/api/teams")
+      .addSuccess(Schema.Array(TeamWithMembers))
+      .middleware(Authentication)
+  )
+  // 作成は admin のみ。teamNumber 重複は 409。
+  .add(
+    HttpApiEndpoint.post("createTeam", "/api/teams")
+      .setPayload(CreateTeamRequest)
+      .addSuccess(Team)
+      .addError(TeamNumberConflict)
+      .middleware(AdminOnly)
+  )
+  // メンバー割当(全量置換)も admin のみ。
+  .add(
+    HttpApiEndpoint.put("setTeamMembers")`/api/teams/${HttpApiSchema.param("id", TeamId)}/members`
+      .setPayload(SetTeamMembersRequest)
+      .addSuccess(TeamWithMembers)
+      .addError(NotFound)
+      .addError(UnknownGithubLogins)
+      .addError(MemberConflict)
+      .middleware(AdminOnly)
+  )
+
+export const instancesGroup = HttpApiGroup.make("instances")
+  // 参照は当該チームメンバー or admin(それ以外は Forbidden、403)。
+  .add(
+    HttpApiEndpoint.get("listTeamInstances")`/api/teams/${HttpApiSchema.param("id", TeamId)}/instances`
+      .addSuccess(Schema.Array(Instance))
+      .addError(NotFound)
+      .addError(Forbidden)
+      .middleware(Authentication)
+  )
+  // 登録は admin のみ。privateIp がチームサブネット外なら 422。
+  .add(
+    HttpApiEndpoint.post("createInstance", "/api/instances")
+      .setPayload(CreateInstanceRequest)
+      .addSuccess(Instance)
+      .addError(NotFound)
+      .addError(TargetIpOutOfSubnet)
+      .middleware(AdminOnly)
+  )
+  // 削除は admin のみ。logout と同様に冪等(存在しない id でも 204)。
+  .add(
+    HttpApiEndpoint.del("deleteInstance")`/api/instances/${HttpApiSchema.param("id", InstanceId)}`
+      .addSuccess(HttpApiSchema.NoContent)
+      .middleware(AdminOnly)
+  )
+
+// コンテスト状態遷移(admin のみ)。不正遷移は domain の
+// startContest/finishContest をマップした 409。
+export const adminGroup = HttpApiGroup.make("admin")
+  .add(
+    HttpApiEndpoint.post("startContest", "/api/admin/contest/start")
+      .addSuccess(Contest)
+      .addError(NotFound)
+      .addError(InvalidContestTransition)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.post("finishContest", "/api/admin/contest/finish")
+      .addSuccess(Contest)
+      .addError(NotFound)
+      .addError(InvalidContestTransition)
+      .middleware(AdminOnly)
+  )
+
+export const api = HttpApi.make("inucon")
+  .add(healthGroup)
+  .add(authGroup)
+  .add(contestGroup)
+  .add(teamsGroup)
+  .add(instancesGroup)
+  .add(adminGroup)

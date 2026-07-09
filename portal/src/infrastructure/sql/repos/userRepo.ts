@@ -55,7 +55,20 @@ export const UserRepoLive: Layer.Layer<UserRepo, never, SqlClient.SqlClient | Uu
           Effect.flatMap((rows) =>
             rows.length === 0 ? Effect.succeed(Option.none<User>()) : decodeUser(rows[0]).pipe(Effect.map(Option.some))
           )
-        )
+        ),
+
+      // 空配列を渡すと `IN ()` になってしまう(SQLite では構文エラー)ため、
+      // その場合は問い合わせずに空配列を返す。
+      findManyByGithubLogins: (logins: ReadonlyArray<string>) =>
+        logins.length === 0
+          ? Effect.succeed([])
+          : wrapSqlError(
+              sql<UserRow>`
+                SELECT id, github_id AS githubId, github_login AS githubLogin,
+                       display_name AS displayName, is_admin AS isAdmin
+                FROM users WHERE ${sql.in("github_login", logins)}
+              `
+            ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeUser)))
     }
   })
 )
