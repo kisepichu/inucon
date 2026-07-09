@@ -1,9 +1,9 @@
 import { it } from "@effect/vitest"
-import { Clock, Effect, Option } from "effect"
+import { Effect } from "effect"
 import { describe, expect } from "vitest"
 import { Contest } from "../../src/domain/contest.js"
 import { ContestId } from "../../src/domain/ids.js"
-import { BenchJobRepo, ContestRepo } from "../../src/application/ports.js"
+import { ContestRepo } from "../../src/application/ports.js"
 import { asAdmin, makeApiClient, makeRunnerApiClient, TestLayer } from "../support/apiTestHelpers.js"
 import { login } from "../support/login.js"
 
@@ -76,12 +76,10 @@ describe("E2E: チーム作成からベンチ実行・スコアボード反映�
       })
 
       // 8. finish を報告する。
-      const beforeFinish = Date.now()
       yield* runnerClient.runner.reportFinish({
         path: { id: job.id },
         payload: { passed: true, score: 100, errorMessage: null, logTail: "done\n" }
       })
-      const afterFinish = Date.now()
 
       // 9. スコアボードに反映される(全員参照可)。
       const scoreboard = yield* memberClient.scoreboard.getScoreboard()
