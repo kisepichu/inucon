@@ -58,6 +58,10 @@ const RunnerConfigLive = Layer.effect(
   RunnerConfig,
   Config.integer("JOB_TIMEOUT_MILLIS").pipe(
     Config.withDefault(600_000),
+    Config.validate({
+      message: "JOB_TIMEOUT_MILLIS must be a positive integer",
+      validation: (n) => n > 0
+    }),
     Effect.map((jobTimeoutMillis) => ({ jobTimeoutMillis }))
   )
 )

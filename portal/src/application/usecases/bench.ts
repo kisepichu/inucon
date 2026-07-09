@@ -83,20 +83,24 @@ export const pollNextJob = Effect.gen(function* () {
   return yield* jobs.dequeueNextQueued(now)
 })
 
-// progress は logChunk 省略時(既存呼び出し互換)は appendLog("") の no-op になる。
+// progress の logChunk 省略/空文字(ハートビートのみ)は appendLog 自体を
+// スキップして不要な DB 書き込みを避ける。
 export const reportProgress = (args: { jobId: BenchJobId; logChunk?: string }) =>
   Effect.gen(function* () {
     const jobs = yield* BenchJobRepo
     const now = yield* Clock.currentTimeMillis
     const job = yield* jobs.recordProgressIfRunning(args.jobId, now)
-    yield* jobs.appendLog(args.jobId, args.logChunk ?? "")
+    const chunk = args.logChunk ?? ""
+    if (chunk !== "") {
+      yield* jobs.appendLog(args.jobId, chunk)
+    }
     return job
   })
 
 // errorMessage が付いている(実行自体の失敗: バイナリ異常終了等)場合は
 // failIfRunning、無ければ finishIfRunning(score/passed を保存)。どちらも
-// running でなければ InvalidJobTransition。logTail は省略時(既存呼び出し
-// 互換)は appendLog("") の no-op になる。
+// running でなければ InvalidJobTransition。logTail の省略/空文字は
+// appendLog 自体をスキップする。
 export const reportFinish = (args: {
   jobId: BenchJobId
   score: number
@@ -111,7 +115,10 @@ export const reportFinish = (args: {
     const job = yield* (errorMessage === null
       ? jobs.finishIfRunning(args.jobId, { score: args.score, passed: args.passed }, now)
       : jobs.failIfRunning(args.jobId, errorMessage, now))
-    yield* jobs.appendLog(args.jobId, args.logTail ?? "")
+    const logTail = args.logTail ?? ""
+    if (logTail !== "") {
+      yield* jobs.appendLog(args.jobId, logTail)
+    }
     return job
   })
 
