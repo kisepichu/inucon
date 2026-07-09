@@ -29,17 +29,19 @@ import { MigratorTest, SqlTest } from "../support/sqlTest.js"
 // `:memory:` SQLite + 本番と同一マイグレーションを適用した Layer。it.layer(...)
 // の呼び出し単位(= 下の each `layer("...", ...)` ブロック単位)で独立した
 // DB がビルドされるため、テストデータの ID はブロック内でのみユニークであれば
-// 良い。UserRepoLive は UuidGen に依存するため明示的に provide する
-// (Layer.mergeAll は兄弟レイヤー同士の依存を自動解決しないため)。
+// 良い。UserRepoLive は UuidGen に依存するが Layer.mergeAll は兄弟レイヤー
+// 同士の依存を自動解決しないため、Layer.provideMerge(UuidGenLive) で
+// UuidGenLive を 1 回だけ構築し、それを他レイヤーの依存解決に使いつつ
+// 結果にも公開する(UuidGenLive を mergeAll のリストにも含めて
+// Layer.provide すると 2 インスタンスになってしまうため避ける)。
 const RepoLayer = Layer.mergeAll(
   ContestRepoLive,
   UserRepoLive,
   SessionRepoLive,
   TeamRepoLive,
   InstanceRepoLive,
-  BenchJobRepoLive,
-  UuidGenLive
-).pipe(Layer.provide(UuidGenLive), Layer.provideMerge(MigratorTest), Layer.provideMerge(SqlTest))
+  BenchJobRepoLive
+).pipe(Layer.provideMerge(UuidGenLive), Layer.provideMerge(MigratorTest), Layer.provideMerge(SqlTest))
 
 const layer = it.layer(RepoLayer)
 

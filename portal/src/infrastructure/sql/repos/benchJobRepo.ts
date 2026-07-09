@@ -55,32 +55,35 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
       )
 
     return {
-      // 「チームに queued/running なし」の再検証と INSERT を同一トランザクション
-      // で行う(TOCTOU 回避)。
+      // 存在チェックと INSERT を単一の条件付き INSERT ... SELECT ... WHERE NOT
+      // EXISTS ... RETURNING 文でアトミックに行う(TOCTOU 回避)。並行 fiber が
+      // それぞれ別文で COUNT→INSERT すると両方が count=0 を読める余地がある
+      // が、1 文の INSERT...SELECT なら DB のロックにより直列化される。
+      // 0 行挿入(= 既に queued/running あり)なら TeamJobAlreadyQueued。
+      // bench_job_logs の空行 INSERT は同一トランザクション内の別文のまま。
       insertIfAllowed: (job: BenchJob) =>
         wrapSqlError(
           sql.withTransaction(
             Effect.gen(function* () {
-              const countRows = yield* sql<{ count: number }>`
-                SELECT COUNT(*) AS count FROM bench_jobs
-                WHERE team_id = ${job.teamId} AND status IN ('queued', 'running')
-              `
-              if (countRows[0].count > 0) {
-                return yield* Effect.fail(new TeamJobAlreadyQueued({ teamId: job.teamId }))
-              }
-              yield* sql`
+              const rows = yield* sql<BenchJobRow>`
                 INSERT INTO bench_jobs
                   (id, team_id, target_ip, target_port, status, score, passed, error_message,
                    enqueued_at, started_at, finished_at, last_progress_at)
-                VALUES (
+                SELECT
                   ${job.id}, ${job.teamId}, ${job.targetIp}, ${job.targetPort}, ${job.status},
                   ${optionToNull(job.score)}, ${optionBoolToNullableInt(job.passed)}, ${optionToNull(job.errorMessage)},
                   ${job.enqueuedAt}, ${optionToNull(job.startedAt)}, ${optionToNull(job.finishedAt)},
                   ${optionToNull(job.lastProgressAt)}
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM bench_jobs WHERE team_id = ${job.teamId} AND status IN ('queued', 'running')
                 )
+                RETURNING ${columns}
               `
+              if (rows.length === 0) {
+                return yield* Effect.fail(new TeamJobAlreadyQueued({ teamId: job.teamId }))
+              }
               yield* sql`INSERT INTO bench_job_logs (job_id, log) VALUES (${job.id}, '')`
-              return job
+              return yield* decodeBenchJob(rows[0])
             })
           )
         ),
