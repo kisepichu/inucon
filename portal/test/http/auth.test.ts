@@ -84,13 +84,18 @@ describe("GET /auth/github/callback", () => {
     }).pipe(Effect.provide(TestLayer))
   )
 
-  it.effect("state 不一致は 400", () =>
+  it.effect("state 不一致は 400(state cookie も破棄される)", () =>
     Effect.gen(function* () {
       const client = yield* HttpClient.HttpClient
       const res = yield* client.get("/auth/github/callback?code=code-taro&state=evil", {
         headers: { cookie: `${STATE_COOKIE}=st-1` }
       })
       expect(res.status).toBe(400)
+
+      // state cookie が破棄されることを確認
+      const state = getCookie(res.cookies, STATE_COOKIE)
+      expect(state.value).toBe("")
+      expect(state.options?.maxAge).toStrictEqual(Duration.zero)
     }).pipe(Effect.provide(TestLayer))
   )
 
@@ -112,13 +117,18 @@ describe("GET /auth/github/callback", () => {
     }).pipe(Effect.provide(TestLayer))
   )
 
-  it.effect("コード交換に失敗したら 502", () =>
+  it.effect("コード交換に失敗したら 502(state cookie も破棄される)", () =>
     Effect.gen(function* () {
       const client = yield* HttpClient.HttpClient
       const res = yield* client.get("/auth/github/callback?code=unknown-code&state=st-1", {
         headers: { cookie: `${STATE_COOKIE}=st-1` }
       })
       expect(res.status).toBe(502)
+
+      // state cookie が破棄されることを確認
+      const state = getCookie(res.cookies, STATE_COOKIE)
+      expect(state.value).toBe("")
+      expect(state.options?.maxAge).toStrictEqual(Duration.zero)
     }).pipe(Effect.provide(TestLayer))
   )
 })

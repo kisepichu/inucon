@@ -38,22 +38,36 @@ export const AuthLive = HttpApiBuilder.group(api, "auth", (handlers) =>
         const request = yield* HttpServerRequest.HttpServerRequest
         const stateCookie = request.cookies[STATE_COOKIE]
         if (stateCookie === undefined || stateCookie !== urlParams.state) {
-          return yield* Effect.fail(new InvalidOAuthState())
+          // state 不一致: 400 を返す(state cookie を破棄)
+          return yield* HttpServerResponse.empty({ status: 400 }).pipe(
+            HttpServerResponse.setCookie(STATE_COOKIE, "", { ...secureCookie, maxAge: Duration.zero }),
+            Effect.orDie
+          )
         }
 
-        const { sessionId } = yield* handleOAuthCallback({ code: urlParams.code }).pipe(
+        const result = yield* handleOAuthCallback({ code: urlParams.code }).pipe(
           Effect.catchTags({
-            OAuthFailed: () => Effect.fail(new OAuthExchangeFailed()),
+            OAuthFailed: () => Effect.succeed(null),
             RepoError: (e) => Effect.die(e)
           })
         )
+
+        if (result === null) {
+          // トークン交換失敗: 502 を返す(state cookie を破棄)
+          return yield* HttpServerResponse.empty({ status: 502 }).pipe(
+            HttpServerResponse.setCookie(STATE_COOKIE, "", { ...secureCookie, maxAge: Duration.zero }),
+            Effect.orDie
+          )
+        }
+
+        const { sessionId } = result
 
         return yield* HttpServerResponse.redirect("/", { status: 302 }).pipe(
           HttpServerResponse.setCookie(SESSION_COOKIE, sessionId, {
             ...secureCookie,
             maxAge: Duration.millis(SESSION_TTL_MILLIS)
           }),
-          // 使い終わった state cookie は破棄する。
+          // 使い終わった state cookie は全パスで破棄する(成功時も失敗時も)。
           Effect.flatMap(
             HttpServerResponse.setCookie(STATE_COOKIE, "", { ...secureCookie, maxAge: Duration.zero })
           ),
