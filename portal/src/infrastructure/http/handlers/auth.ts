@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto"
 import { HttpApiBuilder, HttpServerRequest, HttpServerResponse } from "@effect/platform"
-import { Config, Duration, Effect, Layer, Option } from "effect"
+import { Config, Duration, Effect, Either, Layer, Option } from "effect"
 import {
   api,
   CurrentUser,
@@ -59,19 +59,16 @@ export const AuthLive = Layer.unwrapEffect(
               )
             }
 
-            const result = yield* handleOAuthCallback({ code }).pipe(
-              Effect.catchTags({
-                OAuthFailed: () => Effect.succeed(null),
-                RepoError: (e) => Effect.die(e)
-              })
-            )
+            const result = yield* Effect.either(handleOAuthCallback({ code }))
 
-            if (result === null) {
-              // トークン交換失敗: 502 を返す(state cookie を破棄)。
-              // ボディは契約(OAuthExchangeFailed)の encode と同形の JSON にする。
-              const response = yield* HttpServerResponse.schemaJson(OAuthExchangeFailed)(
-                new OAuthExchangeFailed(),
-                { status: 502 }
+            if (Either.isLeft(result)) {
+              // 失敗時も state cookie は必ず破棄する。
+              // - OAuthFailed(トークン交換失敗): 502。ボディは契約
+              //   (OAuthExchangeFailed)の encode と同形の JSON にする。
+              // - RepoError: 500(内部エラー。ボディなし)
+              const response = yield* (result.left._tag === "OAuthFailed"
+                ? HttpServerResponse.schemaJson(OAuthExchangeFailed)(new OAuthExchangeFailed(), { status: 502 })
+                : Effect.succeed(HttpServerResponse.empty({ status: 500 }))
               ).pipe(Effect.orDie)
               return yield* response.pipe(
                 HttpServerResponse.setCookie(STATE_COOKIE, "", { ...secureCookie, maxAge: Duration.zero }),
@@ -79,7 +76,7 @@ export const AuthLive = Layer.unwrapEffect(
               )
             }
 
-            const { sessionId } = result
+            const { sessionId } = result.right
 
             return yield* HttpServerResponse.redirect("/", { status: 302 }).pipe(
               HttpServerResponse.setCookie(SESSION_COOKIE, sessionId, {
