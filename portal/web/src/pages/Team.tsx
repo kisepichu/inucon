@@ -29,9 +29,18 @@ export function Team({ me }: TeamProps) {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const loadJobs = useCallback(async (teamId: string) => {
-    const data = await api.listBenchJobs(teamId)
-    setJobs(data)
+  const loadJobs = useCallback(async (teamId: string, isCanceled: () => boolean) => {
+    try {
+      const data = await api.listBenchJobs(teamId)
+      if (!isCanceled()) {
+        setJobs(data)
+        setError(null)
+      }
+    } catch (err) {
+      if (!isCanceled()) {
+        setError(err instanceof ApiError ? err.tag : "ジョブ履歴の読み込みに失敗しました")
+      }
+    }
   }, [])
 
   // インスタンス一覧・コンテスト状態は 1 回取得。ジョブ履歴は「実行不可の理由」の
@@ -41,6 +50,7 @@ export function Team({ me }: TeamProps) {
       return
     }
     let canceled = false
+    const isCanceled = () => canceled
 
     ;(async () => {
       try {
@@ -63,8 +73,8 @@ export function Team({ me }: TeamProps) {
       }
     })()
 
-    loadJobs(team.id)
-    const id = setInterval(() => loadJobs(team.id), JOBS_POLL_MILLIS)
+    loadJobs(team.id, isCanceled)
+    const id = setInterval(() => loadJobs(team.id, isCanceled), JOBS_POLL_MILLIS)
     return () => {
       canceled = true
       clearInterval(id)
@@ -81,7 +91,9 @@ export function Team({ me }: TeamProps) {
     ? "コンテストは開催されていません"
     : hasActiveJob
       ? "既に実行中のジョブがあります"
-      : null
+      : !useManualTarget && !selectedInstanceId
+        ? "インスタンスを選択してください"
+        : null
 
   const handleEnqueue = async (event: React.FormEvent) => {
     event.preventDefault()
@@ -95,7 +107,7 @@ export function Team({ me }: TeamProps) {
         // InstanceId にキャストする(フロントエンドはランタイム検証をしない方針)。
         await api.enqueueBench({ instanceId: selectedInstanceId as InstanceId })
       }
-      await loadJobs(team.id)
+      await loadJobs(team.id, () => false)
     } catch (err) {
       setError(err instanceof ApiError ? err.tag : "実行に失敗しました")
     } finally {

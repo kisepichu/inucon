@@ -38,7 +38,13 @@ export function Admin() {
   }, [])
 
   useEffect(() => {
-    loadTeams()
+    ;(async () => {
+      try {
+        await loadTeams()
+      } catch (err) {
+        setError(err instanceof ApiError ? err.tag : "チーム一覧の読み込みに失敗しました")
+      }
+    })()
     loadContest()
   }, [loadTeams, loadContest])
 

@@ -36,19 +36,23 @@ const CONTENT_TYPES: Record<string, string> = {
 
 const contentTypeFor = (path: string): string => CONTENT_TYPES[extname(path)] ?? "application/octet-stream"
 
-// dist 配下のファイルを読んでレスポンスにする。存在しない/読めない場合は
-// 警告ログを出して 404 を返す(例外で落とさない)。
+// dist 配下のファイルを読んでレスポンスにする。ENOENT/ENOTDIR は 404 だけ返し、
+// その他のエラーは警告ログを出して 404 を返す(例外で落とさない)。
 const serveFile = (absPath: string): Effect.Effect<HttpServerResponse.HttpServerResponse> =>
   Effect.tryPromise({
     try: () => readFile(absPath),
     catch: (cause) => cause
   }).pipe(
     Effect.map((buf) => HttpServerResponse.uint8Array(buf, { contentType: contentTypeFor(absPath) })),
-    Effect.catchAll((cause) =>
-      Effect.logWarning(`static: file not found: ${absPath}`, cause).pipe(
+    Effect.catchAll((cause) => {
+      const code = cause instanceof Error && 'code' in cause ? (cause.code as string) : undefined
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        return Effect.succeed(HttpServerResponse.empty({ status: 404 }))
+      }
+      return Effect.logWarning(`static: file not found: ${absPath}`, cause).pipe(
         Effect.as(HttpServerResponse.empty({ status: 404 }))
       )
-    )
+    })
   )
 
 // resolve 後に dist(root)配下であることを確認する。root 自身も許可する。
