@@ -1,12 +1,21 @@
-import { Effect, Either, Layer, Option, Ref } from "effect"
+import { Context, Effect, Either, Layer, Option, Ref } from "effect"
 import { cancelJob, failJob, finishJob, recordProgress, startJob } from "../../src/domain/benchJob.js"
 import type { BenchJob } from "../../src/domain/benchJob.js"
 import type { Contest } from "../../src/domain/contest.js"
 import { CannotCancelRunning, InvalidJobTransition, TeamJobAlreadyQueued } from "../../src/domain/errors.js"
-import type { BenchJobId, TeamId, UserId } from "../../src/domain/ids.js"
+import type { BenchJobId, TeamId } from "../../src/domain/ids.js"
+import { UserId } from "../../src/domain/ids.js"
+import { User } from "../../src/domain/user.js"
 import type { Team } from "../../src/domain/team.js"
-import type { User } from "../../src/domain/user.js"
-import { BenchJobRepo, ContestRepo, RunnerConfig, TeamRepo, UuidGen } from "../../src/application/ports.js"
+import {
+  BenchJobRepo,
+  ContestRepo,
+  RunnerConfig,
+  SessionRepo,
+  TeamRepo,
+  UserRepo,
+  UuidGen
+} from "../../src/application/ports.js"
 
 // テスト専用のインメモリ port 実装。すべて Ref ベースで、ports.ts のコメントに
 // 書かれた意味論(TOCTOU 回避 / 全体 running 1 本制約)を素直に再現する。
@@ -193,3 +202,68 @@ export const makeBenchJobRepoTest = (initial: ReadonlyArray<BenchJob> = []): Lay
 
 export const RunnerConfigTest = (jobTimeoutMillis: number): Layer.Layer<RunnerConfig> =>
   Layer.succeed(RunnerConfig, { jobTimeoutMillis })
+
+// UserRepo と SessionRepo のインメモリ実装。findValidUser が users と sessions
+// を JOIN する(本番 SQL 実装と同じ意味論)ため、両者で状態を共有する必要が
+// あり、1 つの Layer で両タグをまとめて提供する。
+export const makeAuthReposTest = (): Layer.Layer<UserRepo | SessionRepo> =>
+  Layer.effectContext(
+    Effect.gen(function* () {
+      const usersRef = yield* Ref.make<ReadonlyArray<User>>([])
+      const sessionsRef = yield* Ref.make<
+        ReadonlyArray<{ sessionId: string; userId: UserId; expiresAt: number }>
+      >([])
+      const counter = yield* Ref.make(0)
+
+      const userRepo: Context.Tag.Service<UserRepo> = {
+        upsertByGithub: (u) =>
+          Effect.gen(function* () {
+            const n = yield* Ref.updateAndGet(counter, (c) => c + 1)
+            return yield* Ref.modify(usersRef, (users): readonly [User, ReadonlyArray<User>] => {
+              const existing = users.find((x) => x.githubId === u.githubId)
+              if (existing !== undefined) {
+                const updated = new User({
+                  ...existing,
+                  githubLogin: u.githubLogin,
+                  displayName: u.displayName,
+                  isAdmin: u.isAdmin
+                })
+                return [updated, users.map((x) => (x.githubId === u.githubId ? updated : x))]
+              }
+              const created = new User({
+                id: UserId.make(`test-user-${n}`),
+                githubId: u.githubId,
+                githubLogin: u.githubLogin,
+                displayName: u.displayName,
+                isAdmin: u.isAdmin
+              })
+              return [created, [...users, created]]
+            })
+          }),
+        findById: (id) =>
+          Ref.get(usersRef).pipe(Effect.map((users) => Option.fromNullable(users.find((u) => u.id === id))))
+      }
+
+      const sessionRepo: Context.Tag.Service<SessionRepo> = {
+        create: (userId, expiresAt) =>
+          Effect.gen(function* () {
+            const n = yield* Ref.updateAndGet(counter, (c) => c + 1)
+            const sessionId = `test-session-${n}`
+            yield* Ref.update(sessionsRef, (sessions) => [...sessions, { sessionId, userId, expiresAt }])
+            return sessionId
+          }),
+        findValidUser: (sessionId, now) =>
+          Effect.gen(function* () {
+            const sessions = yield* Ref.get(sessionsRef)
+            const session = sessions.find((s) => s.sessionId === sessionId && s.expiresAt > now)
+            if (session === undefined) return Option.none<User>()
+            const users = yield* Ref.get(usersRef)
+            return Option.fromNullable(users.find((u) => u.id === session.userId))
+          }),
+        delete: (sessionId) =>
+          Ref.update(sessionsRef, (sessions) => sessions.filter((s) => s.sessionId !== sessionId))
+      }
+
+      return Context.make(UserRepo, userRepo).pipe(Context.add(SessionRepo, sessionRepo))
+    })
+  )
