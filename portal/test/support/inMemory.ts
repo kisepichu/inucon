@@ -1,8 +1,8 @@
 import { Effect, Either, Layer, Option, Ref } from "effect"
-import { failJob, startJob } from "../../src/domain/benchJob.js"
+import { cancelJob, failJob, finishJob, recordProgress, startJob } from "../../src/domain/benchJob.js"
 import type { BenchJob } from "../../src/domain/benchJob.js"
 import type { Contest } from "../../src/domain/contest.js"
-import { TeamJobAlreadyQueued } from "../../src/domain/errors.js"
+import { CannotCancelRunning, InvalidJobTransition, TeamJobAlreadyQueued } from "../../src/domain/errors.js"
 import type { BenchJobId, TeamId, UserId } from "../../src/domain/ids.js"
 import type { Team } from "../../src/domain/team.js"
 import type { User } from "../../src/domain/user.js"
@@ -83,6 +83,39 @@ export const makeBenchJobRepoTest = (initial: ReadonlyArray<BenchJob> = []): Lay
     Effect.gen(function* () {
       const jobsRef = yield* Ref.make(initial)
       const logsRef = yield* Ref.make<Record<string, string>>({})
+
+      // reportProgress/reportFinish/cancel 共通の「判定+更新」ヘルパー。単一の
+      // Ref.modify コールバック内でジョブを引き、domain の遷移関数
+      // (recordProgress/finishJob/cancelJob)を適用して書き戻すことで TOCTOU を
+      // 回避する(ports.ts のコメントにある「条件付き UPDATE 1 文」の模擬)。
+      // ジョブ自体が見つからない場合は defect(die)にする(既存方針どおり)。
+      const atomicTransition = <E>(
+        id: BenchJobId,
+        actionName: string,
+        transition: (job: BenchJob) => Either.Either<BenchJob, E>
+      ): Effect.Effect<BenchJob, E> =>
+        Ref.modify(
+          jobsRef,
+          (jobs): readonly [Option.Option<Either.Either<BenchJob, E>>, ReadonlyArray<BenchJob>] => {
+            const job = jobs.find((j) => j.id === id)
+            if (job === undefined) return [Option.none(), jobs]
+            return Either.match(transition(job), {
+              onLeft: (e) => [Option.some(Either.left(e)), jobs],
+              onRight: (updated) => [
+                Option.some(Either.right(updated)),
+                jobs.map((j) => (j.id === id ? updated : j))
+              ]
+            })
+          }
+        ).pipe(
+          Effect.flatMap(
+            Option.match({
+              onNone: () => Effect.dieMessage(`${actionName}: BenchJob ${id} not found`),
+              onSome: Either.match({ onLeft: Effect.fail, onRight: Effect.succeed })
+            })
+          )
+        )
+
       return {
         insertIfAllowed: (job: BenchJob) =>
           Ref.modify(
@@ -125,7 +158,12 @@ export const makeBenchJobRepoTest = (initial: ReadonlyArray<BenchJob> = []): Lay
               return [Option.some(started), updated]
             }
           ),
-        save: (job: BenchJob) => Ref.update(jobsRef, (jobs) => jobs.map((j) => (j.id === job.id ? job : j))),
+        recordProgressIfRunning: (id: BenchJobId, now: number) =>
+          atomicTransition(id, "recordProgressIfRunning", (job) => recordProgress(job, now)),
+        finishIfRunning: (id: BenchJobId, result: { score: number; passed: boolean }, now: number) =>
+          atomicTransition(id, "finishIfRunning", (job) => finishJob(job, result, now)),
+        cancelIfQueued: (id: BenchJobId) =>
+          atomicTransition<CannotCancelRunning | InvalidJobTransition>(id, "cancelIfQueued", (job) => cancelJob(job)),
         appendLog: (id: BenchJobId, chunk: string) =>
           Ref.update(logsRef, (logs) => ({ ...logs, [id]: (logs[id] ?? "") + chunk })),
         getLog: (id: BenchJobId) => Ref.get(logsRef).pipe(Effect.map((logs) => logs[id] ?? "")),

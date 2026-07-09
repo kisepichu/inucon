@@ -366,3 +366,84 @@ describe("sweepTimedOutJobs", () => {
     )
   )
 })
+
+// reportProgress/reportFinish/cancel を「判定+更新」を単一の原子的操作に
+// 寄せた(recordProgressIfRunning/finishIfRunning/cancelIfQueued)ことの回帰
+// テスト。sweep や dequeue が先にジョブの状態を変えてしまうケースで、後続の
+// ユースケースが古い状態を前提に上書きしないことを確認する。
+describe("状態遷移の競合(TOCTOU 回帰)", () => {
+  it.effect("sweep で failed になったジョブへの reportFinish は InvalidJobTransition で失敗し failed のまま", () =>
+    Effect.gen(function* () {
+      const staleId = BenchJobId.make("77777777-8888-9999-aaaa-bbbbbbbbbbbb")
+      // now=700_000, timeout=600_000 → cutoff=100_000。lastProgressAt=0 は対象。
+      yield* TestClock.setTime(700_000)
+      const count = yield* sweepTimedOutJobs
+      expect(count).toBe(1)
+
+      const exit = yield* Effect.exit(reportFinish({ jobId: staleId, score: 100, passed: true }))
+      expect(exit).toStrictEqual(
+        Exit.fail(new InvalidJobTransition({ jobId: staleId, from: "failed", action: "finish" }))
+      )
+
+      const jobs = yield* BenchJobRepo
+      const after = yield* jobs.findById(staleId)
+      expect(Option.isSome(after)).toBe(true)
+      if (Option.isSome(after)) {
+        expect(after.value.status).toBe("failed")
+      }
+    }).pipe(
+      Effect.provide(
+        testLayer(
+          "running",
+          [
+            new BenchJob({
+              ...runningJobAt({
+                id: BenchJobId.make("77777777-8888-9999-aaaa-bbbbbbbbbbbb"),
+                teamId: team1Id,
+                targetIp: "10.100.1.9",
+                enqueuedAt: 0,
+                now: 0
+              }),
+              lastProgressAt: Option.some(0)
+            })
+          ],
+          600_000
+        )
+      )
+    )
+  )
+
+  it.effect("dequeue で running になったジョブへの cancelBench は CannotCancelRunning で失敗し running のまま", () =>
+    Effect.gen(function* () {
+      const queuedId = BenchJobId.make("99999999-aaaa-bbbb-cccc-dddddddddddd")
+
+      const dequeued = yield* pollNextJob
+      expect(Option.isSome(dequeued)).toBe(true)
+      if (Option.isSome(dequeued)) {
+        expect(dequeued.value.status).toBe("running")
+      }
+
+      const exit = yield* Effect.exit(cancelBench({ user: user1, jobId: queuedId }))
+      expect(exit).toStrictEqual(Exit.fail(new CannotCancelRunning({ jobId: queuedId })))
+
+      const jobs = yield* BenchJobRepo
+      const after = yield* jobs.findById(queuedId)
+      expect(Option.isSome(after)).toBe(true)
+      if (Option.isSome(after)) {
+        expect(after.value.status).toBe("running")
+      }
+    }).pipe(
+      Effect.provide(
+        testLayer("running", [
+          newJob({
+            id: BenchJobId.make("99999999-aaaa-bbbb-cccc-dddddddddddd"),
+            teamId: team1Id,
+            targetIp: "10.100.1.9",
+            targetPort: 8080,
+            now: 1000
+          })
+        ])
+      )
+    )
+  )
+})

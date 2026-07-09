@@ -1,14 +1,19 @@
 import { Clock, Effect, Either, Option } from "effect"
-import { cancelJob, checkEnqueueAllowed, finishJob, newJob, recordProgress } from "../../domain/benchJob.js"
+import { checkEnqueueAllowed, newJob } from "../../domain/benchJob.js"
 import { ContestNotRunning } from "../../domain/errors.js"
 import type { User } from "../../domain/user.js"
 import { BenchJobId } from "../../domain/ids.js"
 import { Forbidden, NotInTeam } from "../errors.js"
 import { BenchJobRepo, ContestRepo, RunnerConfig, TeamRepo, UuidGen } from "../ports.js"
 
-// repo 取得 → domain 遷移関数(Either.match で E チャネルへ)→ save、が全ユース
-// ケース共通の形。ports.ts のメソッドはすべて R=never なので、この関数群も
-// R=never のまま(Layer 合成は main.ts の 1 箇所に集約する)。
+// enqueue は「repo 取得 → domain 遷移関数(Either.match で E チャネルへ)→
+// insertIfAllowed」の形。状態遷移系(cancel/reportProgress/reportFinish/sweep)
+// は判定と更新を単一の原子的操作にまとめた port メソッド(cancelIfQueued 等)
+// に委譲し、ユースケース側は findById による authz チェックの後にそれを
+// 呼ぶだけの薄い形にしている(TOCTOU 回避)。
+// ports.ts の各メソッドの R はいずれも never だが、ユースケース自体は
+// Context.Tag(ContestRepo/TeamRepo/BenchJobRepo/UuidGen/RunnerConfig)と
+// Clock を環境として要求する(Layer 合成は main.ts の 1 箇所に集約する)。
 
 export const enqueueBench = (args: { user: User; targetIp: string; targetPort: number }) =>
   Effect.gen(function* () {
@@ -69,9 +74,7 @@ export const cancelBench = (args: { user: User; jobId: BenchJobId }) =>
       return yield* Effect.fail(new Forbidden())
     }
 
-    const canceled = yield* Either.match(cancelJob(job), { onLeft: Effect.fail, onRight: Effect.succeed })
-    yield* jobs.save(canceled)
-    return canceled
+    return yield* jobs.cancelIfQueued(args.jobId)
   })
 
 export const pollNextJob = Effect.gen(function* () {
@@ -83,38 +86,15 @@ export const pollNextJob = Effect.gen(function* () {
 export const reportProgress = (args: { jobId: BenchJobId }) =>
   Effect.gen(function* () {
     const jobs = yield* BenchJobRepo
-    const job = yield* jobs.findById(args.jobId).pipe(
-      Effect.flatMap(
-        Option.match({
-          onNone: () => Effect.dieMessage(`reportProgress: BenchJob ${args.jobId} not found`),
-          onSome: Effect.succeed
-        })
-      )
-    )
     const now = yield* Clock.currentTimeMillis
-    const updated = yield* Either.match(recordProgress(job, now), { onLeft: Effect.fail, onRight: Effect.succeed })
-    yield* jobs.save(updated)
-    return updated
+    return yield* jobs.recordProgressIfRunning(args.jobId, now)
   })
 
 export const reportFinish = (args: { jobId: BenchJobId; score: number; passed: boolean }) =>
   Effect.gen(function* () {
     const jobs = yield* BenchJobRepo
-    const job = yield* jobs.findById(args.jobId).pipe(
-      Effect.flatMap(
-        Option.match({
-          onNone: () => Effect.dieMessage(`reportFinish: BenchJob ${args.jobId} not found`),
-          onSome: Effect.succeed
-        })
-      )
-    )
     const now = yield* Clock.currentTimeMillis
-    const finished = yield* Either.match(finishJob(job, { score: args.score, passed: args.passed }, now), {
-      onLeft: Effect.fail,
-      onRight: Effect.succeed
-    })
-    yield* jobs.save(finished)
-    return finished
+    return yield* jobs.finishIfRunning(args.jobId, { score: args.score, passed: args.passed }, now)
   })
 
 export const sweepTimedOutJobs = Effect.gen(function* () {

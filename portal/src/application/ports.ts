@@ -1,7 +1,7 @@
 import { Context, Data, Effect, Option } from "effect"
 import type { BenchJob } from "../domain/benchJob.js"
 import type { Contest } from "../domain/contest.js"
-import { TeamJobAlreadyQueued } from "../domain/errors.js"
+import { CannotCancelRunning, InvalidJobTransition, TeamJobAlreadyQueued } from "../domain/errors.js"
 import type { BenchJobId, InstanceId, TeamId, UserId } from "../domain/ids.js"
 import type { Instance } from "../domain/instance.js"
 import type { Team } from "../domain/team.js"
@@ -79,7 +79,6 @@ export class BenchJobRepo extends Context.Tag("app/BenchJobRepo")<
     readonly listByTeam: (teamId: TeamId, limit: number) => Effect.Effect<ReadonlyArray<BenchJob>, RepoError>
     // 全体 running=0 のときだけ先頭 queued を running 化(アトミック)
     readonly dequeueNextQueued: (now: number) => Effect.Effect<Option.Option<BenchJob>, RepoError>
-    readonly save: (job: BenchJob) => Effect.Effect<void, RepoError>
     readonly appendLog: (id: BenchJobId, chunk: string) => Effect.Effect<void, RepoError>
     readonly getLog: (id: BenchJobId) => Effect.Effect<string, RepoError>
     // status='running' かつ lastProgressAt < cutoff のジョブをアトミックに
@@ -88,6 +87,31 @@ export class BenchJobRepo extends Context.Tag("app/BenchJobRepo")<
     // を返す。reportFinish との競合で finished を上書きしないことはこの条件
     // 式が保証する。
     readonly failTimedOutJobs: (cutoff: number, now: number) => Effect.Effect<number, RepoError>
+    // 判定と更新は単一の原子的操作。SQLite 実装では
+    // `UPDATE ... WHERE id=? AND status='running'` の条件付き UPDATE 1 文 +
+    // RETURNING。0 行更新時は現在の status を読み直して型付きエラーを構築する。
+    // ジョブ自体が存在しない場合は defect(die)でよい(ジョブ行は削除されない)。
+    readonly recordProgressIfRunning: (
+      id: BenchJobId,
+      now: number
+    ) => Effect.Effect<BenchJob, RepoError | InvalidJobTransition>
+    // 判定と更新は単一の原子的操作。SQLite 実装では
+    // `UPDATE ... WHERE id=? AND status='running'` の条件付き UPDATE 1 文 +
+    // RETURNING。0 行更新時は現在の status を読み直して型付きエラーを構築する。
+    // ジョブ自体が存在しない場合は defect(die)でよい(ジョブ行は削除されない)。
+    readonly finishIfRunning: (
+      id: BenchJobId,
+      result: { score: number; passed: boolean },
+      now: number
+    ) => Effect.Effect<BenchJob, RepoError | InvalidJobTransition>
+    // 判定と更新は単一の原子的操作。SQLite 実装では
+    // `UPDATE ... WHERE id=? AND status='queued'` の条件付き UPDATE 1 文 +
+    // RETURNING。0 行更新時は現在の status を読み直して型付きエラーを構築する
+    // (running なら CannotCancelRunning、それ以外は InvalidJobTransition)。
+    // ジョブ自体が存在しない場合は defect(die)でよい(ジョブ行は削除されない)。
+    readonly cancelIfQueued: (
+      id: BenchJobId
+    ) => Effect.Effect<BenchJob, RepoError | CannotCancelRunning | InvalidJobTransition>
     readonly scoreboard: Effect.Effect<
       ReadonlyArray<{
         teamId: TeamId
