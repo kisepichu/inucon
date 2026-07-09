@@ -6,7 +6,12 @@ import { Contest } from "../../src/domain/contest.js"
 import { Instance } from "../../src/domain/instance.js"
 import { Team } from "../../src/domain/team.js"
 import { User } from "../../src/domain/user.js"
-import { CannotCancelRunning, InvalidJobTransition, TeamJobAlreadyQueued } from "../../src/domain/errors.js"
+import {
+  CannotCancelRunning,
+  DuplicateInstanceIndex,
+  InvalidJobTransition,
+  TeamJobAlreadyQueued
+} from "../../src/domain/errors.js"
 import { BenchJobId, ContestId, InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
 import {
   BenchJobRepo,
@@ -244,7 +249,8 @@ layer("InstanceRepo", (it) => {
         privateIp: "10.100.102.10",
         status: "active"
       })
-      yield* instances.create(instance)
+      const created = yield* instances.create(instance)
+      expect(created).toStrictEqual(instance)
 
       const listed = yield* instances.listByTeam(team.id)
       expect(listed).toStrictEqual([instance])
@@ -252,6 +258,40 @@ layer("InstanceRepo", (it) => {
       yield* instances.remove(instance.id)
       const afterRemove = yield* instances.listByTeam(team.id)
       expect(afterRemove).toStrictEqual([])
+    })
+  )
+})
+
+layer("InstanceRepo: create 重複拒否", (it) => {
+  it.effect("同一 (team, index) の二重 create は DuplicateInstanceIndex", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const team = new Team({ id: TeamId.make("team-repo-instances-dup"), name: "Instances Dup", teamNumber: 103 })
+      yield* teams.create(team)
+
+      const first = new Instance({
+        id: InstanceId.make("instance-dup-1"),
+        teamId: team.id,
+        index: 1,
+        privateIp: "10.100.103.10",
+        status: "active"
+      })
+      yield* instances.create(first)
+
+      const second = new Instance({
+        id: InstanceId.make("instance-dup-2"),
+        teamId: team.id,
+        index: 1,
+        privateIp: "10.100.103.11",
+        status: "active"
+      })
+      const exit = yield* Effect.exit(instances.create(second))
+      expect(exit).toStrictEqual(Exit.fail(new DuplicateInstanceIndex({ teamId: team.id, index: 1 })))
+
+      // 拒否された行は挿入されていない(元の1件のみ残る)
+      const listed = yield* instances.listByTeam(team.id)
+      expect(listed).toStrictEqual([first])
     })
   )
 })

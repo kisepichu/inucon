@@ -1,7 +1,13 @@
 import { Context, Data, Effect, Option } from "effect"
 import type { BenchJob } from "../domain/benchJob.js"
 import type { Contest } from "../domain/contest.js"
-import { CannotCancelRunning, InvalidJobTransition, TeamJobAlreadyQueued } from "../domain/errors.js"
+import {
+  CannotCancelRunning,
+  DuplicateInstanceIndex,
+  InvalidJobTransition,
+  TeamJobAlreadyQueued,
+  TeamNumberConflict
+} from "../domain/errors.js"
 import type { BenchJobId, InstanceId, TeamId, UserId } from "../domain/ids.js"
 import type { Instance } from "../domain/instance.js"
 import type { Team } from "../domain/team.js"
@@ -36,6 +42,12 @@ export class UserRepo extends Context.Tag("app/UserRepo")<
       isAdmin: boolean
     }) => Effect.Effect<User, RepoError>
     readonly findById: (id: UserId) => Effect.Effect<Option.Option<User>, RepoError>
+    // PUT /api/teams/:id/members のバリデーション(未ログイン login の検出)用。
+    // 渡された githubLogins のうち実在する行だけを返す(存在しない login は
+    // 結果に現れない → 呼び出し元が差分を取って UnknownGithubLogins を判定する)。
+    readonly findManyByGithubLogins: (
+      logins: ReadonlyArray<string>
+    ) => Effect.Effect<ReadonlyArray<User>, RepoError>
   }
 >() {}
 
@@ -55,7 +67,10 @@ export class TeamRepo extends Context.Tag("app/TeamRepo")<
     readonly list: Effect.Effect<ReadonlyArray<Team>, RepoError>
     readonly findById: (id: TeamId) => Effect.Effect<Option.Option<Team>, RepoError>
     readonly findByUserId: (id: UserId) => Effect.Effect<Option.Option<Team>, RepoError>
-    readonly create: (t: Team) => Effect.Effect<void, RepoError>
+    // team_number の UNIQUE 制約違反は TeamNumberConflict にマップする
+    // (benchJobRepo.insertIfAllowed と同じ「INSERT ... WHERE NOT EXISTS ...
+    // RETURNING」の単一原子的操作で TOCTOU を回避する、SQLite 実装)。
+    readonly create: (t: Team) => Effect.Effect<void, RepoError | TeamNumberConflict>
     readonly setMembers: (teamId: TeamId, userIds: ReadonlyArray<UserId>) => Effect.Effect<void, RepoError>
     readonly listMembers: (teamId: TeamId) => Effect.Effect<ReadonlyArray<User>, RepoError>
   }
@@ -65,7 +80,11 @@ export class InstanceRepo extends Context.Tag("app/InstanceRepo")<
   InstanceRepo,
   {
     readonly listByTeam: (teamId: TeamId) => Effect.Effect<ReadonlyArray<Instance>, RepoError>
-    readonly create: (i: Instance) => Effect.Effect<void, RepoError>
+    // instances.(team_id, idx) の UNIQUE 制約は「INSERT ... SELECT ... WHERE
+    // NOT EXISTS ... RETURNING」の単一原子的操作で検出する(TeamRepo.create /
+    // benchJobRepo.insertIfAllowed と同じ TOCTOU 回避パターン、SQLite 実装)。
+    // 0 行挿入なら DuplicateInstanceIndex。
+    readonly create: (i: Instance) => Effect.Effect<Instance, RepoError | DuplicateInstanceIndex>
     readonly remove: (id: InstanceId) => Effect.Effect<void, RepoError>
   }
 >() {}

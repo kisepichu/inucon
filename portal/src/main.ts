@@ -5,10 +5,16 @@ import { Config, Effect, Layer } from "effect"
 import { api } from "shared"
 import { AuthConfig } from "./application/ports.js"
 import { GithubOAuthLive } from "./infrastructure/github/oauth.js"
+import { AdminLive } from "./infrastructure/http/handlers/admin.js"
 import { AuthLive } from "./infrastructure/http/handlers/auth.js"
+import { ContestLive } from "./infrastructure/http/handlers/contest.js"
 import { HealthLive } from "./infrastructure/http/handlers/health.js"
-import { AuthenticationLive } from "./infrastructure/http/middleware.js"
+import { InstancesLive } from "./infrastructure/http/handlers/instances.js"
+import { TeamsLive } from "./infrastructure/http/handlers/teams.js"
+import { AdminOnlyLive, AuthenticationLive } from "./infrastructure/http/middleware.js"
 import { MigratorLive, SqlLive } from "./infrastructure/sql/client.js"
+import { ContestRepoLive } from "./infrastructure/sql/repos/contestRepo.js"
+import { InstanceRepoLive } from "./infrastructure/sql/repos/instanceRepo.js"
 import { SessionRepoLive } from "./infrastructure/sql/repos/sessionRepo.js"
 import { TeamRepoLive } from "./infrastructure/sql/repos/teamRepo.js"
 import { UserRepoLive } from "./infrastructure/sql/repos/userRepo.js"
@@ -31,14 +37,21 @@ const AuthConfigLive = Layer.effect(
 
 // UserRepoLive は UuidGen に依存する。provideMerge で 1 インスタンスの
 // UuidGenLive を依存解決と公開の両方に使う(repos.test.ts と同じ理由)。
-const ReposLive = Layer.mergeAll(UserRepoLive, SessionRepoLive, TeamRepoLive).pipe(
+const ReposLive = Layer.mergeAll(
+  UserRepoLive,
+  SessionRepoLive,
+  TeamRepoLive,
+  ContestRepoLive,
+  InstanceRepoLive
+).pipe(
   Layer.provideMerge(UuidGenLive),
   Layer.provide(SqlLive)
 )
 
 const ApiLive = HttpApiBuilder.api(api).pipe(
-  Layer.provide(Layer.mergeAll(HealthLive, AuthLive)),
+  Layer.provide(Layer.mergeAll(HealthLive, AuthLive, ContestLive, TeamsLive, InstancesLive, AdminLive)),
   Layer.provide(AuthenticationLive),
+  Layer.provide(AdminOnlyLive),
   Layer.provide(GithubOAuthLive.pipe(Layer.provide(NodeHttpClient.layer))),
   Layer.provide(AuthConfigLive),
   Layer.provide(ReposLive)
