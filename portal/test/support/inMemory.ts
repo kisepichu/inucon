@@ -1,0 +1,151 @@
+import { Effect, Either, Layer, Option, Ref } from "effect"
+import { startJob } from "../../src/domain/benchJob.js"
+import type { BenchJob } from "../../src/domain/benchJob.js"
+import type { Contest } from "../../src/domain/contest.js"
+import { TeamJobAlreadyQueued } from "../../src/domain/errors.js"
+import type { BenchJobId, TeamId, UserId } from "../../src/domain/ids.js"
+import type { Team } from "../../src/domain/team.js"
+import type { User } from "../../src/domain/user.js"
+import { BenchJobRepo, ContestRepo, RunnerConfig, TeamRepo, UuidGen } from "../../src/application/ports.js"
+
+// テスト専用のインメモリ port 実装。すべて Ref ベースで、ports.ts のコメントに
+// 書かれた意味論(TOCTOU 回避 / 全体 running 1 本制約)を素直に再現する。
+// 本番実装(SQLite、Task 4)とは別物 — ここでの「アトミック性」は Ref の単一
+// update 呼び出し内で読み取り+書き込みを完結させることで模している。
+
+export const UuidGenTest: Layer.Layer<UuidGen> = Layer.effect(
+  UuidGen,
+  Effect.gen(function* () {
+    const counter = yield* Ref.make(0)
+    return {
+      next: Ref.updateAndGet(counter, (n) => n + 1).pipe(Effect.map((n) => `test-uuid-${n}`))
+    }
+  })
+)
+
+export const makeContestRepoTest = (
+  initial: Option.Option<Contest> = Option.none()
+): Layer.Layer<ContestRepo> =>
+  Layer.effect(
+    ContestRepo,
+    Effect.gen(function* () {
+      const ref = yield* Ref.make(initial)
+      return {
+        getCurrent: Ref.get(ref),
+        save: (c: Contest) => Ref.set(ref, Option.some(c))
+      }
+    })
+  )
+
+export const makeTeamRepoTest = (args: {
+  teams: ReadonlyArray<Team>
+  memberships?: ReadonlyArray<{ userId: UserId; teamId: TeamId }>
+  users?: ReadonlyArray<User>
+}): Layer.Layer<TeamRepo> =>
+  Layer.effect(
+    TeamRepo,
+    Effect.gen(function* () {
+      const teamsRef = yield* Ref.make(args.teams)
+      const membersRef = yield* Ref.make(args.memberships ?? [])
+      const usersRef = yield* Ref.make(args.users ?? [])
+      return {
+        list: Ref.get(teamsRef),
+        findById: (id: TeamId) =>
+          Ref.get(teamsRef).pipe(Effect.map((teams) => Option.fromNullable(teams.find((t) => t.id === id)))),
+        findByUserId: (userId: UserId) =>
+          Effect.gen(function* () {
+            const members = yield* Ref.get(membersRef)
+            const teams = yield* Ref.get(teamsRef)
+            const membership = members.find((m) => m.userId === userId)
+            if (membership === undefined) return Option.none<Team>()
+            return Option.fromNullable(teams.find((t) => t.id === membership.teamId))
+          }),
+        create: (t: Team) => Ref.update(teamsRef, (teams) => [...teams, t]),
+        setMembers: (teamId: TeamId, userIds: ReadonlyArray<UserId>) =>
+          Ref.update(membersRef, (members) => [
+            ...members.filter((m) => m.teamId !== teamId),
+            ...userIds.map((userId) => ({ userId, teamId }))
+          ]),
+        listMembers: (teamId: TeamId) =>
+          Effect.gen(function* () {
+            const members = yield* Ref.get(membersRef)
+            const users = yield* Ref.get(usersRef)
+            const memberIds = new Set(members.filter((m) => m.teamId === teamId).map((m) => m.userId))
+            return users.filter((u) => memberIds.has(u.id))
+          })
+      }
+    })
+  )
+
+export const makeBenchJobRepoTest = (initial: ReadonlyArray<BenchJob> = []): Layer.Layer<BenchJobRepo> =>
+  Layer.effect(
+    BenchJobRepo,
+    Effect.gen(function* () {
+      const jobsRef = yield* Ref.make(initial)
+      const logsRef = yield* Ref.make<Record<string, string>>({})
+      return {
+        insertIfAllowed: (job: BenchJob) =>
+          Ref.modify(
+            jobsRef,
+            (jobs): readonly [Either.Either<BenchJob, TeamJobAlreadyQueued>, ReadonlyArray<BenchJob>] => {
+              const hasActiveForTeam = jobs.some(
+                (j) => j.teamId === job.teamId && (j.status === "queued" || j.status === "running")
+              )
+              if (hasActiveForTeam) {
+                return [Either.left(new TeamJobAlreadyQueued({ teamId: job.teamId })), jobs]
+              }
+              return [Either.right(job), [...jobs, job]]
+            }
+          ).pipe(Effect.flatMap(Either.match({ onLeft: Effect.fail, onRight: Effect.succeed }))),
+        findById: (id: BenchJobId) =>
+          Ref.get(jobsRef).pipe(Effect.map((jobs) => Option.fromNullable(jobs.find((j) => j.id === id)))),
+        listByTeam: (teamId: TeamId, limit: number) =>
+          Ref.get(jobsRef).pipe(
+            Effect.map((jobs) =>
+              jobs
+                .filter((j) => j.teamId === teamId)
+                .sort((a, b) => b.enqueuedAt - a.enqueuedAt)
+                .slice(0, limit)
+            )
+          ),
+        // 全体で running が 1 件でもあれば None。なければ最も古い queued を
+        // startJob で running 化し、Ref の単一 modify 呼び出し内で読み取りと
+        // 書き戻しを完結させることでアトミック性を模す。
+        dequeueNextQueued: (now: number) =>
+          Ref.modify(
+            jobsRef,
+            (jobs): readonly [Option.Option<BenchJob>, ReadonlyArray<BenchJob>] => {
+              const anyRunning = jobs.some((j) => j.status === "running")
+              if (anyRunning) return [Option.none(), jobs]
+              const queued = jobs.filter((j) => j.status === "queued").sort((a, b) => a.enqueuedAt - b.enqueuedAt)
+              const next = queued[0]
+              if (next === undefined) return [Option.none(), jobs]
+              const started = Either.getOrThrow(startJob(next, now))
+              const updated = jobs.map((j) => (j.id === started.id ? started : j))
+              return [Option.some(started), updated]
+            }
+          ),
+        save: (job: BenchJob) => Ref.update(jobsRef, (jobs) => jobs.map((j) => (j.id === job.id ? job : j))),
+        appendLog: (id: BenchJobId, chunk: string) =>
+          Ref.update(logsRef, (logs) => ({ ...logs, [id]: (logs[id] ?? "") + chunk })),
+        getLog: (id: BenchJobId) => Ref.get(logsRef).pipe(Effect.map((logs) => logs[id] ?? "")),
+        listRunningOlderThan: (cutoff: number) =>
+          Ref.get(jobsRef).pipe(
+            Effect.map((jobs) =>
+              jobs.filter(
+                (j) =>
+                  j.status === "running" &&
+                  Option.match(j.lastProgressAt, { onNone: () => false, onSome: (t) => t < cutoff })
+              )
+            )
+          ),
+        // Task 3 のユースケースでは未使用。scoreboard はチーム名の結合が要る
+        // ため、必要になった時点(スコアボード関連タスク)でチームデータも
+        // 受け取れるように拡張する。
+        scoreboard: Effect.succeed([])
+      }
+    })
+  )
+
+export const RunnerConfigTest = (jobTimeoutMillis: number): Layer.Layer<RunnerConfig> =>
+  Layer.succeed(RunnerConfig, { jobTimeoutMillis })
