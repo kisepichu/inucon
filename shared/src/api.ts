@@ -24,6 +24,7 @@ import {
   PollJobResponse,
   RunnerFinishRequest,
   RunnerProgressRequest,
+  ScoreboardEntry,
   SetTeamMembersRequest,
   Team,
   TeamId,
@@ -325,6 +326,14 @@ export const benchGroup = HttpApiGroup.make("bench")
       .middleware(Authentication)
   )
 
+// GET /api/scoreboard(セッション): チームごとの最新/ベストスコア一覧
+// (BenchJobRepo.scoreboard をそのまま返す、Task 8)。
+export const scoreboardGroup = HttpApiGroup.make("scoreboard").add(
+  HttpApiEndpoint.get("getScoreboard", "/api/scoreboard")
+    .addSuccess(Schema.Array(ScoreboardEntry))
+    .middleware(Authentication)
+)
+
 // ランナー(benchvm 常駐)専用。RunnerAuth(shared token)で認可する。
 export const runnerGroup = HttpApiGroup.make("runner")
   .add(
@@ -356,3 +365,4 @@ export const api = HttpApi.make("inucon")
   .add(adminGroup)
   .add(benchGroup)
   .add(runnerGroup)
+  .add(scoreboardGroup)

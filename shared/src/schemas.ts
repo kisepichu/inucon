@@ -174,3 +174,15 @@ export const RunnerFinishRequest = Schema.Struct({
   logTail: Schema.String
 })
 export type RunnerFinishRequest = typeof RunnerFinishRequest.Type
+
+// GET /api/scoreboard: チームごとの最新/ベストスコア(BenchJobRepo.scoreboard、
+// Task 4 で集計済み)。finished 以外のジョブは集計対象外、0 件チームも
+// bestScore/latestScore/latestAt=null で必ず返る。
+export const ScoreboardEntry = Schema.Struct({
+  teamId: TeamId,
+  teamName: Schema.String,
+  bestScore: Schema.NullOr(Schema.Int),
+  latestScore: Schema.NullOr(Schema.Int),
+  latestAt: Schema.NullOr(Schema.Int)
+})
+export type ScoreboardEntry = typeof ScoreboardEntry.Type
