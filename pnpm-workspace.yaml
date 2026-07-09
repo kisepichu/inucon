@@ -1,9 +1,12 @@
 packages:
   - shared
   - portal
+  - portal/web
   - runner
 allowBuilds:
   '@parcel/watcher': true
   better-sqlite3: true
   esbuild: true
   msgpackr-extract: true
+minimumReleaseAgeExclude:
+  - vite@8.1.4
