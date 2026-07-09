@@ -6,7 +6,7 @@ import { Contest } from "../../src/domain/contest.js"
 import { Instance } from "../../src/domain/instance.js"
 import { Team } from "../../src/domain/team.js"
 import { User } from "../../src/domain/user.js"
-import { TeamJobAlreadyQueued } from "../../src/domain/errors.js"
+import { CannotCancelRunning, InvalidJobTransition, TeamJobAlreadyQueued } from "../../src/domain/errors.js"
 import { BenchJobId, ContestId, InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
 import {
   BenchJobRepo,
@@ -191,6 +191,37 @@ layer("TeamRepo", (it) => {
 
       const members = yield* teams.listMembers(team.id)
       expect(members).toStrictEqual([user])
+    })
+  )
+})
+
+layer("TeamRepo: setMembers 複数行 INSERT", (it) => {
+  it.effect("2人を一度に set すると listMembers が2人返す", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const users = yield* UserRepo
+      const team = new Team({ id: TeamId.make("team-members-multi"), name: "Members Multi", teamNumber: 211 })
+      yield* teams.create(team)
+
+      const user1 = yield* users.upsertByGithub({
+        githubId: 9001,
+        githubLogin: "multiuser1",
+        displayName: "Multi User 1",
+        isAdmin: false
+      })
+      const user2 = yield* users.upsertByGithub({
+        githubId: 9002,
+        githubLogin: "multiuser2",
+        displayName: "Multi User 2",
+        isAdmin: false
+      })
+
+      yield* teams.setMembers(team.id, [user1.id, user2.id])
+
+      const members = yield* teams.listMembers(team.id)
+      expect(
+        members.map((m) => m.id).slice().sort()
+      ).toStrictEqual([user1.id, user2.id].slice().sort())
     })
   )
 })
@@ -485,6 +516,303 @@ layer("BenchJobRepo: scoreboard", (it) => {
       expect(rowC?.bestScore).toBeNull()
       expect(rowC?.latestScore).toBeNull()
       expect(rowC?.latestAt).toBeNull()
+    })
+  )
+})
+
+layer("BenchJobRepo: scoreboard の best と latest の取り違え検出", (it) => {
+  it.effect("finished 2本(先: score=500 finishedAt=1000 / 後: score=300 finishedAt=2000) → best=500, latest=300", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+      const team = new Team({ id: TeamId.make("team-sb-bl"), name: "SB Best/Latest", teamNumber: 161 })
+      yield* teams.create(team)
+
+      const job1 = newJob({
+        id: BenchJobId.make("bj-sb-bl-1"),
+        teamId: team.id,
+        targetIp: "10.100.161.1",
+        targetPort: 8080,
+        now: 100
+      })
+      yield* jobs.insertIfAllowed(job1)
+      yield* jobs.dequeueNextQueued(100)
+      yield* jobs.finishIfRunning(job1.id, { score: 500, passed: true }, 1000)
+
+      const job2 = newJob({
+        id: BenchJobId.make("bj-sb-bl-2"),
+        teamId: team.id,
+        targetIp: "10.100.161.2",
+        targetPort: 8080,
+        now: 1500
+      })
+      yield* jobs.insertIfAllowed(job2)
+      yield* jobs.dequeueNextQueued(1500)
+      yield* jobs.finishIfRunning(job2.id, { score: 300, passed: true }, 2000)
+
+      const board = yield* jobs.scoreboard
+      const row = board.find((r) => r.teamId === team.id)
+      // MAX(score) は 500(先の job1)、latest は finished_at 最大行(=後の job2)の
+      // score である 300。best と latest を取り違えて両方 MAX(score) や両方
+      // 最新行になっていないかを検出する。
+      expect(row?.bestScore).toBe(500)
+      expect(row?.latestScore).toBe(300)
+      expect(row?.latestAt).toBe(2000)
+    })
+  )
+})
+
+layer("BenchJobRepo: scoreboard の finished_at 同値タイ", (it) => {
+  it.effect("同一 finished_at の2本 → id DESC の行の score が latest になる", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+      const team = new Team({ id: TeamId.make("team-sb-tie"), name: "SB Tie", teamNumber: 191 })
+      yield* teams.create(team)
+
+      // "bj-sb-tie-2" > "bj-sb-tie-1" (文字列比較) なので id DESC では
+      // job2 が先頭に来る。score をあえて best とは逆にして、latest が
+      // score の大小ではなく id で決まっていることを検証する。
+      const job1 = newJob({
+        id: BenchJobId.make("bj-sb-tie-1"),
+        teamId: team.id,
+        targetIp: "10.100.191.1",
+        targetPort: 8080,
+        now: 100
+      })
+      yield* jobs.insertIfAllowed(job1)
+      yield* jobs.dequeueNextQueued(100)
+      yield* jobs.finishIfRunning(job1.id, { score: 90, passed: true }, 5000)
+
+      const job2 = newJob({
+        id: BenchJobId.make("bj-sb-tie-2"),
+        teamId: team.id,
+        targetIp: "10.100.191.2",
+        targetPort: 8080,
+        now: 1500
+      })
+      yield* jobs.insertIfAllowed(job2)
+      yield* jobs.dequeueNextQueued(1500)
+      yield* jobs.finishIfRunning(job2.id, { score: 10, passed: true }, 5000)
+
+      const board = yield* jobs.scoreboard
+      const row = board.find((r) => r.teamId === team.id)
+      expect(row?.bestScore).toBe(90)
+      expect(row?.latestScore).toBe(10)
+      expect(row?.latestAt).toBe(5000)
+    })
+  )
+})
+
+layer("BenchJobRepo: listByTeam", (it) => {
+  it.effect("対象チームの分だけ enqueued_at 降順で limit 件を返す", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+      const teamA = new Team({ id: TeamId.make("team-list-a"), name: "List A", teamNumber: 181 })
+      const teamB = new Team({ id: TeamId.make("team-list-b"), name: "List B", teamNumber: 182 })
+      yield* teams.create(teamA)
+      yield* teams.create(teamB)
+
+      // 同一チームは queued/running を同時に 1 本しか持てないため、都度
+      // cancelIfQueued で退避させてから次を積む。
+      const a1 = newJob({
+        id: BenchJobId.make("bj-list-a1"),
+        teamId: teamA.id,
+        targetIp: "10.100.181.1",
+        targetPort: 8080,
+        now: 100
+      })
+      yield* jobs.insertIfAllowed(a1)
+      yield* jobs.cancelIfQueued(a1.id)
+
+      const a2 = newJob({
+        id: BenchJobId.make("bj-list-a2"),
+        teamId: teamA.id,
+        targetIp: "10.100.181.2",
+        targetPort: 8080,
+        now: 200
+      })
+      yield* jobs.insertIfAllowed(a2)
+      yield* jobs.cancelIfQueued(a2.id)
+
+      const a3 = newJob({
+        id: BenchJobId.make("bj-list-a3"),
+        teamId: teamA.id,
+        targetIp: "10.100.181.3",
+        targetPort: 8080,
+        now: 300
+      })
+      yield* jobs.insertIfAllowed(a3)
+      yield* jobs.cancelIfQueued(a3.id)
+
+      const b1 = newJob({
+        id: BenchJobId.make("bj-list-b1"),
+        teamId: teamB.id,
+        targetIp: "10.100.182.1",
+        targetPort: 8080,
+        now: 250
+      })
+      yield* jobs.insertIfAllowed(b1)
+
+      const listedA = yield* jobs.listByTeam(teamA.id, 2)
+      expect(listedA.map((j) => j.id)).toStrictEqual([a3.id, a2.id])
+
+      const listedB = yield* jobs.listByTeam(teamB.id, 10)
+      expect(listedB.map((j) => j.id)).toStrictEqual([b1.id])
+    })
+  )
+})
+
+layer("BenchJobRepo: dequeueNextQueued の同一 enqueued_at タイブレーク", (it) => {
+  it.effect("id 昇順の方が先に出る(挿入順ではない)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+      const teamA = new Team({ id: TeamId.make("team-dq-tie-a"), name: "DQ Tie A", teamNumber: 201 })
+      const teamB = new Team({ id: TeamId.make("team-dq-tie-b"), name: "DQ Tie B", teamNumber: 202 })
+      yield* teams.create(teamA)
+      yield* teams.create(teamB)
+
+      // id の大きい方 (z) を先に挿入し、あとから id の小さい方 (a) を挿入する。
+      // enqueued_at が同値のとき挿入順ではなく id 昇順で先頭が決まることを検証する。
+      const jobZ = newJob({
+        id: BenchJobId.make("bj-dq-tie-z"),
+        teamId: teamA.id,
+        targetIp: "10.100.201.1",
+        targetPort: 8080,
+        now: 1000
+      })
+      yield* jobs.insertIfAllowed(jobZ)
+      const jobA = newJob({
+        id: BenchJobId.make("bj-dq-tie-a"),
+        teamId: teamB.id,
+        targetIp: "10.100.202.1",
+        targetPort: 8080,
+        now: 1000
+      })
+      yield* jobs.insertIfAllowed(jobA)
+
+      const dequeued = yield* jobs.dequeueNextQueued(2000)
+      expect(Option.isSome(dequeued)).toBe(true)
+      if (Option.isSome(dequeued)) {
+        expect(dequeued.value.id).toBe(jobA.id)
+      }
+    })
+  )
+})
+
+layer("BenchJobRepo: finishIfRunning は queued ジョブに失敗する", (it) => {
+  it.effect("InvalidJobTransition(from: queued, action: finish)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+      const team = new Team({
+        id: TeamId.make("team-err-finish-queued"),
+        name: "Err Finish Queued",
+        teamNumber: 171
+      })
+      yield* teams.create(team)
+
+      const job = newJob({
+        id: BenchJobId.make("bj-err-finish-queued"),
+        teamId: team.id,
+        targetIp: "10.100.171.5",
+        targetPort: 8080,
+        now: 1000
+      })
+      yield* jobs.insertIfAllowed(job)
+
+      const exit = yield* Effect.exit(jobs.finishIfRunning(job.id, { score: 1, passed: true }, 2000))
+      expect(exit).toStrictEqual(
+        Exit.fail(new InvalidJobTransition({ jobId: job.id, from: "queued", action: "finish" }))
+      )
+    })
+  )
+})
+
+layer("BenchJobRepo: recordProgressIfRunning は queued ジョブに失敗する", (it) => {
+  it.effect("InvalidJobTransition(from: queued, action: recordProgress)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+      const team = new Team({
+        id: TeamId.make("team-err-progress-queued"),
+        name: "Err Progress Queued",
+        teamNumber: 172
+      })
+      yield* teams.create(team)
+
+      const job = newJob({
+        id: BenchJobId.make("bj-err-progress-queued"),
+        teamId: team.id,
+        targetIp: "10.100.172.5",
+        targetPort: 8080,
+        now: 1000
+      })
+      yield* jobs.insertIfAllowed(job)
+
+      const exit = yield* Effect.exit(jobs.recordProgressIfRunning(job.id, 2000))
+      expect(exit).toStrictEqual(
+        Exit.fail(new InvalidJobTransition({ jobId: job.id, from: "queued", action: "recordProgress" }))
+      )
+    })
+  )
+})
+
+layer("BenchJobRepo: cancelIfQueued は running ジョブに失敗する", (it) => {
+  it.effect("CannotCancelRunning", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+      const team = new Team({
+        id: TeamId.make("team-err-cancel-running"),
+        name: "Err Cancel Running",
+        teamNumber: 173
+      })
+      yield* teams.create(team)
+
+      const job = newJob({
+        id: BenchJobId.make("bj-err-cancel-running"),
+        teamId: team.id,
+        targetIp: "10.100.173.5",
+        targetPort: 8080,
+        now: 1000
+      })
+      yield* jobs.insertIfAllowed(job)
+      yield* jobs.dequeueNextQueued(2000)
+
+      const err = yield* Effect.flip(jobs.cancelIfQueued(job.id))
+      expect(err).toStrictEqual(new CannotCancelRunning({ jobId: job.id }))
+    })
+  )
+})
+
+layer("BenchJobRepo: cancelIfQueued は finished ジョブに失敗する", (it) => {
+  it.effect("InvalidJobTransition(from: finished, action: cancel)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+      const team = new Team({
+        id: TeamId.make("team-err-cancel-finished"),
+        name: "Err Cancel Finished",
+        teamNumber: 174
+      })
+      yield* teams.create(team)
+
+      const job = newJob({
+        id: BenchJobId.make("bj-err-cancel-finished"),
+        teamId: team.id,
+        targetIp: "10.100.174.5",
+        targetPort: 8080,
+        now: 1000
+      })
+      yield* jobs.insertIfAllowed(job)
+      yield* jobs.dequeueNextQueued(2000)
+      yield* jobs.finishIfRunning(job.id, { score: 1, passed: true }, 3000)
+
+      const err = yield* Effect.flip(jobs.cancelIfQueued(job.id))
+      expect(err).toStrictEqual(new InvalidJobTransition({ jobId: job.id, from: "finished", action: "cancel" }))
     })
   )
 })
