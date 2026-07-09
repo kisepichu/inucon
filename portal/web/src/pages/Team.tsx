@@ -187,7 +187,20 @@ export function Team({ me }: TeamProps) {
           </thead>
           <tbody>
             {(jobs ?? []).map((job) => (
-              <tr key={job.id} className="clickable" onClick={() => navigate(`/jobs/${job.id}`)}>
+              <tr
+                key={job.id}
+                className="clickable"
+                tabIndex={0}
+                role="link"
+                aria-label={`ジョブ詳細: ${job.id}`}
+                onClick={() => navigate(`/jobs/${job.id}`)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault()
+                    navigate(`/jobs/${job.id}`)
+                  }
+                }}
+              >
                 <td>{job.status}</td>
                 <td>{job.score ?? "-"}</td>
                 <td>{formatDate(job.enqueuedAt)}</td>

@@ -103,6 +103,7 @@ export const makeStaticMiddleware = (distDir: string) => {
   const root = resolve(distDir)
 
   // root の realpath は起動時(初回リクエスト時)に 1 回だけ解決してキャッシュする。
+  let warnedIndexMissing = false
   let rootRealPathPromise: Promise<string | null> | undefined
   const getRootRealPath = (): Promise<string | null> => {
     if (rootRealPathPromise === undefined) {
@@ -137,7 +138,17 @@ export const makeStaticMiddleware = (distDir: string) => {
       }
 
       // SPA フォールバック: ルーティングは react-router-dom に任せ、常に
-      // index.html を返す。
-      return yield* serveFile(resolve(root, "index.html"))
+      // index.html を返す。index.html の欠落(dist 未ビルド)は運用ミスに
+      // 気づけるよう、プロセスごとに 1 回だけ warning を出す。
+      const indexPath = resolve(root, "index.html")
+      return yield* serveFile(indexPath).pipe(
+        Effect.tap((res) =>
+          res.status === 404 && !warnedIndexMissing
+            ? Effect.sync(() => {
+                warnedIndexMissing = true
+              }).pipe(Effect.zipRight(Effect.logWarning(`static: index.html not found (web/dist 未ビルド?): ${indexPath}`)))
+            : Effect.void
+        )
+      )
     })
 }
