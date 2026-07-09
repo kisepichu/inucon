@@ -12,6 +12,7 @@ import { ContestLive } from "./infrastructure/http/handlers/contest.js"
 import { HealthLive } from "./infrastructure/http/handlers/health.js"
 import { InstancesLive } from "./infrastructure/http/handlers/instances.js"
 import { RunnerLive } from "./infrastructure/http/handlers/runner.js"
+import { ScoreboardLive } from "./infrastructure/http/handlers/scoreboard.js"
 import { TeamsLive } from "./infrastructure/http/handlers/teams.js"
 import { AdminOnlyLive, AuthenticationLive, RunnerAuthLive } from "./infrastructure/http/middleware.js"
 import { MigratorLive, SqlLive } from "./infrastructure/sql/client.js"
@@ -22,6 +23,7 @@ import { SessionRepoLive } from "./infrastructure/sql/repos/sessionRepo.js"
 import { TeamRepoLive } from "./infrastructure/sql/repos/teamRepo.js"
 import { UserRepoLive } from "./infrastructure/sql/repos/userRepo.js"
 import { UuidGenLive } from "./infrastructure/sql/uuid.js"
+import { TimeoutSweeperLive } from "./infrastructure/worker/timeoutSweeper.js"
 
 // ADMIN_GITHUB_LOGINS(カンマ区切り)に載っている githubLogin はログイン時に
 // isAdmin=true になる(スペック §認証)。
@@ -68,7 +70,17 @@ const RunnerConfigLive = Layer.effect(
 
 const ApiLive = HttpApiBuilder.api(api).pipe(
   Layer.provide(
-    Layer.mergeAll(HealthLive, AuthLive, ContestLive, TeamsLive, InstancesLive, AdminLive, BenchLive, RunnerLive)
+    Layer.mergeAll(
+      HealthLive,
+      AuthLive,
+      ContestLive,
+      TeamsLive,
+      InstancesLive,
+      AdminLive,
+      BenchLive,
+      RunnerLive,
+      ScoreboardLive
+    )
   ),
   Layer.provide(AuthenticationLive),
   Layer.provide(AdminOnlyLive),
@@ -90,6 +102,22 @@ const HttpLive = HttpApiBuilder.serve(HttpMiddleware.logger).pipe(
   Layer.provide(ServerLive)
 )
 
-const MainLive = Layer.mergeAll(HttpLive, MigratorLive)
+// タイムアウト回収ワーカー(Task 8)。ApiLive と同じ ReposLive/RunnerConfigLive
+// の参照を再利用することで、Layer のメモ化(同一 Layer 参照は 1 度だけ構築
+// される)により SqlLive の接続を 1 つに共有する(ApiLive 側と別接続を開かない)。
+// MigratorLive も明示的に provide する: Layer.scopedDiscard は構築時に即
+// fork するため、MigratorLive が MainLive の並列な兄弟のままだと migration
+// 未完了のうちに 1 回目の sweep が走り "no such table" で失敗しうる
+// (catchAllCause で fiber は死なないが起動直後に無用なエラーログが出る)。
+// MigratorLive を依存として挟むことで、その fork 前に migration の完了を
+// 待たせる(参照は MainLive の MigratorLive と同一なのでメモ化により 1 回だけ
+// 実行される)。
+const WorkerLive = TimeoutSweeperLive.pipe(
+  Layer.provide(RunnerConfigLive),
+  Layer.provide(ReposLive),
+  Layer.provide(MigratorLive)
+)
+
+const MainLive = Layer.mergeAll(HttpLive, MigratorLive, WorkerLive)
 
 Layer.launch(MainLive).pipe(NodeRuntime.runMain)

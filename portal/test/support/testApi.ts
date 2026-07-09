@@ -11,6 +11,7 @@ import { ContestLive } from "../../src/infrastructure/http/handlers/contest.js"
 import { HealthLive } from "../../src/infrastructure/http/handlers/health.js"
 import { InstancesLive } from "../../src/infrastructure/http/handlers/instances.js"
 import { RunnerLive } from "../../src/infrastructure/http/handlers/runner.js"
+import { ScoreboardLive } from "../../src/infrastructure/http/handlers/scoreboard.js"
 import { TeamsLive } from "../../src/infrastructure/http/handlers/teams.js"
 import { AdminOnlyLive, AuthenticationLive, RunnerAuthLive } from "../../src/infrastructure/http/middleware.js"
 import { BenchJobRepoLive } from "../../src/infrastructure/sql/repos/benchJobRepo.js"
@@ -68,7 +69,17 @@ export const makeAppTestLayer = (options?: {
     Layer.provideMerge(
       HttpApiBuilder.api(api).pipe(
         Layer.provide(
-          Layer.mergeAll(HealthLive, AuthLive, ContestLive, TeamsLive, InstancesLive, AdminLive, BenchLive, RunnerLive)
+          Layer.mergeAll(
+            HealthLive,
+            AuthLive,
+            ContestLive,
+            TeamsLive,
+            InstancesLive,
+            AdminLive,
+            BenchLive,
+            RunnerLive,
+            ScoreboardLive
+          )
         ),
         Layer.provide(AuthenticationLive),
         Layer.provide(AdminOnlyLive),
