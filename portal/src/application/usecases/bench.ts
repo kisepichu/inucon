@@ -1,5 +1,5 @@
 import { Clock, Effect, Either, Option } from "effect"
-import { cancelJob, checkEnqueueAllowed, failJob, finishJob, newJob, recordProgress } from "../../domain/benchJob.js"
+import { cancelJob, checkEnqueueAllowed, finishJob, newJob, recordProgress } from "../../domain/benchJob.js"
 import { ContestNotRunning } from "../../domain/errors.js"
 import type { User } from "../../domain/user.js"
 import { BenchJobId } from "../../domain/ids.js"
@@ -121,18 +121,5 @@ export const sweepTimedOutJobs = Effect.gen(function* () {
   const jobs = yield* BenchJobRepo
   const config = yield* RunnerConfig
   const now = yield* Clock.currentTimeMillis
-  const staleJobs = yield* jobs.listRunningOlderThan(now - config.jobTimeoutMillis)
-  yield* Effect.forEach(
-    staleJobs,
-    (job) =>
-      Effect.gen(function* () {
-        const failed = yield* Either.match(failJob(job, "timeout", now), {
-          onLeft: Effect.fail,
-          onRight: Effect.succeed
-        })
-        yield* jobs.save(failed)
-      }),
-    { discard: true }
-  )
-  return staleJobs.length
+  return yield* jobs.failTimedOutJobs(now - config.jobTimeoutMillis, now)
 })

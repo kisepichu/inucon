@@ -82,7 +82,12 @@ export class BenchJobRepo extends Context.Tag("app/BenchJobRepo")<
     readonly save: (job: BenchJob) => Effect.Effect<void, RepoError>
     readonly appendLog: (id: BenchJobId, chunk: string) => Effect.Effect<void, RepoError>
     readonly getLog: (id: BenchJobId) => Effect.Effect<string, RepoError>
-    readonly listRunningOlderThan: (cutoff: number) => Effect.Effect<ReadonlyArray<BenchJob>, RepoError> // lastProgressAt < cutoff
+    // status='running' かつ lastProgressAt < cutoff のジョブをアトミックに
+    // failed 化する(errorMessage="timeout", finishedAt=now)。判定と更新は
+    // 単一の原子的操作(SQLite 実装では条件付き UPDATE 1 文)で行い、更新件数
+    // を返す。reportFinish との競合で finished を上書きしないことはこの条件
+    // 式が保証する。
+    readonly failTimedOutJobs: (cutoff: number, now: number) => Effect.Effect<number, RepoError>
     readonly scoreboard: Effect.Effect<
       ReadonlyArray<{
         teamId: TeamId

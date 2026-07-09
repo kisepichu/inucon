@@ -175,6 +175,13 @@ describe("cancelBench", () => {
       )
     )
   )
+
+  it.effect("存在しない jobId は Forbidden", () =>
+    Effect.gen(function* () {
+      const exit = yield* Effect.exit(cancelBench({ user: user1, jobId }))
+      expect(exit).toStrictEqual(Exit.fail(new Forbidden()))
+    }).pipe(Effect.provide(testLayer("running", [])))
+  )
 })
 
 describe("pollNextJob", () => {
@@ -316,6 +323,41 @@ describe("sweepTimedOutJobs", () => {
             new BenchJob({
               ...runningJobAt({ id: freshId, teamId: team2Id, targetIp: "10.100.2.9", enqueuedAt: 0, now: 0 }),
               lastProgressAt: Option.some(650_000) // 700_000 - 650_000 < timeout → 無傷
+            })
+          ],
+          jobTimeoutMillis
+        )
+      )
+    )
+  )
+
+  it.effect("reportFinish 済みのジョブは cutoff 条件を満たしても failed にならない(件数 0)", () =>
+    Effect.gen(function* () {
+      // running(lastProgressAt=0)のジョブを先に finish してから sweep する。
+      // 判定と更新が原子的でない実装だと、finished を failed で上書きしうる
+      // 競合(TOCTOU)の代表ケース。
+      const finished = yield* reportFinish({ jobId: staleId, score: 100, passed: true })
+      expect(finished.status).toBe("finished")
+
+      yield* TestClock.setTime(700_000) // cutoff=100_000、lastProgressAt=0 < cutoff
+      const count = yield* sweepTimedOutJobs
+      expect(count).toBe(0)
+
+      const jobs = yield* BenchJobRepo
+      const after = yield* jobs.findById(staleId)
+      expect(Option.isSome(after)).toBe(true)
+      if (Option.isSome(after)) {
+        expect(after.value.status).toBe("finished")
+        expect(after.value.score).toStrictEqual(Option.some(100))
+      }
+    }).pipe(
+      Effect.provide(
+        testLayer(
+          "running",
+          [
+            new BenchJob({
+              ...runningJobAt({ id: staleId, teamId: team1Id, targetIp: "10.100.1.9", enqueuedAt: 0, now: 0 }),
+              lastProgressAt: Option.some(0)
             })
           ],
           jobTimeoutMillis

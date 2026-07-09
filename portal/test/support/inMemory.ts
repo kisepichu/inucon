@@ -1,5 +1,5 @@
 import { Effect, Either, Layer, Option, Ref } from "effect"
-import { startJob } from "../../src/domain/benchJob.js"
+import { failJob, startJob } from "../../src/domain/benchJob.js"
 import type { BenchJob } from "../../src/domain/benchJob.js"
 import type { Contest } from "../../src/domain/contest.js"
 import { TeamJobAlreadyQueued } from "../../src/domain/errors.js"
@@ -129,16 +129,22 @@ export const makeBenchJobRepoTest = (initial: ReadonlyArray<BenchJob> = []): Lay
         appendLog: (id: BenchJobId, chunk: string) =>
           Ref.update(logsRef, (logs) => ({ ...logs, [id]: (logs[id] ?? "") + chunk })),
         getLog: (id: BenchJobId) => Ref.get(logsRef).pipe(Effect.map((logs) => logs[id] ?? "")),
-        listRunningOlderThan: (cutoff: number) =>
-          Ref.get(jobsRef).pipe(
-            Effect.map((jobs) =>
-              jobs.filter(
-                (j) =>
-                  j.status === "running" &&
-                  Option.match(j.lastProgressAt, { onNone: () => false, onSome: (t) => t < cutoff })
-              )
-            )
-          ),
+        // running かつ lastProgressAt < cutoff のジョブを単一の Ref.modify
+        // コールバック内で failed 化する(判定と更新を同一操作にすることで
+        // reportFinish との TOCTOU を模擬的に回避する)。
+        failTimedOutJobs: (cutoff: number, now: number) =>
+          Ref.modify(jobsRef, (jobs): readonly [number, ReadonlyArray<BenchJob>] => {
+            let count = 0
+            const updated = jobs.map((j) => {
+              const isStale =
+                j.status === "running" &&
+                Option.match(j.lastProgressAt, { onNone: () => false, onSome: (t) => t < cutoff })
+              if (!isStale) return j
+              count++
+              return Either.getOrThrow(failJob(j, "timeout", now))
+            })
+            return [count, updated]
+          }),
         // Task 3 のユースケースでは未使用。scoreboard はチーム名の結合が要る
         // ため、必要になった時点(スコアボード関連タスク)でチームデータも
         // 受け取れるように拡張する。
