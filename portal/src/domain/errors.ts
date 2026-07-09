@@ -1,0 +1,38 @@
+import { Data } from "effect"
+import type { ContestStatus } from "./contest.js"
+import type { BenchJobStatus } from "./benchJob.js"
+import type { BenchJobId, TeamId } from "./ids.js"
+
+// Data.TaggedError(データのみ、Effect runtime 非依存)。
+// ContestStatus / BenchJobStatus は contest.ts / benchJob.ts で定義される型のみを
+// import type で参照する(実行時の循環 import を避けるため)。
+
+export class InvalidContestTransition extends Data.TaggedError("InvalidContestTransition")<{
+  from: ContestStatus
+  to: ContestStatus
+}> {}
+
+export type JobAction = "start" | "recordProgress" | "finish" | "fail" | "cancel"
+
+export class InvalidJobTransition extends Data.TaggedError("InvalidJobTransition")<{
+  jobId: BenchJobId
+  from: BenchJobStatus
+  action: JobAction
+}> {}
+
+export class CannotCancelRunning extends Data.TaggedError("CannotCancelRunning")<{
+  jobId: BenchJobId
+}> {}
+
+export class TargetIpOutOfSubnet extends Data.TaggedError("TargetIpOutOfSubnet")<{
+  ip: string
+  teamNumber: number
+}> {}
+
+export class TeamJobAlreadyQueued extends Data.TaggedError("TeamJobAlreadyQueued")<{
+  teamId: TeamId
+}> {}
+
+export class ContestNotRunning extends Data.TaggedError("ContestNotRunning")<{
+  status: ContestStatus
+}> {}
