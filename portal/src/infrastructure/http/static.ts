@@ -85,7 +85,9 @@ const serveAssetSafely = (
       return HttpServerResponse.empty({ status: 404 })
     }
 
-    return yield* serveFile(requestedPath)
+    // 検証済みの実体パスをそのまま読む(検証と読み出しの間に symlink を
+    // 差し替えられる TOCTOU の競合窓を残さない)。
+    return yield* serveFile(targetReal)
   })
 
 /**
