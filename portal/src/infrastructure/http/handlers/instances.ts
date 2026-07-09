@@ -1,7 +1,7 @@
 import { HttpApiBuilder } from "@effect/platform"
 import { Effect } from "effect"
 import { api, CurrentUser, DuplicateInstanceIndex, Forbidden, NotFound, TargetIpOutOfSubnet } from "shared"
-import { createInstance, listTeamInstances, removeInstance } from "../../../application/usecases/teams.js"
+import { createInstance, listTeamInstances, removeInstance } from "../../../application/usecases/instances.js"
 
 export const InstancesLive = HttpApiBuilder.group(api, "instances", (handlers) =>
   handlers
