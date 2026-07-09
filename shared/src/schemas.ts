@@ -146,10 +146,10 @@ export type JobAction = typeof JobAction.Type
 // --- runner 契約(ランナーが HttpApiClient で使う。これが正) ---
 
 export const RunnerJob = Schema.Struct({
-  id: Schema.String,
-  teamId: Schema.String,
+  id: BenchJobId,
+  teamId: TeamId,
   targetIp: Schema.String,
-  targetPort: Schema.Number,
+  targetPort: Schema.Int.pipe(Schema.between(1, 65535)),
   problemKey: Schema.String
 })
 export type RunnerJob = typeof RunnerJob.Type
@@ -161,7 +161,7 @@ export type PollJobResponse = typeof PollJobResponse.Type
 // POST /api/runner/jobs/:id/progress
 export const RunnerProgressRequest = Schema.Struct({
   logChunk: Schema.String,
-  partialScore: Schema.NullOr(Schema.Number)
+  partialScore: Schema.NullOr(Schema.Int)
 })
 export type RunnerProgressRequest = typeof RunnerProgressRequest.Type
 
@@ -169,7 +169,7 @@ export type RunnerProgressRequest = typeof RunnerProgressRequest.Type
 // (バイナリ異常終了等)は errorMessage 付き・passed=false, score=0 で送る。
 export const RunnerFinishRequest = Schema.Struct({
   passed: Schema.Boolean,
-  score: Schema.Number,
+  score: Schema.Int,
   errorMessage: Schema.NullOr(Schema.String),
   logTail: Schema.String
 })
