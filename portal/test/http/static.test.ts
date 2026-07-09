@@ -1,9 +1,12 @@
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { HttpApi, HttpApiBuilder, HttpApiEndpoint, HttpApiGroup, HttpClient } from "@effect/platform"
 import { NodeHttpServer } from "@effect/platform-node"
 import { it } from "@effect/vitest"
 import { Effect, Layer, Schema } from "effect"
-import { describe, expect } from "vitest"
+import { afterEach, describe, expect } from "vitest"
 import { makeStaticMiddleware } from "../../src/infrastructure/http/static.js"
 
 // フィクスチャ: portal/test/fixtures/staticDist(dist 相当) と、その1つ上の
@@ -40,6 +43,16 @@ describe("static middleware", () => {
       expect(res.status).toBe(200)
       const body = yield* res.json
       expect(body).toStrictEqual({ ok: true })
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("/apifoo は /api への委譲ではなく SPA フォールバックになる(セグメント境界の誤判定防止)", () =>
+    Effect.gen(function* () {
+      const client = yield* HttpClient.HttpClient
+      const res = yield* client.get("/apifoo")
+      expect(res.status).toBe(200)
+      const body = yield* res.text
+      expect(body).toContain("INDEX_MARKER")
     }).pipe(Effect.provide(TestLayer))
   )
 
@@ -124,6 +137,46 @@ describe("static middleware", () => {
       expect(res.status).toBe(404)
       const body = yield* res.text
       expect(body).not.toContain("SECRET_MARKER")
+    }).pipe(Effect.provide(TestLayer))
+  )
+})
+
+describe("シンボリックリンク経由のパストラバーサル", () => {
+  // dist(fixtureDist)の assets 配下に、dist の外(OS の一時ディレクトリ)を
+  // 指すシンボリックリンクを一時的に作り、GET /assets/<link> が 404 になり
+  // 中身が漏れないことを確認する。シンボリックリンクはコミットせず、テスト内で
+  // 作成して afterEach で必ず削除する。
+  const assetsDir = fileURLToPath(new URL("../fixtures/staticDist/assets", import.meta.url))
+  const symlinkPath = join(assetsDir, "evil-symlink.txt")
+  let outsideDir: string | undefined
+  let outsideFile: string | undefined
+
+  afterEach(() => {
+    if (existsSync(symlinkPath)) {
+      rmSync(symlinkPath)
+    }
+    if (outsideFile !== undefined && existsSync(outsideFile)) {
+      rmSync(outsideFile)
+    }
+    if (outsideDir !== undefined && existsSync(outsideDir)) {
+      rmSync(outsideDir, { recursive: true, force: true })
+    }
+    outsideDir = undefined
+    outsideFile = undefined
+  })
+
+  it.effect("dist 外を指すシンボリックリンクは 404 になり中身が漏れない", () =>
+    Effect.gen(function* () {
+      outsideDir = mkdtempSync(join(tmpdir(), "inucon-static-symlink-"))
+      outsideFile = join(outsideDir, "leak.txt")
+      writeFileSync(outsideFile, "SYMLINK_LEAK_MARKER")
+      symlinkSync(outsideFile, symlinkPath)
+
+      const client = yield* HttpClient.HttpClient
+      const res = yield* client.get("/assets/evil-symlink.txt")
+      expect(res.status).toBe(404)
+      const body = yield* res.text
+      expect(body).not.toContain("SYMLINK_LEAK_MARKER")
     }).pipe(Effect.provide(TestLayer))
   )
 })
