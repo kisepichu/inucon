@@ -73,7 +73,11 @@ export class InstanceRepo extends Context.Tag("app/InstanceRepo")<
 export class BenchJobRepo extends Context.Tag("app/BenchJobRepo")<
   BenchJobRepo,
   {
-    // 「チームに queued/running なし」の再検証と INSERT を同一トランザクションで行う(TOCTOU 回避)
+    // 存在チェックと INSERT を単一の条件付き INSERT 文で行う(TOCTOU 回避)。
+    // SQLite 実装では
+    // `INSERT ... SELECT ... WHERE NOT EXISTS (SELECT 1 FROM bench_jobs WHERE team_id=? AND status IN ('queued','running')) RETURNING ...`
+    // の 1 文で判定と挿入をアトミックに行い、0 行挿入(= 既に queued/running
+    // あり)なら TeamJobAlreadyQueued を返す。
     readonly insertIfAllowed: (job: BenchJob) => Effect.Effect<BenchJob, RepoError | TeamJobAlreadyQueued>
     readonly findById: (id: BenchJobId) => Effect.Effect<Option.Option<BenchJob>, RepoError>
     readonly listByTeam: (teamId: TeamId, limit: number) => Effect.Effect<ReadonlyArray<BenchJob>, RepoError>
