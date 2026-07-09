@@ -31,7 +31,7 @@ export default Effect.gen(function* () {
     CREATE TABLE teams (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
-      team_number INTEGER NOT NULL UNIQUE,
+      team_number INTEGER NOT NULL UNIQUE CHECK (team_number BETWEEN 1 AND 254),
       created_at INTEGER NOT NULL
     )
   `
@@ -57,9 +57,9 @@ export default Effect.gen(function* () {
     CREATE TABLE instances (
       id TEXT PRIMARY KEY,
       team_id TEXT NOT NULL REFERENCES teams(id),
-      idx INTEGER NOT NULL,
+      idx INTEGER NOT NULL CHECK (idx > 0),
       private_ip TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'active',
+      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active')),
       created_at INTEGER NOT NULL,
       UNIQUE (team_id, idx)
     )
@@ -70,7 +70,7 @@ export default Effect.gen(function* () {
       id TEXT PRIMARY KEY,
       team_id TEXT NOT NULL REFERENCES teams(id),
       target_ip TEXT NOT NULL,
-      target_port INTEGER NOT NULL DEFAULT 80,
+      target_port INTEGER NOT NULL DEFAULT 80 CHECK (target_port BETWEEN 1 AND 65535),
       status TEXT NOT NULL CHECK (status IN ('queued','running','finished','canceled','failed')),
       score INTEGER,
       passed INTEGER CHECK (passed IN (0, 1)),

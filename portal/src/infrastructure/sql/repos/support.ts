@@ -1,4 +1,3 @@
-import type { SqlError } from "@effect/sql/SqlError"
 import { Effect, Option, Schema } from "effect"
 import { RepoError } from "../../../application/ports.js"
 
