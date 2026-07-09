@@ -1,9 +1,9 @@
 import { it } from "@effect/vitest"
-import { Effect } from "effect"
+import { Clock, Effect, Option } from "effect"
 import { describe, expect } from "vitest"
 import { Contest } from "../../src/domain/contest.js"
 import { ContestId } from "../../src/domain/ids.js"
-import { ContestRepo } from "../../src/application/ports.js"
+import { BenchJobRepo, ContestRepo } from "../../src/application/ports.js"
 import { asAdmin, makeApiClient, makeRunnerApiClient, TestLayer } from "../support/apiTestHelpers.js"
 import { login } from "../support/login.js"
 
@@ -76,10 +76,12 @@ describe("E2E: チーム作成からベンチ実行・スコアボード反映�
       })
 
       // 8. finish を報告する。
+      const beforeFinish = Date.now()
       yield* runnerClient.runner.reportFinish({
         path: { id: job.id },
         payload: { passed: true, score: 100, errorMessage: null, logTail: "done\n" }
       })
+      const afterFinish = Date.now()
 
       // 9. スコアボードに反映される(全員参照可)。
       const scoreboard = yield* memberClient.scoreboard.getScoreboard()
@@ -88,6 +90,9 @@ describe("E2E: チーム作成からベンチ実行・スコアボード反映�
       expect(entry?.teamName).toBe("E2E Team")
       expect(entry?.bestScore).toBe(100)
       expect(entry?.latestScore).toBe(100)
+      // latestAt は finish 時刻で、null ではなく妥当な数値である
+      expect(entry?.latestAt).not.toBeNull()
+      expect(typeof entry?.latestAt).toBe("number")
 
       // 10. ジョブ詳細でログ全文が確認できる(自チームメンバーのみ)。
       const detail = yield* memberClient.bench.getBenchJob({ path: { id: job.id } })

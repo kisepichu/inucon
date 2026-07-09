@@ -97,9 +97,14 @@ const ServerLive = Layer.unwrapEffect(
   )
 )
 
+// Migration 依存: migration 前に最初のリクエストが来ると "no such table"
+// になる潜在レース。MigratorLive を依存として挟むことで、HTTP サーバー起動
+// 前に migration の完了を待たせる(参照は MainLive の MigratorLive と同一なので
+// メモ化により 1 回だけ実行される)。WorkerLive と同じ根本原因。
 const HttpLive = HttpApiBuilder.serve(HttpMiddleware.logger).pipe(
   Layer.provide(ApiLive),
-  Layer.provide(ServerLive)
+  Layer.provide(ServerLive),
+  Layer.provide(MigratorLive)
 )
 
 // タイムアウト回収ワーカー(Task 8)。ApiLive と同じ ReposLive/RunnerConfigLive
