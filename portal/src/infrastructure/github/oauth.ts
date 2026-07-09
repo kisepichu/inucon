@@ -27,7 +27,7 @@ export const GithubOAuthLive: Layer.Layer<GithubOAuthPort, ConfigError, HttpClie
         authorizeUrl: (state) => {
           const params = new URLSearchParams({
             client_id: Redacted.value(clientId),
-            redirect_uri: `${baseUrl}/auth/github/callback`,
+            redirect_uri: new URL("/auth/github/callback", baseUrl).toString(),
             state
           })
           return `https://github.com/login/oauth/authorize?${params.toString()}`

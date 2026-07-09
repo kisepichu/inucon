@@ -23,7 +23,7 @@ export type User = typeof User.Type
 export const Team = Schema.Struct({
   id: TeamId,
   name: Schema.String,
-  teamNumber: Schema.Int
+  teamNumber: Schema.Int.pipe(Schema.between(1, 254))
 })
 export type Team = typeof Team.Type
 
