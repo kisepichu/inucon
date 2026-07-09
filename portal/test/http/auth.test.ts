@@ -56,6 +56,26 @@ describe("GET /auth/github", () => {
       expect(state.options?.maxAge).toStrictEqual(Duration.seconds(600))
     }).pipe(Effect.provide(TestLayer))
   )
+
+  it.effect("COOKIE_SECURE=false のときは Set-Cookie に Secure が付かない", () =>
+    Effect.gen(function* () {
+      const client = yield* HttpClient.HttpClient
+      const res = yield* client.get("/auth/github")
+
+      const state = getCookie(res.cookies, STATE_COOKIE)
+      // secure: false は Set-Cookie に Secure 属性そのものを付けない(parse 結果は undefined になる)。
+      expect(state.options?.secure).toBeFalsy()
+      expect(state.options?.httpOnly).toBe(true)
+      expect(state.options?.sameSite).toBe("lax")
+    }).pipe(
+      Effect.provide(
+        makeAppTestLayer({
+          stubCodes,
+          configProvider: ConfigProvider.fromMap(new Map([["COOKIE_SECURE", "false"]]))
+        })
+      )
+    )
+  )
 })
 
 describe("GET /auth/github/callback", () => {
@@ -384,5 +404,17 @@ describe("RunnerAuth", () => {
       })
       expect(res.status).toBe(200)
     }).pipe(Effect.provide(SecureTestLayer))
+  )
+
+  it.effect("RUNNER_TOKEN が空文字だと RunnerAuthLive の構築が失敗する(空 bearer による認証バイパスの防止)", () =>
+    Effect.gen(function* () {
+      const layer = RunnerAuthLive.pipe(
+        Layer.provide(
+          Layer.setConfigProvider(ConfigProvider.fromMap(new Map([["RUNNER_TOKEN", ""]])))
+        )
+      )
+      const exit = yield* Effect.exit(Effect.scoped(Layer.build(layer)))
+      expect(exit._tag).toBe("Failure")
+    })
   )
 })

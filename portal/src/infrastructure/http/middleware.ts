@@ -48,10 +48,19 @@ export const AdminOnlyLive: Layer.Layer<AdminOnly, never, SessionRepo> = Layer.e
 
 const sha256 = (value: string): Buffer => createHash("sha256").update(value).digest()
 
+// 空文字(空白のみ含む)の RUNNER_TOKEN は「空 bearer との sha256 比較」が
+// 成立してしまい認証バイパスになりうるため、Layer 構築時に拒否する。
+const runnerTokenConfig = Config.redacted("RUNNER_TOKEN").pipe(
+  Config.validate({
+    message: "RUNNER_TOKEN must be non-empty",
+    validation: (token) => Redacted.value(token).trim() !== ""
+  })
+)
+
 export const RunnerAuthLive: Layer.Layer<RunnerAuth, ConfigError> = Layer.effect(
   RunnerAuth,
   Effect.gen(function* () {
-    const token = yield* Config.redacted("RUNNER_TOKEN")
+    const token = yield* runnerTokenConfig
     const expected = sha256(Redacted.value(token))
     return {
       // 比較はタイミングセーフに行う。sha256 で長さを揃えることで

@@ -1,5 +1,6 @@
 import { HttpApiBuilder } from "@effect/platform"
 import { NodeHttpServer } from "@effect/platform-node"
+import type { ConfigProvider } from "effect"
 import { Layer } from "effect"
 import { api } from "shared"
 import { AuthConfig } from "../../src/application/ports.js"
@@ -28,6 +29,9 @@ export const ReposTestLive = Layer.mergeAll(UserRepoLive, SessionRepoLive, TeamR
 export const makeAppTestLayer = (options?: {
   readonly stubCodes?: Record<string, StubGithubUser>
   readonly adminGithubLogins?: ReadonlyArray<string>
+  // COOKIE_SECURE 等の Config を読むテスト(空文字検証、Secure 属性の切替)用に
+  // ConfigProvider を差し替え可能にする。未指定時は既定(process.env)のまま。
+  readonly configProvider?: ConfigProvider.ConfigProvider
 }) =>
   HttpApiBuilder.serve().pipe(
     Layer.provideMerge(
@@ -37,6 +41,9 @@ export const makeAppTestLayer = (options?: {
         Layer.provide(makeGithubOAuthStub(options?.stubCodes ?? {})),
         Layer.provide(
           Layer.succeed(AuthConfig, { adminGithubLogins: options?.adminGithubLogins ?? [] })
+        ),
+        Layer.provide(
+          options?.configProvider !== undefined ? Layer.setConfigProvider(options.configProvider) : Layer.empty
         )
       )
     ),
