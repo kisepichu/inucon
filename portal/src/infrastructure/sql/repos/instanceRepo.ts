@@ -1,5 +1,5 @@
 import { SqlClient } from "@effect/sql"
-import { Clock, Effect, Layer } from "effect"
+import { Clock, Effect, Layer, Option } from "effect"
 import type { InstanceId, TeamId } from "../../../domain/ids.js"
 import { Instance } from "../../../domain/instance.js"
 import { DuplicateInstanceIndex } from "../../../domain/errors.js"
@@ -30,6 +30,16 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
         wrapSqlError(
           sql<InstanceRow>`SELECT ${columns} FROM instances WHERE team_id = ${teamId} ORDER BY idx`
         ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeInstance))),
+
+      // POST /api/bench-jobs: instanceId 指定時に privateIp を解決するために使う。
+      findById: (id: InstanceId) =>
+        wrapSqlError(sql<InstanceRow>`SELECT ${columns} FROM instances WHERE id = ${id}`).pipe(
+          Effect.flatMap((rows) =>
+            rows.length === 0
+              ? Effect.succeed(Option.none())
+              : decodeInstance(rows[0]).pipe(Effect.map(Option.some))
+          )
+        ),
 
       // instances.(team_id, idx) の UNIQUE 制約は「INSERT ... SELECT ... WHERE
       // NOT EXISTS ... RETURNING」の単一原子的操作で検出する(TOCTOU 回避、

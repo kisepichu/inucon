@@ -80,6 +80,8 @@ export class InstanceRepo extends Context.Tag("app/InstanceRepo")<
   InstanceRepo,
   {
     readonly listByTeam: (teamId: TeamId) => Effect.Effect<ReadonlyArray<Instance>, RepoError>
+    // POST /api/bench-jobs: instanceId 指定時に privateIp を解決するために使う。
+    readonly findById: (id: InstanceId) => Effect.Effect<Option.Option<Instance>, RepoError>
     // instances.(team_id, idx) の UNIQUE 制約は「INSERT ... SELECT ... WHERE
     // NOT EXISTS ... RETURNING」の単一原子的操作で検出する(TeamRepo.create /
     // benchJobRepo.insertIfAllowed と同じ TOCTOU 回避パターン、SQLite 実装)。
@@ -125,6 +127,15 @@ export class BenchJobRepo extends Context.Tag("app/BenchJobRepo")<
     readonly finishIfRunning: (
       id: BenchJobId,
       result: { score: number; passed: boolean },
+      now: number
+    ) => Effect.Effect<BenchJob, RepoError | InvalidJobTransition>
+    // finishIfRunning と対称: 実行自体の失敗(バイナリ異常終了等)の報告を
+    // failed 化する。判定と更新は単一の原子的操作。SQLite 実装では
+    // `UPDATE ... WHERE id=? AND status='running'` の条件付き UPDATE 1 文 +
+    // RETURNING。0 行更新時は現在の status を読み直して型付きエラーを構築する。
+    readonly failIfRunning: (
+      id: BenchJobId,
+      errorMessage: string,
       now: number
     ) => Effect.Effect<BenchJob, RepoError | InvalidJobTransition>
     // 判定と更新は単一の原子的操作。SQLite 実装では

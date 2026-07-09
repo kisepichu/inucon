@@ -8,13 +8,22 @@ import {
 } from "@effect/platform"
 import { Context, Schema } from "effect"
 import {
+  BenchJob,
+  BenchJobDetail,
+  BenchJobId,
+  BenchJobStatus,
   Contest,
   ContestStatus,
   CreateInstanceRequest,
   CreateTeamRequest,
+  EnqueueBenchRequest,
   Instance,
   InstanceId,
+  JobAction,
   Me,
+  PollJobResponse,
+  RunnerFinishRequest,
+  RunnerProgressRequest,
   SetTeamMembersRequest,
   Team,
   TeamId,
@@ -105,6 +114,40 @@ export class DuplicateInstanceIndex extends Schema.TaggedError<DuplicateInstance
 export class InvalidContestTransition extends Schema.TaggedError<InvalidContestTransition>()(
   "InvalidContestTransition",
   { from: ContestStatus, to: ContestStatus },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// POST /api/bench-jobs: Contest が running でない(domain の
+// checkEnqueueAllowed をマップ)。
+export class ContestNotRunning extends Schema.TaggedError<ContestNotRunning>()(
+  "ContestNotRunning",
+  { status: ContestStatus },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// POST /api/bench-jobs: 自チームに既に queued/running のジョブがある
+// (連打防止。スペック §BenchJob 不変条件 1)。
+export class TeamJobAlreadyQueued extends Schema.TaggedError<TeamJobAlreadyQueued>()(
+  "TeamJobAlreadyQueued",
+  { teamId: TeamId },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// POST /api/bench-jobs/:id/cancel: running のジョブはキャンセルできない
+// (Phase 2 では実行中断をサポートしないため)。
+export class CannotCancelRunning extends Schema.TaggedError<CannotCancelRunning>()(
+  "CannotCancelRunning",
+  { jobId: BenchJobId },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// POST /api/runner/jobs/:id/{progress,finish}: ジョブが running でない状態
+// での報告(二重 poll・タイムアウト後の遅延報告など)。POST
+// /api/bench-jobs/:id/cancel が queued 以外(finished/canceled/failed)を
+// 指した場合もここに乗る。
+export class InvalidJobTransition extends Schema.TaggedError<InvalidJobTransition>()(
+  "InvalidJobTransition",
+  { jobId: BenchJobId, from: BenchJobStatus, action: JobAction },
   HttpApiSchema.annotations({ status: 409 })
 ) {}
 
@@ -246,6 +289,64 @@ export const adminGroup = HttpApiGroup.make("admin")
       .middleware(AdminOnly)
   )
 
+// enqueue/cancel はチームメンバー(自チームのみ、ユースケース側で判定)。
+// 一覧(スコア・状態)は全員可。詳細(ログ含む)は自チーム + admin のみ
+// (ユースケース側で判定、他チームは Forbidden)。
+export const benchGroup = HttpApiGroup.make("bench")
+  .add(
+    HttpApiEndpoint.post("enqueueBench", "/api/bench-jobs")
+      .setPayload(EnqueueBenchRequest)
+      .addSuccess(BenchJob)
+      .addError(ContestNotRunning)
+      .addError(TeamJobAlreadyQueued)
+      .addError(TargetIpOutOfSubnet)
+      .addError(Forbidden)
+      .addError(NotFound)
+      .middleware(Authentication)
+  )
+  .add(
+    HttpApiEndpoint.get("listBenchJobs", "/api/bench-jobs")
+      .setUrlParams(Schema.Struct({ teamId: TeamId }))
+      .addSuccess(Schema.Array(BenchJob))
+      .middleware(Authentication)
+  )
+  .add(
+    HttpApiEndpoint.get("getBenchJob")`/api/bench-jobs/${HttpApiSchema.param("id", BenchJobId)}`
+      .addSuccess(BenchJobDetail)
+      .addError(Forbidden)
+      .middleware(Authentication)
+  )
+  .add(
+    HttpApiEndpoint.post("cancelBenchJob")`/api/bench-jobs/${HttpApiSchema.param("id", BenchJobId)}/cancel`
+      .addSuccess(BenchJob)
+      .addError(Forbidden)
+      .addError(CannotCancelRunning)
+      .addError(InvalidJobTransition)
+      .middleware(Authentication)
+  )
+
+// ランナー(benchvm 常駐)専用。RunnerAuth(shared token)で認可する。
+export const runnerGroup = HttpApiGroup.make("runner")
+  .add(
+    HttpApiEndpoint.post("pollJob", "/api/runner/jobs/poll")
+      .addSuccess(PollJobResponse)
+      .middleware(RunnerAuth)
+  )
+  .add(
+    HttpApiEndpoint.post("reportProgress")`/api/runner/jobs/${HttpApiSchema.param("id", BenchJobId)}/progress`
+      .setPayload(RunnerProgressRequest)
+      .addSuccess(HttpApiSchema.NoContent)
+      .addError(InvalidJobTransition)
+      .middleware(RunnerAuth)
+  )
+  .add(
+    HttpApiEndpoint.post("reportFinish")`/api/runner/jobs/${HttpApiSchema.param("id", BenchJobId)}/finish`
+      .setPayload(RunnerFinishRequest)
+      .addSuccess(HttpApiSchema.NoContent)
+      .addError(InvalidJobTransition)
+      .middleware(RunnerAuth)
+  )
+
 export const api = HttpApi.make("inucon")
   .add(healthGroup)
   .add(authGroup)
@@ -253,3 +354,5 @@ export const api = HttpApi.make("inucon")
   .add(teamsGroup)
   .add(instancesGroup)
   .add(adminGroup)
+  .add(benchGroup)
+  .add(runnerGroup)

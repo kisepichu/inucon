@@ -190,6 +190,25 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
           )
         ),
 
+      // finishIfRunning と対称の条件付き UPDATE 1 文 + RETURNING(TOCTOU 回避)。
+      failIfRunning: (id: BenchJobId, errorMessage: string, now: number) =>
+        wrapSqlError(
+          sql<BenchJobRow>`
+            UPDATE bench_jobs
+            SET status = 'failed', error_message = ${errorMessage}, finished_at = ${now}
+            WHERE id = ${id} AND status = 'running'
+            RETURNING ${columns}
+          `
+        ).pipe(
+          Effect.flatMap((rows) =>
+            rows.length > 0
+              ? decodeBenchJob(rows[0])
+              : currentStatusOrDie(id).pipe(
+                  Effect.flatMap((from) => Effect.fail(new InvalidJobTransition({ jobId: id, from, action: "fail" })))
+                )
+          )
+        ),
+
       cancelIfQueued: (id: BenchJobId) =>
         wrapSqlError(
           sql<BenchJobRow>`

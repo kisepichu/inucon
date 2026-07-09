@@ -104,6 +104,8 @@ export const makeInstanceRepoTest = (initial: ReadonlyArray<Instance> = []): Lay
               instances.filter((i) => i.teamId === teamId).sort((a, b) => a.index - b.index)
             )
           ),
+        findById: (id: InstanceId) =>
+          Ref.get(instancesRef).pipe(Effect.map((instances) => Option.fromNullable(instances.find((i) => i.id === id)))),
         create: (i: Instance) =>
           Ref.modify(
             instancesRef,
@@ -205,6 +207,8 @@ export const makeBenchJobRepoTest = (initial: ReadonlyArray<BenchJob> = []): Lay
           atomicTransition(id, "recordProgressIfRunning", (job) => recordProgress(job, now)),
         finishIfRunning: (id: BenchJobId, result: { score: number; passed: boolean }, now: number) =>
           atomicTransition(id, "finishIfRunning", (job) => finishJob(job, result, now)),
+        failIfRunning: (id: BenchJobId, errorMessage: string, now: number) =>
+          atomicTransition(id, "failIfRunning", (job) => failJob(job, errorMessage, now)),
         cancelIfQueued: (id: BenchJobId) =>
           atomicTransition<CannotCancelRunning | InvalidJobTransition>(id, "cancelIfQueued", (job) => cancelJob(job)),
         appendLog: (id: BenchJobId, chunk: string) =>
