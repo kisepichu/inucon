@@ -143,3 +143,10 @@ export class RunnerConfig extends Context.Tag("app/RunnerConfig")<
   RunnerConfig,
   { readonly jobTimeoutMillis: number }
 >() {}
+
+// 認証まわりの設定(ADMIN_GITHUB_LOGINS 由来)。Layer は main.ts で
+// Config から組み立てる(テストでは Layer.succeed で注入)。
+export class AuthConfig extends Context.Tag("app/AuthConfig")<
+  AuthConfig,
+  { readonly adminGithubLogins: ReadonlyArray<string> }
+>() {}
