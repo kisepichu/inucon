@@ -7,7 +7,7 @@
 import { NodeContext } from "@effect/platform-node"
 import { it } from "@effect/vitest"
 import { Duration, Effect, Either, Fiber, Layer, Option, Ref } from "effect"
-import { mkdtempSync, readFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { BenchJobId, RunnerFinishRequest, RunnerJob, RunnerProgressRequest } from "shared/schemas"
@@ -22,9 +22,9 @@ const fakeBenchScript =
   "setTimeout(() => { process.stdout.write('warming up\\n') }, 50);" +
   "setTimeout(() => { console.log(JSON.stringify({ pass: true, score: 777, messages: [] })) }, 400)"
 
-const makeFakeAdapter = (problemKey: string): ProblemAdapter => ({
+const makeFakeAdapter = (problemKey: string, script: string = fakeBenchScript): ProblemAdapter => ({
   problemKey,
-  command: () => ({ cmd: process.execPath, args: ["-e", fakeBenchScript], cwd: process.cwd() }),
+  command: () => ({ cmd: process.execPath, args: ["-e", script], cwd: process.cwd() }),
   parseResult: (stdout) => {
     const line = stdout
       .split("\n")
@@ -39,6 +39,20 @@ const makeFakeAdapter = (problemKey: string): ProblemAdapter => ({
   },
   parsePartialScore: () => Option.none()
 })
+
+// 偽ベンチ(ハートビート検証用): 500ms の間 stdout に何も出さず、その後に最終
+// JSON を出して正常終了する。stdout が沈黙している区間でも progress の
+// ハートビート(空 logChunk の POST)が interval ごとに飛ぶことを確認するため
+// に使う。
+const silentThenResultScript =
+  "setTimeout(() => { console.log(JSON.stringify({ pass: true, score: 42, messages: [] })) }, 500)"
+
+// 偽ベンチ(stderr 分離検証用): 起動直後に stderr へ `{...}` 形式の行(本物の
+// 結果 JSON と紛らわしい)を書き出し、その後 stdout に正しい結果 JSON を出す。
+// parseResult には stdout のみが渡ることを確認するのに使う。
+const stderrNoiseScript =
+  "process.stderr.write('{\"pass\":false,\"score\":999,\"messages\":[]}\\n');" +
+  "setTimeout(() => { console.log(JSON.stringify({ pass: true, score: 777, messages: [] })) }, 100)"
 
 // PortalClient のスタブ: ジョブキュー(Ref)と、progress/finish の呼び出しを
 // 記録する Ref を持つ。HTTP は一切経由しない。
@@ -100,6 +114,67 @@ describe("runLoop", () => {
 
       expect(progresses.length).toBeGreaterThanOrEqual(1)
       expect(progresses.some((p) => p.logChunk.includes("warming up"))).toBe(true)
+    })
+  )
+
+  it.scopedLive("stdout が出ない区間でも progress(ハートビート)が interval ごとに飛ぶ", () =>
+    Effect.gen(function* () {
+      const job: RunnerJob = {
+        id: BenchJobIdSchema.make("job-heartbeat"),
+        teamId: TeamIdSchema.make("team-1"),
+        targetIp: "127.0.0.1",
+        targetPort: 12345,
+        problemKey: "silent"
+      }
+
+      const { progressCallsRef, portal } = yield* makeStubPortal([job])
+
+      const testLayer = Layer.mergeAll(
+        Layer.succeed(PortalClient, portal),
+        Layer.succeed(AdapterRegistry, { silent: makeFakeAdapter("silent", silentThenResultScript) }),
+        // progress 100ms ごと、ベンチは 500ms 沈黙してから結果を出す。
+        // 700ms 走らせれば、沈黙区間だけで複数回のハートビートが飛ぶはず。
+        Layer.succeed(LoopConfig, { pollIntervalMillis: 50, progressIntervalMillis: 100 })
+      )
+
+      yield* runLoopFor(700, testLayer)
+
+      const progresses = yield* Ref.get(progressCallsRef)
+
+      // 沈黙区間(結果が出る 500ms より前)の progress は logChunk が空でも
+      // 必ず POST されているはず(ハートビート)。
+      const heartbeats = progresses.filter((p) => p.logChunk === "")
+      expect(heartbeats.length).toBeGreaterThanOrEqual(2)
+    })
+  )
+
+  it.scopedLive("stderr に `{...}` 行が混ざっても parseResult は stdout の JSON を使う", () =>
+    Effect.gen(function* () {
+      const job: RunnerJob = {
+        id: BenchJobIdSchema.make("job-stderr"),
+        teamId: TeamIdSchema.make("team-1"),
+        targetIp: "127.0.0.1",
+        targetPort: 12345,
+        problemKey: "stderr-noise"
+      }
+
+      const { finishCallsRef, portal } = yield* makeStubPortal([job])
+
+      const testLayer = Layer.mergeAll(
+        Layer.succeed(PortalClient, portal),
+        Layer.succeed(AdapterRegistry, { "stderr-noise": makeFakeAdapter("stderr-noise", stderrNoiseScript) }),
+        Layer.succeed(LoopConfig, { pollIntervalMillis: 50, progressIntervalMillis: 150 })
+      )
+
+      yield* runLoopFor(500, testLayer)
+
+      const finishes = yield* Ref.get(finishCallsRef)
+      expect(finishes).toHaveLength(1)
+      const [, finishRequest] = finishes[0]
+      // stderr の紛らわしい行(pass:false, score:999)ではなく、stdout の
+      // 本物の結果(pass:true, score:777)が採用されていること。
+      expect(finishRequest.passed).toBe(true)
+      expect(finishRequest.score).toBe(777)
     })
   )
 
@@ -168,10 +243,24 @@ describe("runLoop", () => {
         Layer.succeed(LoopConfig, { pollIntervalMillis: 50, progressIntervalMillis: 150 })
       )
 
-      // プロセスが起動して pid ファイルを書き出すのを待ってから interrupt する。
-      yield* runLoopFor(400, testLayer)
+      const fiber = yield* Effect.fork(runLoop.pipe(Effect.provide(testLayer), Effect.provide(NodeContext.layer)))
 
-      const pid = Number(readFileSync(pidFile, "utf8").trim())
+      // プロセスが起動して pid ファイルを書き出すのを待ってから interrupt する。
+      // 固定時間の sleep(旧: 400ms)だと CI 等の遅いマシンでフレークしうるため、
+      // ファイル出現を 50ms 間隔・最大 3 秒でポーリングする。
+      const pid = yield* Effect.gen(function* () {
+        const deadlineMillis = Date.now() + 3000
+        while (!existsSync(pidFile)) {
+          if (Date.now() >= deadlineMillis) {
+            return yield* Effect.dieMessage(`pid file did not appear within 3s: ${pidFile}`)
+          }
+          yield* Effect.sleep(Duration.millis(50))
+        }
+        return Number(readFileSync(pidFile, "utf8").trim())
+      })
+
+      yield* Fiber.interrupt(fiber)
+
       expect(Number.isInteger(pid)).toBe(true)
 
       // interrupt 後、子プロセスに signal 0 を送って生死を確認する(ESRCH なら
