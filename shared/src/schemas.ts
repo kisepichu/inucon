@@ -95,3 +95,82 @@ export const CreateInstanceRequest = Schema.Struct({
   privateIp: Schema.String
 })
 export type CreateInstanceRequest = typeof CreateInstanceRequest.Type
+
+export const BenchJobId = Schema.String.pipe(Schema.brand("BenchJobId"))
+export type BenchJobId = typeof BenchJobId.Type
+
+export const BenchJobStatus = Schema.Literal("queued", "running", "finished", "canceled", "failed")
+export type BenchJobStatus = typeof BenchJobStatus.Type
+
+// domain の BenchJob(Option フィールド)は境界を跨がないため、ハンドラが
+// Option.getOrNull で変換してこの Struct(null 許容)に合わせる(teams.ts の
+// toTeamMember と同じ方針)。
+export const BenchJob = Schema.Struct({
+  id: BenchJobId,
+  teamId: TeamId,
+  targetIp: Schema.String,
+  targetPort: Schema.Int.pipe(Schema.between(1, 65535)),
+  status: BenchJobStatus,
+  score: Schema.NullOr(Schema.Int),
+  passed: Schema.NullOr(Schema.Boolean),
+  errorMessage: Schema.NullOr(Schema.String),
+  enqueuedAt: Schema.Int,
+  startedAt: Schema.NullOr(Schema.Int),
+  finishedAt: Schema.NullOr(Schema.Int)
+})
+export type BenchJob = typeof BenchJob.Type
+
+// GET /api/bench-jobs/:id: 一覧(BenchJob)にログを足したもの。詳細のみ返す
+// 理由はスペック §2(一覧クエリにログを引きずらないため bench_job_logs を
+// 別テーブルにしている)。
+export const BenchJobDetail = Schema.Struct({
+  ...BenchJob.fields,
+  log: Schema.String
+})
+export type BenchJobDetail = typeof BenchJobDetail.Type
+
+// POST /api/bench-jobs: instanceId 指定時は InstanceRepo で privateIp を解決し
+// targetPort=80 固定にする。どちらの形も受ける(スペック §2 bench)。
+export const EnqueueBenchRequest = Schema.Union(
+  Schema.Struct({ instanceId: InstanceId }),
+  Schema.Struct({ targetIp: Schema.String, targetPort: Schema.Int.pipe(Schema.between(1, 65535)) })
+)
+export type EnqueueBenchRequest = typeof EnqueueBenchRequest.Type
+
+// domain/errors.ts の JobAction(portal 内部)と同形の契約側コピー。domain 型を
+// shared から import しない方針(shared はランナーとも共有するため portal の
+// domain には依存しない)。
+export const JobAction = Schema.Literal("start", "recordProgress", "finish", "fail", "cancel")
+export type JobAction = typeof JobAction.Type
+
+// --- runner 契約(ランナーが HttpApiClient で使う。これが正) ---
+
+export const RunnerJob = Schema.Struct({
+  id: BenchJobId,
+  teamId: TeamId,
+  targetIp: Schema.String,
+  targetPort: Schema.Int.pipe(Schema.between(1, 65535)),
+  problemKey: Schema.String
+})
+export type RunnerJob = typeof RunnerJob.Type
+
+// POST /api/runner/jobs/poll
+export const PollJobResponse = Schema.Struct({ job: Schema.NullOr(RunnerJob) })
+export type PollJobResponse = typeof PollJobResponse.Type
+
+// POST /api/runner/jobs/:id/progress
+export const RunnerProgressRequest = Schema.Struct({
+  logChunk: Schema.String,
+  partialScore: Schema.NullOr(Schema.Int)
+})
+export type RunnerProgressRequest = typeof RunnerProgressRequest.Type
+
+// POST /api/runner/jobs/:id/finish: passed/score は成功時、実行自体の失敗
+// (バイナリ異常終了等)は errorMessage 付き・passed=false, score=0 で送る。
+export const RunnerFinishRequest = Schema.Struct({
+  passed: Schema.Boolean,
+  score: Schema.Int,
+  errorMessage: Schema.NullOr(Schema.String),
+  logTail: Schema.String
+})
+export type RunnerFinishRequest = typeof RunnerFinishRequest.Type

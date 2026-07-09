@@ -3,16 +3,19 @@ import { HttpApiBuilder, HttpMiddleware } from "@effect/platform"
 import { NodeHttpClient, NodeHttpServer, NodeRuntime } from "@effect/platform-node"
 import { Config, Effect, Layer } from "effect"
 import { api } from "shared"
-import { AuthConfig } from "./application/ports.js"
+import { AuthConfig, RunnerConfig } from "./application/ports.js"
 import { GithubOAuthLive } from "./infrastructure/github/oauth.js"
 import { AdminLive } from "./infrastructure/http/handlers/admin.js"
 import { AuthLive } from "./infrastructure/http/handlers/auth.js"
+import { BenchLive } from "./infrastructure/http/handlers/bench.js"
 import { ContestLive } from "./infrastructure/http/handlers/contest.js"
 import { HealthLive } from "./infrastructure/http/handlers/health.js"
 import { InstancesLive } from "./infrastructure/http/handlers/instances.js"
+import { RunnerLive } from "./infrastructure/http/handlers/runner.js"
 import { TeamsLive } from "./infrastructure/http/handlers/teams.js"
-import { AdminOnlyLive, AuthenticationLive } from "./infrastructure/http/middleware.js"
+import { AdminOnlyLive, AuthenticationLive, RunnerAuthLive } from "./infrastructure/http/middleware.js"
 import { MigratorLive, SqlLive } from "./infrastructure/sql/client.js"
+import { BenchJobRepoLive } from "./infrastructure/sql/repos/benchJobRepo.js"
 import { ContestRepoLive } from "./infrastructure/sql/repos/contestRepo.js"
 import { InstanceRepoLive } from "./infrastructure/sql/repos/instanceRepo.js"
 import { SessionRepoLive } from "./infrastructure/sql/repos/sessionRepo.js"
@@ -42,16 +45,35 @@ const ReposLive = Layer.mergeAll(
   SessionRepoLive,
   TeamRepoLive,
   ContestRepoLive,
-  InstanceRepoLive
+  InstanceRepoLive,
+  BenchJobRepoLive
 ).pipe(
   Layer.provideMerge(UuidGenLive),
   Layer.provide(SqlLive)
 )
 
+// JOB_TIMEOUT_MILLIS: running のハートビート(進捗報告)がこの時間途絶えたら
+// failed にする(スペック §BenchJob 不変条件 4)。既定 10 分。
+const RunnerConfigLive = Layer.effect(
+  RunnerConfig,
+  Config.integer("JOB_TIMEOUT_MILLIS").pipe(
+    Config.withDefault(600_000),
+    Config.validate({
+      message: "JOB_TIMEOUT_MILLIS must be a positive integer",
+      validation: (n) => n > 0
+    }),
+    Effect.map((jobTimeoutMillis) => ({ jobTimeoutMillis }))
+  )
+)
+
 const ApiLive = HttpApiBuilder.api(api).pipe(
-  Layer.provide(Layer.mergeAll(HealthLive, AuthLive, ContestLive, TeamsLive, InstancesLive, AdminLive)),
+  Layer.provide(
+    Layer.mergeAll(HealthLive, AuthLive, ContestLive, TeamsLive, InstancesLive, AdminLive, BenchLive, RunnerLive)
+  ),
   Layer.provide(AuthenticationLive),
   Layer.provide(AdminOnlyLive),
+  Layer.provide(RunnerAuthLive),
+  Layer.provide(RunnerConfigLive),
   Layer.provide(GithubOAuthLive.pipe(Layer.provide(NodeHttpClient.layer))),
   Layer.provide(AuthConfigLive),
   Layer.provide(ReposLive)

@@ -36,3 +36,6 @@ export class UnknownGithubLogins extends Data.TaggedError("UnknownGithubLogins")
 export class MemberConflict extends Data.TaggedError("MemberConflict")<{
   logins: ReadonlyArray<string>
 }> {}
+
+// POST /api/bench-jobs: instanceId 指定時に解決先の Instance が存在しない。
+export class InstanceNotFound extends Data.TaggedError("InstanceNotFound")<{}> {}
