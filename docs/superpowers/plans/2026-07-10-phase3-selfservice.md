@@ -14,7 +14,7 @@
 - domain(`portal/src/domain/`)は effect の Schema / Either / Option / Data / Match のみ。application は domain・自層 port・effect コアのみ、infrastructure を import しない。Layer 合成は `portal/src/main.ts`
 - **本番 DB が存在する**(apphost の PVC)。migration は前方専用(0002 を新規追加。既存 0001 は書き換えない)。既存 `active` 行の `running` への移行を 0002 に含める
 - **外部副作用の port はすべて冪等**(ensure/remove 系、stopAndDestroy は無ければ成功)。saga は進行状態(instances.progress)を DB に記録し、プロセス再起動・リトライ・再実行で孤児/二重作成を作らない
-- **guestExec に渡すコマンドはコード内固定**(authorized_keys 追記のみ)。可変部は SSH 公開鍵文字列のみで、`^(ssh-(rsa|ed25519)|ecdsa-sha2-)\S+ \S+` 形式検証を通し argv 分離(シェル展開に渡さない)
+- **guestExec に渡すコマンドはコード内固定**(authorized_keys 追記のみ)。可変部は SSH 公開鍵文字列のみで、authorized_keys 形式(`<keytype> <base64> [comment]`)を検証してから argv 分離(シェル展開に渡さない)。keytype は許可リスト、keydata は base64 のみ: `^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) +[A-Za-z0-9+/]+=* *(\S.*)?$`(keytype と keydata の間は 1 個以上の空白必須、改行・制御文字を含む鍵は弾く)
 - **Access ポリシー更新は現行 include との和集合 PUT**(締め出し防止。スペック §招待フロー)
 - VM スペックは固定 2vCPU/4GB/20GB(ユーザー入力を受けない)。vmid = `1000 + teamNumber*100 + index`、IP = `10.100.<teamNumber>.1<index>`
 - 秘密情報(Proxmox / Cloudflare トークン)は Config.redacted + k8s Secret。リポジトリ・チャット・ログに出さない
@@ -36,7 +36,7 @@ portal/src/
     http/handlers/{instances,admin}.ts(拡張)
     worker/provisioner.ts  払い出し/撤収ワーカー Layer
   web/src/pages/{Team,Admin}.tsx(拡張)
-docs/superpowers/research/2026-07-1x-phase3-spike.md  Task 1 の spike 結果
+docs/superpowers/research/2026-07-11-phase3-spike.md  Task 1 の spike 結果
 ```
 
 ---
@@ -47,7 +47,7 @@ docs/superpowers/research/2026-07-1x-phase3-spike.md  Task 1 の spike 結果
 
 **リモート作業を含むため、資格情報不足時は BLOCKED 報告。**
 
-- [ ] **Step 1: linked clone + 標準 cloud-init の検証(リスク 1)。** eevee で `tpl-private-isu`(9100)から検証用 vmid(例 1901)へ linked clone し、`qm set 1901 --ipconfig0 ip=10.100.1.19/24,gw=10.100.1.1 --sshkeys <file> --net0 ...`(チーム VNet bridge)→ `qm start` → guest agent 経由で IP と authorized_keys が入るか確認。**入らなければ代替(guestExec で IP/鍵注入、cloud-init 非依存)を検証**。検証後 clone は破棄。結果(どの方式が動くか、必要な qm 引数の正確形)を `docs/superpowers/research/2026-07-1x-phase3-spike.md` に記録
+- [ ] **Step 1: linked clone + 標準 cloud-init の検証(リスク 1)。** eevee で `tpl-private-isu`(9100)から検証用 VM(team1 の index 9 相当 = vmid `vmidFor(1,9)` = 1109、IP `ipFor(1,9)` = 10.100.1.19)へ linked clone し、`qm set 1109 --ipconfig0 ip=10.100.1.19/24,gw=10.100.1.1 --sshkeys <file> --net0 ...`(チーム1 VNet bridge)→ `qm start` → guest agent 経由で IP と authorized_keys が入るか確認。**入らなければ代替(guestExec で IP/鍵注入、cloud-init 非依存)を検証**。検証後 clone は破棄。結果(どの方式が動くか、必要な qm 引数の正確形)を `docs/superpowers/research/2026-07-11-phase3-spike.md` に記録
 - [ ] **Step 2: Proxmox API トークンの最小権限(リスク 2)。** eevee で portal 用トークンを作り、clone / config / start / stop / destroy / guest-exec / status に必要な privilege を実測で確定(足りなければ足す)。トークン値は記録せず apphost の k8s Secret へ入れる手順を spike メモに記載(値は Secret にのみ、リポジトリに書かない)
 - [ ] **Step 3: guest agent exec の挙動(リスク 3)。** `agent/exec` + `agent/exec-status` で isucon ユーザーの authorized_keys に追記できるか、出力サイズ/タイムアウトを実測。API の正確なエンドポイント形と応答をメモ
 - [ ] **Step 4: RAM ガードの閾値(リスク 4)。** `nodes/eevee/status` の memory と ARC の関係を実測し、「空き」の定義と作成拒否の閾値(例: 4GB VM を作る前に free ≥ 5GB)を決めてメモ
