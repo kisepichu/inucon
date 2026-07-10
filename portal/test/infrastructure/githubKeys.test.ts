@@ -88,6 +88,20 @@ describe("fetchKeys", () => {
     })
   )
 
+  it.effect("コメント部に制御文字(タブ)を含む鍵は除去する", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeGithub({
+        ctrl: { body: `${ed25519Key}\n${rsaKey}\ttab-in-comment\n` }
+      })
+      const keys = yield* GithubKeysPort.pipe(
+        Effect.flatMap((port) => port.fetchKeys("ctrl")),
+        Effect.provide(portLayer(fake))
+      )
+      // タブを含む行は弾かれ、正常な鍵のみ返る
+      expect(keys).toStrictEqual([ed25519Key])
+    })
+  )
+
   it.effect("全行が不正な形式なら GithubKeysError(有効な鍵が 0 件)", () =>
     Effect.gen(function* () {
       const fake = makeFakeGithub({ garbage: { body: "not-a-key\nalso not a key\n" } })

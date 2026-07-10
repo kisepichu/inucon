@@ -356,11 +356,15 @@ const emptyProxmoxState: ProxmoxTestState = {
 
 // authorized_keys への追記を模す固定コマンド(実装は
 // src/infrastructure/proxmox/client.ts の guestExec 呼び出し元 — Task 4/5 —
-// が組み立てる想定の printf 形と同じ検出ロジック)。command[0] が鍵文字列を
-// 引数に取る printf 呼び出しであれば、その鍵を authorized_keys に追記する。
+// が組み立てる想定の printf 形 `printf "%s\n" "<key>"` と同じ検出ロジック)。
+// フォーマット(printf の直後が "%s\n"、その次が鍵)と配列長を確認してから
+// 抽出し、printf を使う別コマンドを誤検出しない。
 const extractAppendedKey = (command: ReadonlyArray<string>): string | undefined => {
   const idx = command.findIndex((c) => c === "printf")
   if (idx === -1) return undefined
+  // argv 上の printf フォーマット文字列(バックスラッシュ + n の 4 文字 "%s\n")。
+  if (command[idx + 1] !== "%s\\n") return undefined
+  if (idx + 2 >= command.length) return undefined
   return command[idx + 2]
 }
 

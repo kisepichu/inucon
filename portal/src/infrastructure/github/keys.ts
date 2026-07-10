@@ -6,7 +6,7 @@ import { GithubKeysError, GithubKeysPort } from "../../application/ports.js"
 // 計画の Global Constraints(2026-07-10-phase3-selfservice.md)で確定した正規表現をそのまま使う。
 // keytype と keydata の間は 1 個以上の空白必須、改行・制御文字を含む鍵は弾く。
 export const authorizedKeyPattern =
-  /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) +[A-Za-z0-9+/]+=* *(\S.*)?$/
+  /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) +[A-Za-z0-9+/]+=* *([^\x00-\x1F\x7F]*)?$/
 
 export const GithubKeysLive: Layer.Layer<GithubKeysPort, never, HttpClient.HttpClient> = Layer.effect(
   GithubKeysPort,
