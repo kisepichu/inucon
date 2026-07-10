@@ -26,6 +26,8 @@ spec:
       labels:
         app: inucon-portal
     spec:
+      securityContext:
+        fsGroup: 1000
       containers:
         - name: portal
           image: ghcr.io/kisepichu/inucon-portal:latest

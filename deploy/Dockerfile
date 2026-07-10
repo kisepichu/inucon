@@ -80,10 +80,13 @@ COPY --from=build /app/shared/dist ./shared/dist
 COPY --from=build /app/portal/dist ./portal/dist
 COPY --from=build /app/portal/web/dist ./portal/web/dist
 
-# DB_PATH(既定 data/portal.db、k8s では /data/portal.db を Secret/ConfigMap
-# 経由で指定)配置用ディレクトリ。PVC マウント先が /data の想定。
+# DB_PATH 未指定時の既定値(data/portal.db)を保存するディレクトリ。
+# k8s では PVC が /data にマウントされるため、このディレクトリは作成のみ。
 RUN mkdir -p /app/data
 
 EXPOSE 3000
+
+# 非 root で実行する(k8s では deployment.yaml に securityContext.fsGroup を設定)
+USER node
 
 CMD ["node", "portal/dist/main.js"]

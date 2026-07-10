@@ -10,6 +10,7 @@ Task 11 のうち、**ローカルで完結する部分**(Dockerfile / k8s マ�
   - `pnpm -r typecheck && pnpm -r test` 全緑
   - `docker build -f deploy/Dockerfile -t inucon-portal:local .` 成功
   - `docker run` で起動し `/api/health` 200・`/` が SPA の index.html・seed(contests 1 行、`INUCON`/`private-isu`/`preparing`)を確認済み(詳細は `.superpowers/sdd/task-11-report.md`)
+  - ローカル `docker run` で DB ファイルへの書き込み確認時は、`-v` マウント先ディレクトリの所有者・権限に注意（node ユーザー UID 1000 で実行するため、ホストの `chmod 777` または Docker Desktop の fsGroup 対応で対処）
 - k8s マニフェスト: `deploy/k8s/{namespace,pvc,deployment,service,ingress}.yaml`
 - 対象クラスタ: apphost(192.0.2.20、NixOS + k3s。`ssh apphost.kisen.one` で入れる)
 - ランナー対象ホスト: benchvm(192.0.2.5、NixOS。bench 環境は Phase 1 で配置済み)
@@ -27,14 +28,23 @@ Task 11 のうち、**ローカルで完結する部分**(Dockerfile / k8s マ�
 
 ## 2. イメージ build & push(ghcr.io)
 
+**重要: ビルドマシンの CPU アーキテクチャが Apple Silicon(arm64)の場合、デプロイ先の apphost が amd64 VM のため、クロスビルドが必須です。そのまま `docker build` を実行すると、apphost で `exec format error` で起動に失敗します。**
+
+amd64 への本番ビルド(リポジトリルートで実行):
 ```sh
-# リポジトリルートで実行(ビルドコンテキストはルート)
-docker build -f deploy/Dockerfile -t ghcr.io/kisepichu/inucon-portal:latest .
+# docker buildx を使ったクロスビルド(amd64 イメージを ghcr.io に直接 push)
+docker buildx build --platform linux/amd64 \
+  -f deploy/Dockerfile \
+  -t ghcr.io/kisepichu/inucon-portal:latest \
+  --push \
+  .
+```
 
-# ghcr.io へログイン(GitHub PAT に write:packages が必要)
-echo "$GHCR_TOKEN" | docker login ghcr.io -u kisepichu --password-stdin
-
-docker push ghcr.io/kisepichu/inucon-portal:latest
+ローカルで動作確認したい場合(arm64 イメージを使う):
+```sh
+# クロスビルドなし、ローカル動作確認用(:local タグを使う)
+docker build -f deploy/Dockerfile -t inucon-portal:local .
+docker run -p 3000:3000 inucon-portal:local
 ```
 
 push 後、GitHub の Package 設定(`https://github.com/users/kisepichu/packages/container/inucon-portal/settings`)で **Package visibility を Public に変更**する。
@@ -44,24 +54,36 @@ push 後、GitHub の Package 設定(`https://github.com/users/kisepichu/package
 
 `inucon-portal-env` という名前の Secret に、ポータルが読む機密環境変数をまとめて入れる(`deployment.yaml` は `envFrom.secretRef` でこの Secret を丸ごと注入する)。
 
+**重要: 値の安全な渡し方**
+
+コマンド置換を使った `printf` 方式は、展開値が kubectl の argv に入るため、`ps` で確認できてしまいます。代わりに一時ファイル方式を使ってください:
+
 ```sh
 ssh apphost.kisen.one
 
 kubectl create namespace inucon --dry-run=client -o yaml | kubectl apply -f -
 
-# 値はすべてプレースホルダ。実際の値に置き換えてから実行すること。
-# printf ヒアドキュメント経由にすることで、シェル履歴・プロセスリストに
-# 平文の secret を残しにくくする。
+# 一時 env ファイルを安全に作成(mode 0600)
+umask 077
+cat > /tmp/inucon-env << 'EOF'
+GITHUB_CLIENT_ID=REPLACE_ME_GITHUB_CLIENT_ID
+GITHUB_CLIENT_SECRET=REPLACE_ME_GITHUB_CLIENT_SECRET
+ADMIN_GITHUB_LOGINS=kisepichu
+RUNNER_TOKEN=REPLACE_ME_RUNNER_TOKEN
+BASE_URL=https://inucon.kisen.one
+EOF
+
+# Secret を作成
 kubectl create secret generic inucon-portal-env \
   --namespace inucon \
-  --from-literal=GITHUB_CLIENT_ID="$(printf '%s' 'REPLACE_ME_GITHUB_CLIENT_ID')" \
-  --from-literal=GITHUB_CLIENT_SECRET="$(printf '%s' 'REPLACE_ME_GITHUB_CLIENT_SECRET')" \
-  --from-literal=ADMIN_GITHUB_LOGINS="$(printf '%s' 'kisepichu')" \
-  --from-literal=RUNNER_TOKEN="$(printf '%s' 'REPLACE_ME_RUNNER_TOKEN')" \
-  --from-literal=BASE_URL="$(printf '%s' 'https://inucon.kisen.one')" \
+  --from-env-file=/tmp/inucon-env \
   --dry-run=client -o yaml | kubectl apply -f -
+
+# ファイルは使用後に削除
+rm /tmp/inucon-env
 ```
 
+環境変数の説明:
 - `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`: 手順 1 で発行した値
 - `RUNNER_TOKEN`: ランナー(benchvm)と共有する bearer token。`openssl rand -hex 32` などで生成した値を使う。手順 6 の agenix secret と同じ値にすること
 - `ADMIN_GITHUB_LOGINS`: 管理者の GitHub login をカンマ区切りで(例: `kisepichu`)
