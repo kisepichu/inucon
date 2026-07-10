@@ -268,6 +268,36 @@ describe("ensureInstanceRoute", () => {
       void fake
     })
   )
+
+  it.effect("HTTP は 2xx でもボディが success:false なら CloudflareError(errors の要約が cause に入り、トークンは含まない)", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeCf()
+      const rateLimitedClient = HttpClient.make((request) =>
+        Effect.succeed(
+          jsonResponse(request, {
+            success: false,
+            errors: [{ code: 1004, message: "DNS Validation Error" }],
+            result: null
+          })
+        )
+      )
+      const rateLimitedLayer = CloudflareLive.pipe(
+        Layer.provide(Layer.succeed(HttpClient.HttpClient, rateLimitedClient)),
+        Layer.provide(configLayer)
+      )
+      const error = yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) => cf.ensureInstanceRoute({ hostname: "x.kisen.one", ip: "10.100.1.11" })),
+        Effect.provide(rateLimitedLayer),
+        Effect.flip
+      )
+      expect(error).toBeInstanceOf(CloudflareError)
+      const cause = String((error as CloudflareError).cause)
+      expect(cause).toContain("1004")
+      expect(cause).toContain("DNS Validation Error")
+      expect(cause).not.toContain("test-cf-token")
+      void fake
+    })
+  )
 })
 
 describe("removeInstanceRoute", () => {
@@ -480,6 +510,38 @@ describe("removeAccessApp", () => {
         Effect.provide(portLayer(fake))
       )
       expect(fake.state.accessApps).toHaveLength(0)
+    })
+  )
+
+  it.effect("DELETE が 2xx + success:false を返すと CloudflareError(void 系ヘルパーの success 検証)", () =>
+    Effect.gen(function* () {
+      const client = HttpClient.make((request) => {
+        const url = HttpClientRequest.toUrl(request).pipe(
+          (opt) => (opt._tag === "Some" ? opt.value : new URL(request.url))
+        )
+        if (url.pathname === "/client/v4/accounts/acct-1/access/apps" && request.method === "GET") {
+          return Effect.succeed(
+            jsonResponse(request, {
+              success: true,
+              result: [{ id: "app-1", domain: "inucon-team1-1.kisen.one" }]
+            })
+          )
+        }
+        return Effect.succeed(
+          jsonResponse(request, { success: false, errors: [{ code: 7003, message: "Not authorized" }] })
+        )
+      })
+      const layer = CloudflareLive.pipe(Layer.provide(Layer.succeed(HttpClient.HttpClient, client)), Layer.provide(configLayer))
+      const error = yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) => cf.removeAccessApp("inucon-team1-1.kisen.one")),
+        Effect.provide(layer),
+        Effect.flip
+      )
+      expect(error).toBeInstanceOf(CloudflareError)
+      const cause = String((error as CloudflareError).cause)
+      expect(cause).toContain("7003")
+      expect(cause).toContain("Not authorized")
+      expect(cause).not.toContain("test-cf-token")
     })
   )
 })

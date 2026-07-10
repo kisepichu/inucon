@@ -16,9 +16,7 @@ const DnsRecord = Schema.Struct({
   content: Schema.String
 })
 
-const DnsRecordsListResponse = Schema.Struct({
-  result: Schema.Array(DnsRecord)
-})
+const DnsRecordsList = Schema.Array(DnsRecord)
 
 const IngressEntry = Schema.Struct({
   hostname: Schema.optional(Schema.String),
@@ -26,11 +24,9 @@ const IngressEntry = Schema.Struct({
 })
 type IngressEntry = typeof IngressEntry.Type
 
-const TunnelConfigResponse = Schema.Struct({
-  result: Schema.Struct({
-    config: Schema.Struct({
-      ingress: Schema.Array(IngressEntry)
-    })
+const TunnelConfig = Schema.Struct({
+  config: Schema.Struct({
+    ingress: Schema.Array(IngressEntry)
   })
 })
 
@@ -39,13 +35,7 @@ const AccessApp = Schema.Struct({
   domain: Schema.String
 })
 
-const AccessAppsListResponse = Schema.Struct({
-  result: Schema.Array(AccessApp)
-})
-
-const AccessAppResponse = Schema.Struct({
-  result: AccessApp
-})
+const AccessAppsList = Schema.Array(AccessApp)
 
 // email include のみ厳格にデコードする。everyone/ip/email_domain 等の他の include
 // 種別は CF API 上多様な形を取り得るため、ここでは Schema.Unknown で受けて未知の形の
@@ -62,9 +52,40 @@ const AccessPolicy = Schema.Struct({
   include: Schema.Array(Schema.Unknown)
 })
 
-const AccessPoliciesListResponse = Schema.Struct({
-  result: Schema.Array(AccessPolicy)
+const AccessPoliciesList = Schema.Array(AccessPolicy)
+
+// CF API v4 のレスポンスエンベロープ。2xx でもボディが `{success:false, errors:[...]}`
+// になり得るため(例: レート制限・入力エラーの一部)、ステータスコードだけでなく
+// このエンベロープの success を必ず検証する。success:true のときのみ result を
+// resultSchema でデコードして使う。
+const CfApiError = Schema.Struct({
+  code: Schema.optional(Schema.Union(Schema.Number, Schema.String)),
+  message: Schema.String
 })
+
+// success:false のとき result は null(あるいは省略)になり得るため、まずは
+// result を Schema.Unknown で緩く受けて success/errors だけを確定させる。
+// resultSchema による厳格なデコードは success:true が確定した後にだけ行う
+// (success:false かつ result が薄い/null なケースで、resultSchema 側の
+// decode 失敗が errors を覆い隠してしまわないようにするため)。
+const CfEnvelope = Schema.Struct({
+  success: Schema.Boolean,
+  errors: Schema.optional(Schema.Array(CfApiError)),
+  result: Schema.optional(Schema.Unknown)
+})
+
+// トークンを含まない(cause は method + path + エラー要約のみ)success:false の
+// 要約文字列を作る。errors が空の場合も success:false 自体を明示する。
+const summarizeCfErrors = (
+  req: HttpClientRequest.HttpClientRequest,
+  errors: ReadonlyArray<{ readonly code?: number | string; readonly message: string }> | undefined
+): string => {
+  const detail =
+    errors !== undefined && errors.length > 0
+      ? errors.map((e) => (e.code !== undefined ? `${e.code}: ${e.message}` : e.message)).join("; ")
+      : "(no error detail)"
+  return `Cloudflare API ${req.method} ${requestPath(req)} → success:false — ${detail}`
+}
 
 export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient.HttpClient> = Layer.effect(
   CloudflarePort,
@@ -80,16 +101,26 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
       )
     )
 
-    const request = <A>(
+    // 2xx かつ success:true のときだけ result を resultSchema でデコードして返す。
+    // 2xx でも success:false なら CloudflareError(errors の要約を cause に)。
+    // 2xx 以外はステータスで即 fail。
+    const request = <A, I>(
       req: HttpClientRequest.HttpClientRequest,
-      schema: Schema.Schema<A, any>
+      resultSchema: Schema.Schema<A, I>
     ): Effect.Effect<A, CloudflareError> =>
       client.execute(req).pipe(
         Effect.mapError((cause) => new CloudflareError({ cause: describeHttpFailure(req, cause) })),
         Effect.flatMap((response) =>
           response.status >= 200 && response.status < 300
-            ? HttpClientResponse.schemaBodyJson(schema)(response).pipe(
-                Effect.mapError((cause) => new CloudflareError({ cause: describeHttpFailure(req, cause) }))
+            ? HttpClientResponse.schemaBodyJson(CfEnvelope)(response).pipe(
+                Effect.mapError((cause) => new CloudflareError({ cause: describeHttpFailure(req, cause) })),
+                Effect.flatMap((envelope) =>
+                  envelope.success
+                    ? Schema.decodeUnknown(resultSchema)(envelope.result).pipe(
+                        Effect.mapError((cause) => new CloudflareError({ cause: describeHttpFailure(req, cause) }))
+                      )
+                    : Effect.fail(new CloudflareError({ cause: summarizeCfErrors(req, envelope.errors) }))
+                )
               )
             : Effect.fail(
                 new CloudflareError({ cause: `Cloudflare API ${req.method} ${requestPath(req)} → ${response.status}` })
@@ -98,6 +129,8 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
         Effect.scoped
       )
 
+    // PUT/POST/DELETE の void 系。result の形は見ず success だけ検証する
+    // (DNS 削除等で result が薄い/null なケースも通す)。
     const requestJson = (
       req: HttpClientRequest.HttpClientRequest
     ): Effect.Effect<void, CloudflareError> =>
@@ -105,7 +138,14 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
         Effect.mapError((cause) => new CloudflareError({ cause: describeHttpFailure(req, cause) })),
         Effect.flatMap((response) =>
           response.status >= 200 && response.status < 300
-            ? Effect.void
+            ? HttpClientResponse.schemaBodyJson(CfEnvelope)(response).pipe(
+                Effect.mapError((cause) => new CloudflareError({ cause: describeHttpFailure(req, cause) })),
+                Effect.flatMap((envelope) =>
+                  envelope.success
+                    ? Effect.void
+                    : Effect.fail(new CloudflareError({ cause: summarizeCfErrors(req, envelope.errors) }))
+                )
+              )
             : Effect.fail(
                 new CloudflareError({ cause: `Cloudflare API ${req.method} ${requestPath(req)} → ${response.status}` })
               )
@@ -119,8 +159,8 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
           HttpClientRequest.setUrlParam("type", "CNAME"),
           HttpClientRequest.setUrlParam("name", hostname)
         ),
-        DnsRecordsListResponse
-      ).pipe(Effect.map((r) => r.result[0]))
+        DnsRecordsList
+      ).pipe(Effect.map((records) => records[0]))
 
     const upsertDnsRecord = (hostname: string, content: string) =>
       Effect.gen(function* () {
@@ -153,8 +193,8 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
     const getIngress = () =>
       request(
         HttpClientRequest.get(`${CF_API_BASE}/accounts/${accountId}/cfd_tunnel/${tunnelId}/configurations`),
-        TunnelConfigResponse
-      ).pipe(Effect.map((r) => r.result.config.ingress))
+        TunnelConfig
+      ).pipe(Effect.map((cfg) => cfg.config.ingress))
 
     const putIngress = (ingress: ReadonlyArray<IngressEntry>) =>
       requestJson(
@@ -190,14 +230,14 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
     const findAccessApp = (hostname: string) =>
       request(
         HttpClientRequest.get(`${CF_API_BASE}/accounts/${accountId}/access/apps`),
-        AccessAppsListResponse
-      ).pipe(Effect.map((r) => r.result.find((a) => a.domain === hostname)))
+        AccessAppsList
+      ).pipe(Effect.map((apps) => apps.find((a) => a.domain === hostname)))
 
     const getPolicies = (appId: string) =>
       request(
         HttpClientRequest.get(`${CF_API_BASE}/accounts/${accountId}/access/apps/${appId}/policies`),
-        AccessPoliciesListResponse
-      ).pipe(Effect.map((r) => r.result))
+        AccessPoliciesList
+      )
 
     return {
       ensureInstanceRoute: ({ hostname, ip }) =>
@@ -226,8 +266,8 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
                   session_duration: "24h"
                 })
               ),
-              AccessAppResponse
-            ).pipe(Effect.map((r) => r.result))
+              AccessApp
+            )
             yield* requestJson(
               HttpClientRequest.post(
                 `${CF_API_BASE}/accounts/${accountId}/access/apps/${app.id}/policies`
