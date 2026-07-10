@@ -36,7 +36,7 @@ interface FakeState {
   accessApps: Array<{
     id: string
     domain: string
-    policies: Array<{ id: string; include: Array<{ email: { email: string } }> }>
+    policies: Array<{ id: string; decision: string; include: Array<unknown> }>
   }>
 }
 
@@ -130,9 +130,9 @@ const makeFakeCf = (initial?: Partial<FakeState>) => {
     }
     if (policiesListMatch && method === "POST") {
       const appId = policiesListMatch[1]
-      const body = bodyJson(request) as { include: Array<{ email: { email: string } }> }
+      const body = bodyJson(request) as { decision: string; include: Array<unknown> }
       const app = state.accessApps.find((a) => a.id === appId)
-      const policy = { id: nextId(), include: body.include }
+      const policy = { id: nextId(), decision: body.decision, include: body.include }
       if (app !== undefined) app.policies.push(policy)
       return Effect.succeed(jsonResponse(request, { success: true, result: policy }))
     }
@@ -141,11 +141,18 @@ const makeFakeCf = (initial?: Partial<FakeState>) => {
     )
     if (policyUpdateMatch && method === "PUT") {
       const [, appId, policyId] = policyUpdateMatch
-      const body = bodyJson(request) as { include: Array<{ email: { email: string } }> }
+      const body = bodyJson(request) as { decision: string; include: Array<unknown> }
       const app = state.accessApps.find((a) => a.id === appId)
       const idx = app?.policies.findIndex((p) => p.id === policyId) ?? -1
-      if (app !== undefined && idx >= 0) app.policies[idx] = { id: policyId, include: body.include }
-      return Effect.succeed(jsonResponse(request, { success: true, result: { id: policyId, include: body.include } }))
+      if (app !== undefined && idx >= 0) {
+        app.policies[idx] = { id: policyId, decision: body.decision, include: body.include }
+      }
+      return Effect.succeed(
+        jsonResponse(request, {
+          success: true,
+          result: { id: policyId, decision: body.decision, include: body.include }
+        })
+      )
     }
 
     return Effect.succeed(jsonResponse(request, { success: false, errors: [{ message: "not found" }] }, 404))
@@ -156,6 +163,16 @@ const makeFakeCf = (initial?: Partial<FakeState>) => {
 
 const portLayer = (fake: { layer: Layer.Layer<HttpClient.HttpClient> }) =>
   CloudflareLive.pipe(Layer.provide(fake.layer), Layer.provide(configLayer))
+
+// テストの include アサーション用: include は Array<unknown> なので、
+// email include だけを取り出して email 文字列に変換する小さなヘルパー。
+const emailsOf = (include: ReadonlyArray<unknown>): Array<string> =>
+  include
+    .filter((i): i is { email: { email: string } } => {
+      const e = i as { email?: { email?: unknown } }
+      return typeof e?.email?.email === "string"
+    })
+    .map((i) => i.email.email)
 
 describe("ensureInstanceRoute", () => {
   it.effect("新規: DNS CNAME 作成 + tunnel ingress を catch-all の前に追加", () =>
@@ -312,7 +329,7 @@ describe("ensureAccessApp", () => {
       const app = fake.state.accessApps[0]
       expect(app.domain).toBe("inucon-team1-1.kisen.one")
       expect(app.policies).toHaveLength(1)
-      expect(app.policies[0].include.map((i) => i.email.email).sort()).toStrictEqual([
+      expect(emailsOf(app.policies[0].include).sort()).toStrictEqual([
         "a@example.com",
         "b@example.com"
       ])
@@ -326,7 +343,9 @@ describe("ensureAccessApp", () => {
           {
             id: "app-1",
             domain: "inucon-team1-1.kisen.one",
-            policies: [{ id: "pol-1", include: [{ email: { email: "existing@example.com" } }] }]
+            policies: [
+              { id: "pol-1", decision: "allow", include: [{ email: { email: "existing@example.com" } }] }
+            ]
           }
         ]
       })
@@ -338,7 +357,7 @@ describe("ensureAccessApp", () => {
       )
 
       const app = fake.state.accessApps[0]
-      expect(app.policies[0].include.map((i) => i.email.email).sort()).toStrictEqual([
+      expect(emailsOf(app.policies[0].include).sort()).toStrictEqual([
         "existing@example.com",
         "new@example.com"
       ])
@@ -352,7 +371,9 @@ describe("ensureAccessApp", () => {
           {
             id: "app-1",
             domain: "inucon-team1-1.kisen.one",
-            policies: [{ id: "pol-1", include: [{ email: { email: "existing@example.com" } }] }]
+            policies: [
+              { id: "pol-1", decision: "allow", include: [{ email: { email: "existing@example.com" } }] }
+            ]
           }
         ]
       })
@@ -364,7 +385,75 @@ describe("ensureAccessApp", () => {
       )
 
       const app = fake.state.accessApps[0]
-      expect(app.policies[0].include.map((i) => i.email.email)).toStrictEqual(["existing@example.com"])
+      expect(emailsOf(app.policies[0].include)).toStrictEqual(["existing@example.com"])
+    })
+  )
+
+  it.effect("既存: email 以外の未知 include(everyone 等)が混在しても decode で落ちず、そのまま保持される", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeCf({
+        accessApps: [
+          {
+            id: "app-1",
+            domain: "inucon-team1-1.kisen.one",
+            policies: [
+              {
+                id: "pol-1",
+                decision: "allow",
+                include: [{ email: { email: "existing@example.com" } }, { everyone: {} }]
+              }
+            ]
+          }
+        ]
+      })
+      yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) =>
+          cf.ensureAccessApp({ hostname: "inucon-team1-1.kisen.one", emails: ["new@example.com"] })
+        ),
+        Effect.provide(portLayer(fake))
+      )
+
+      const app = fake.state.accessApps[0]
+      expect(emailsOf(app.policies[0].include).sort()).toStrictEqual([
+        "existing@example.com",
+        "new@example.com"
+      ])
+      expect(app.policies[0].include).toContainEqual({ everyone: {} })
+    })
+  )
+
+  it.effect("既存: 複数ポリシーがある場合は先頭の allow ポリシーだけを対象にする(他ポリシーは変更しない)", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeCf({
+        accessApps: [
+          {
+            id: "app-1",
+            domain: "inucon-team1-1.kisen.one",
+            policies: [
+              { id: "pol-deny", decision: "deny", include: [{ ip: { ip: "203.0.113.0/24" } }] },
+              { id: "pol-allow", decision: "allow", include: [{ email: { email: "existing@example.com" } }] }
+            ]
+          }
+        ]
+      })
+      yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) =>
+          cf.ensureAccessApp({ hostname: "inucon-team1-1.kisen.one", emails: ["new@example.com"] })
+        ),
+        Effect.provide(portLayer(fake))
+      )
+
+      const app = fake.state.accessApps[0]
+      expect(app.policies).toHaveLength(2)
+      expect(app.policies[0]).toStrictEqual({
+        id: "pol-deny",
+        decision: "deny",
+        include: [{ ip: { ip: "203.0.113.0/24" } }]
+      })
+      expect(emailsOf(app.policies[1].include).sort()).toStrictEqual([
+        "existing@example.com",
+        "new@example.com"
+      ])
     })
   )
 })

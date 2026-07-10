@@ -2,6 +2,7 @@ import { HttpClient, HttpClientRequest, HttpClientResponse } from "@effect/platf
 import { Config, Effect, Layer, Redacted, Schema } from "effect"
 import type { ConfigError } from "effect/ConfigError"
 import { CloudflareError, CloudflarePort } from "../../application/ports.js"
+import { describeHttpFailure, requestPath } from "../httpClientErrors.js"
 
 // Cloudflare API v4。Phase 1-2 は手動(ダッシュボード)で運用していた
 // DNS CNAME / tunnel ingress / Access アプリの 3 操作を API 化する
@@ -46,13 +47,19 @@ const AccessAppResponse = Schema.Struct({
   result: AccessApp
 })
 
-const AccessPolicyInclude = Schema.Struct({
+// email include のみ厳格にデコードする。everyone/ip/email_domain 等の他の include
+// 種別は CF API 上多様な形を取り得るため、ここでは Schema.Unknown で受けて未知の形の
+// まま保持する(厳格な Struct にすると、既存ポリシーにそれらが混在した瞬間に decode が
+// 落ちてしまう)。email include かどうかの判定は isEmailInclude(Schema.is)で行う。
+const AccessPolicyEmailInclude = Schema.Struct({
   email: Schema.Struct({ email: Schema.String })
 })
+const isEmailInclude = Schema.is(AccessPolicyEmailInclude)
 
 const AccessPolicy = Schema.Struct({
   id: Schema.String,
-  include: Schema.Array(AccessPolicyInclude)
+  decision: Schema.String,
+  include: Schema.Array(Schema.Unknown)
 })
 
 const AccessPoliciesListResponse = Schema.Struct({
@@ -78,13 +85,15 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
       schema: Schema.Schema<A, any>
     ): Effect.Effect<A, CloudflareError> =>
       client.execute(req).pipe(
-        Effect.mapError((cause) => new CloudflareError({ cause })),
+        Effect.mapError((cause) => new CloudflareError({ cause: describeHttpFailure(req, cause) })),
         Effect.flatMap((response) =>
           response.status >= 200 && response.status < 300
             ? HttpClientResponse.schemaBodyJson(schema)(response).pipe(
-                Effect.mapError((cause) => new CloudflareError({ cause }))
+                Effect.mapError((cause) => new CloudflareError({ cause: describeHttpFailure(req, cause) }))
               )
-            : Effect.fail(new CloudflareError({ cause: `Cloudflare API ${req.method} ${req.url} → ${response.status}` }))
+            : Effect.fail(
+                new CloudflareError({ cause: `Cloudflare API ${req.method} ${requestPath(req)} → ${response.status}` })
+              )
         ),
         Effect.scoped
       )
@@ -93,11 +102,13 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
       req: HttpClientRequest.HttpClientRequest
     ): Effect.Effect<void, CloudflareError> =>
       client.execute(req).pipe(
-        Effect.mapError((cause) => new CloudflareError({ cause })),
+        Effect.mapError((cause) => new CloudflareError({ cause: describeHttpFailure(req, cause) })),
         Effect.flatMap((response) =>
           response.status >= 200 && response.status < 300
             ? Effect.void
-            : Effect.fail(new CloudflareError({ cause: `Cloudflare API ${req.method} ${req.url} → ${response.status}` }))
+            : Effect.fail(
+                new CloudflareError({ cause: `Cloudflare API ${req.method} ${requestPath(req)} → ${response.status}` })
+              )
         ),
         Effect.scoped
       )
@@ -232,12 +243,17 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
           }
 
           const policies = yield* getPolicies(existingApp.id)
-          const currentEmails = policies.flatMap((p) => p.include.map((i) => i.email.email))
-          const union = Array.from(new Set([...currentEmails, ...emails]))
-          const includeBody = union.map((email) => ({ email: { email } }))
 
-          const existingPolicy = policies[0]
-          if (existingPolicy === undefined) {
+          // 前提(単一ポリシー想定の脆さへの対処): 実 API では複数ポリシー・複数種別の
+          // include(everyone/ip/email_domain 等)が存在しうる。ここでは「先頭の allow
+          // ポリシー」だけを inucon の対象ポリシーとみなし、email はその先頭 allow
+          // ポリシーの email include とのみ和集合を取る。allow ポリシーが 1 つも無い
+          // (0 個、または全て allow 以外)場合は新規に allow ポリシーを作成する。
+          // 対象ポリシーの email 以外の include(everyone/ip 等)は unknown のまま
+          // そのまま保持し、和集合の対象にも変更対象にもしない(消さない)。
+          const targetPolicy = policies.find((p) => p.decision === "allow")
+
+          if (targetPolicy === undefined) {
             yield* requestJson(
               HttpClientRequest.post(
                 `${CF_API_BASE}/accounts/${accountId}/access/apps/${existingApp.id}/policies`
@@ -245,23 +261,29 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
                 HttpClientRequest.bodyUnsafeJson({
                   name: "inucon-team-members",
                   decision: "allow",
-                  include: includeBody
+                  include: emails.map((email) => ({ email: { email } }))
                 })
               )
             )
-          } else {
-            yield* requestJson(
-              HttpClientRequest.put(
-                `${CF_API_BASE}/accounts/${accountId}/access/apps/${existingApp.id}/policies/${existingPolicy.id}`
-              ).pipe(
-                HttpClientRequest.bodyUnsafeJson({
-                  name: "inucon-team-members",
-                  decision: "allow",
-                  include: includeBody
-                })
-              )
-            )
+            return
           }
+
+          const currentEmails = targetPolicy.include.filter(isEmailInclude).map((i) => i.email.email)
+          const otherIncludes = targetPolicy.include.filter((i) => !isEmailInclude(i))
+          const union = Array.from(new Set([...currentEmails, ...emails]))
+          const includeBody = [...otherIncludes, ...union.map((email) => ({ email: { email } }))]
+
+          yield* requestJson(
+            HttpClientRequest.put(
+              `${CF_API_BASE}/accounts/${accountId}/access/apps/${existingApp.id}/policies/${targetPolicy.id}`
+            ).pipe(
+              HttpClientRequest.bodyUnsafeJson({
+                name: "inucon-team-members",
+                decision: "allow",
+                include: includeBody
+              })
+            )
+          )
         }),
 
       removeAccessApp: (hostname) =>
