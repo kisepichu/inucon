@@ -1,7 +1,7 @@
 import { HttpClient, HttpClientRequest } from "@effect/platform"
 import { Effect, Layer } from "effect"
 import { GithubKeysError, GithubKeysPort } from "../../application/ports.js"
-import { describeHttpFailure } from "../httpClientErrors.js"
+import { describeHttpFailure, requestPath } from "../httpClientErrors.js"
 
 // authorized_keys 形式(<keytype> <base64> [comment])の許可リスト検証。
 // 計画の Global Constraints(2026-07-10-phase3-selfservice.md)で確定した正規表現をそのまま使う。
@@ -29,7 +29,9 @@ export const GithubKeysLive: Layer.Layer<GithubKeysPort, never, HttpClient.HttpC
           )
           if (response.status !== 200) {
             return yield* Effect.fail(
-              new GithubKeysError({ cause: `unexpected status ${response.status} for ${login}` })
+              // HTTP 失敗の cause は Proxmox/Cloudflare と同じく method + パス + status に
+              // 揃える(ユーザー入力 login を生でログに残さない)。
+              new GithubKeysError({ cause: `${request.method} ${requestPath(request)} → ${response.status}` })
             )
           }
           const body = yield* response.text.pipe(

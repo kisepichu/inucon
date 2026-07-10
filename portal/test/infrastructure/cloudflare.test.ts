@@ -315,7 +315,9 @@ describe("removeInstanceRoute", () => {
         Effect.flip
       )
       expect(error._tag).toBe("CloudflareError")
-      expect(String(error.cause)).toContain("重複")
+      if (error._tag === "CloudflareError") {
+        expect(String(error.cause)).toContain("重複")
+      }
     })
   )
 
