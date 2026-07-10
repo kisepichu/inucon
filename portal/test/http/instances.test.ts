@@ -1,6 +1,6 @@
 import { HttpBody, HttpClient } from "@effect/platform"
 import { it } from "@effect/vitest"
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import { describe, expect } from "vitest"
 import { DuplicateInstanceIndex } from "shared"
 import { Instance } from "../../src/domain/instance.js"
@@ -21,8 +21,13 @@ describe("GET /api/teams/:id/instances", () => {
         id: InstanceId.make("inst-self-1"),
         teamId: team.id,
         index: 1,
+        vmid: 1140,
         privateIp: "10.100.40.10",
-        status: "active"
+        status: "running",
+        progress: ["clone_done", "configured", "started", "route_done", "access_done"],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
       })
       yield* instances.create(instance)
 
@@ -133,7 +138,7 @@ describe("POST /api/instances", () => {
       const body = (yield* res.json) as { teamId: string; privateIp: string; status: string }
       expect(body.teamId).toBe(team.id)
       expect(body.privateIp).toBe("10.100.52.10")
-      expect(body.status).toBe("active")
+      expect(body.status).toBe("running")
 
       const instances = yield* InstanceRepo
       const listed = yield* instances.listByTeam(team.id)
@@ -196,8 +201,13 @@ describe("DELETE /api/instances/:id", () => {
         id: InstanceId.make("inst-del-1"),
         teamId: team.id,
         index: 1,
+        vmid: 1153,
         privateIp: "10.100.53.10",
-        status: "active"
+        status: "running",
+        progress: ["clone_done", "configured", "started", "route_done", "access_done"],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
       })
       yield* instances.create(instance)
 

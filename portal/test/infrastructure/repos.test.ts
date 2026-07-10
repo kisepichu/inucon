@@ -246,8 +246,13 @@ layer("InstanceRepo", (it) => {
         id: InstanceId.make("instance-1"),
         teamId: team.id,
         index: 1,
+        vmid: 1102,
         privateIp: "10.100.102.10",
-        status: "active"
+        status: "running",
+        progress: ["clone_done", "configured", "started", "route_done", "access_done"],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
       })
       const created = yield* instances.create(instance)
       expect(created).toStrictEqual(instance)
@@ -274,8 +279,13 @@ layer("InstanceRepo: create 重複拒否", (it) => {
         id: InstanceId.make("instance-dup-1"),
         teamId: team.id,
         index: 1,
+        vmid: 1103,
         privateIp: "10.100.103.10",
-        status: "active"
+        status: "running",
+        progress: ["clone_done", "configured", "started", "route_done", "access_done"],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
       })
       yield* instances.create(first)
 
@@ -283,8 +293,13 @@ layer("InstanceRepo: create 重複拒否", (it) => {
         id: InstanceId.make("instance-dup-2"),
         teamId: team.id,
         index: 1,
+        vmid: 1103,
         privateIp: "10.100.103.11",
-        status: "active"
+        status: "running",
+        progress: ["clone_done", "configured", "started", "route_done", "access_done"],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
       })
       const exit = yield* Effect.exit(instances.create(second))
       expect(exit).toStrictEqual(Exit.fail(new DuplicateInstanceIndex({ teamId: team.id, index: 1 })))

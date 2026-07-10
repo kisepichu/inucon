@@ -1,10 +1,23 @@
-import { Effect, Either, Option } from "effect"
+import { Clock, Effect, Either, Option } from "effect"
 import { validateBenchTarget } from "../../domain/subnet.js"
 import { InstanceId, TeamId } from "../../domain/ids.js"
-import { Instance } from "../../domain/instance.js"
+import { Instance, vmidFor } from "../../domain/instance.js"
+import type { ProvisionStep } from "../../domain/instance.js"
 import type { User } from "../../domain/user.js"
 import { Forbidden, TeamNotFound } from "../errors.js"
 import { InstanceRepo, TeamRepo, UuidGen } from "../ports.js"
+
+// スペック §HTTP API(差分): この admin 専用経路は「Terraform 製 VM の台帳
+// 取り込み」用に残す(Phase 2 からの引き継ぎ)。対象 VM は登録時点で既に
+// 起動済みという前提のため、状態機械上は creating を経由せず直ちに running
+// として登録する(全 provision step 済み扱い)。
+const ALL_PROVISION_STEPS: ReadonlyArray<ProvisionStep> = [
+  "clone_done",
+  "configured",
+  "started",
+  "route_done",
+  "access_done"
+]
 
 // GET /api/teams/:id/instances: 当該チームメンバー or admin のみ参照可
 // (他チームは Forbidden、403)。対象チームが存在しない場合は TeamNotFound。
@@ -45,12 +58,18 @@ export const createInstance = (args: { teamId: TeamId; index: number; privateIp:
 
     const uuidGen = yield* UuidGen
     const id = InstanceId.make(yield* uuidGen.next)
+    const now = yield* Clock.currentTimeMillis
     const instance = new Instance({
       id,
       teamId: args.teamId,
       index: args.index,
+      vmid: vmidFor(team.teamNumber, args.index),
       privateIp: args.privateIp,
-      status: "active"
+      status: "running",
+      progress: ALL_PROVISION_STEPS,
+      errorMessage: Option.none(),
+      createdAt: now,
+      updatedAt: now
     })
 
     const instances = yield* InstanceRepo
