@@ -76,29 +76,29 @@ stateDiagram-v2
 ```ts
 // Proxmox VE API(https://192.0.2.10:8006/api2/json)。トークン認証
 export class ProxmoxPort extends Context.Tag("app/ProxmoxPort")<ProxmoxPort, {
-  readonly cloneVm: (args: { templateVmid: number; newVmid: number; name: string }) => Effect<void, ProxmoxError>
-  readonly configureCloudInit: (args: { vmid: number; ip: string; gateway: string; sshKeys: string }) => Effect<void, ProxmoxError>
-  readonly setVnet: (args: { vmid: number; bridge: string }) => Effect<void, ProxmoxError>
-  readonly startVm: (vmid: number) => Effect<void, ProxmoxError>
-  readonly stopAndDestroyVm: (vmid: number) => Effect<void, ProxmoxError>   // 冪等(無ければ成功扱い)
-  readonly waitForGuestAgent: (vmid: number, timeoutMillis: number) => Effect<void, ProxmoxError | ProvisionTimeout>
-  readonly guestExec: (args: { vmid: number; command: ReadonlyArray<string> }) => Effect<{ exitcode: number; out: string }, ProxmoxError>
-  readonly getNodeFreeMemBytes: Effect<number, ProxmoxError>
+  readonly cloneVm: (args: { templateVmid: number; newVmid: number; name: string }) => Effect.Effect<void, ProxmoxError>
+  readonly configureCloudInit: (args: { vmid: number; ip: string; gateway: string; sshKeys: string }) => Effect.Effect<void, ProxmoxError>
+  readonly setVnet: (args: { vmid: number; bridge: string }) => Effect.Effect<void, ProxmoxError>
+  readonly startVm: (vmid: number) => Effect.Effect<void, ProxmoxError>
+  readonly stopAndDestroyVm: (vmid: number) => Effect.Effect<void, ProxmoxError>   // 冪等(無ければ成功扱い)
+  readonly waitForGuestAgent: (vmid: number, timeoutMillis: number) => Effect.Effect<void, ProxmoxError | ProvisionTimeout>
+  readonly guestExec: (args: { vmid: number; command: ReadonlyArray<string> }) => Effect.Effect<{ exitcode: number; out: string }, ProxmoxError>
+  readonly getNodeFreeMemBytes: Effect.Effect<number, ProxmoxError>
 }>() {}
 
 // Cloudflare API(DNS / Tunnel remote config / Access)。Phase 1-2 の runbook 実績の API 化
 export class CloudflarePort extends Context.Tag("app/CloudflarePort")<CloudflarePort, {
-  readonly ensureInstanceRoute: (args: { hostname: string; ip: string }) => Effect<void, CloudflareError>
+  readonly ensureInstanceRoute: (args: { hostname: string; ip: string }) => Effect.Effect<void, CloudflareError>
     // = DNS CNAME(→ benchvm tunnel)+ tunnel ingress(ssh://ip:22)の追加。冪等
-  readonly removeInstanceRoute: (hostname: string) => Effect<void, CloudflareError>
-  readonly ensureAccessApp: (args: { hostname: string; emails: ReadonlyArray<string> }) => Effect<void, CloudflareError>
-    // Access アプリ作成 or ポリシー全置換(既存 runbook の PUT 方式)
-  readonly removeAccessApp: (hostname: string) => Effect<void, CloudflareError>
+  readonly removeInstanceRoute: (hostname: string) => Effect.Effect<void, CloudflareError>
+  readonly ensureAccessApp: (args: { hostname: string; emails: ReadonlyArray<string> }) => Effect.Effect<void, CloudflareError>
+    // Access アプリ作成 or ポリシー更新(現行 include との和集合で PUT — 締め出し防止)
+  readonly removeAccessApp: (hostname: string) => Effect.Effect<void, CloudflareError>
 }>() {}
 
 // GitHub 公開鍵の取得(https://github.com/<login>.keys)
 export class GithubKeysPort extends Context.Tag("app/GithubKeysPort")<GithubKeysPort, {
-  readonly fetchKeys: (login: string) => Effect<ReadonlyArray<string>, GithubKeysError>  // 空は GithubKeysError(鍵未登録)
+  readonly fetchKeys: (login: string) => Effect.Effect<ReadonlyArray<string>, GithubKeysError>  // 空は GithubKeysError(鍵未登録)
 }>() {}
 ```
 
@@ -112,8 +112,8 @@ export class GithubKeysPort extends Context.Tag("app/GithubKeysPort")<GithubKeys
 admin: POST /api/admin/teams/:id/invites { githubLogin, email }
   1. users に存在 → 即所属(既存 setMembers 相当、他チーム所属は 409)
      存在しない → team_invites 行を作成(初ログイン時に自動所属 + 行削除)
-  2. チームの全インスタンスの Access アプリへ email を追加(ポリシー全置換 PUT:
-     現メンバーのメール一覧 + 招待中メール一覧から構成)
+  2. チームの全インスタンスの Access アプリへ email を追加(現行ポリシーを GET し、
+     現メンバー + 招待中のメール集合との和集合で PUT — 下記「締め出し防止」)
   3. チームの running 全 VM に guestExec で authorized_keys 追記
      (GithubKeysPort で取得した鍵を isucon ユーザーへ。重複追記は排除)
   → レスポンスは 3 点の成否。失敗項目は同じ API の再実行で埋める(全ステップ冪等)
