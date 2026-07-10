@@ -82,7 +82,8 @@ COPY --from=build /app/portal/web/dist ./portal/web/dist
 
 # DB_PATH 未指定時の既定値(data/portal.db)を保存するディレクトリ。
 # k8s では PVC が /data にマウントされるため、このディレクトリは作成のみ。
-RUN mkdir -p /app/data
+# USER node で書き込めるよう所有権を渡す。
+RUN mkdir -p /app/data && chown node:node /app/data
 
 EXPOSE 3000
 
