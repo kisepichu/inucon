@@ -1,8 +1,25 @@
 # INUCON Phase 2 設計ドキュメント: ポータル + ベンチランナー
 
 日付: 2026-07-09
-ステータス: ドラフト(レビュー待ち)
+ステータス: 承認済み / **Phase 2 完了 (2026-07-10)**
 親ドキュメント: [2026-07-04-inucon-design.md](2026-07-04-inucon-design.md)(全体設計。Phase 2 の位置づけ・技術選定の大枠はそちらで承認済み)
+
+> **Phase 2 完了時の実測・逸脱注記(2026-07-10)**: 全 12 タスク(PR #13〜#23 + 本 PR、
+> nixos-config-private #7〜#8)をマージし、本番検証を完了した。
+>
+> - **本番実測**: ポータル経由の実ベンチが score 1077 / 902 / 990 の 3 回完走(Phase 1 の
+>   CLI 実測 1030〜1041 と同水準だがばらつき約 ±9% と大きめ。ホスト負荷との相関は開催前に要観察)。
+>   実行中 cancel は 409、ベンチプロセス異常終了は errorMessage 付き failed、ランナー
+>   停止時は 608 秒(10 分 + スイープ周期)で timeout failed に自動回収、をすべて実測。
+> - **デプロイ逸脱 1(イメージ配布)**: ghcr.io への公開 push は不採用とし、
+>   `docker save | ssh | k3s ctr images import` の直接インポート方式にした(公開レジストリに
+>   出さない方が private として健全なため)。deployment の imagePullPolicy は IfNotPresent。
+> - **デプロイ逸脱 2(cloudflared)**: apphost のトンネルは **remotely managed** で、
+>   NixOS 側の config.yml の ingress は Cloudflare 側の設定に上書きされ**無効**。
+>   inucon.kisen.one の ingress 追加は Cloudflare API(cfd_tunnel/configurations)で行った。
+> - **運用注意**: benchvm の LAN IP は DHCP で変動する(実測 .5 → .11)。NodePort 30080 の
+>   firewall 許可は LAN サブネット単位に変更済み(nixos-config-private #8)。
+> - ランナーの環境変数は暫定でファイル(/home/kise/.inucon/runner-env)。開催前に agenix 化(TODO)。
 
 ## 背景・目的
 

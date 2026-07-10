@@ -172,6 +172,7 @@ docs/      本ドキュメント等
 
 - **Phase 1 — 手動 MVP(ポータルなし)**: Terraform + cloud-init で private-isu テンプレート構築 → チーム VM クローン → SDN VNet 分離 → Cloudflare Access 越し SSH 検証 → benchvm から CLI でベンチ実行・スコア確認。ここで「matsuu cloud-config が Proxmox で動くか」「縮小スペックでベンチが通るか」「クローン所要時間」を実証する。
 - **Phase 2 — ポータル**: TS + Effect.ts で キュー・スコアボード・チーム管理・GitHub OAuth。benchvm にランナー常駐。この期間の前半に Effect.ts の素振りを兼ねる。
+  → **完了(2026-07-10)**。詳細・実測・逸脱は [2026-07-09-phase2-portal-design.md](2026-07-09-phase2-portal-design.md) の完了注記を参照。ポータルは https://inucon.kisen.one で稼働中。
 - **Phase 3 — セルフサービス**: インスタンス追加/削除ボタン(Proxmox + Cloudflare API オーケストレーション、クォータ・RAM ガード)。普段使い VM(`inucon-<app>`)の解禁。
 - **Phase 4 — 拡張**: 2 問目対応(アダプタ抽象の検証)、1 チーム複数台構成の運用、CPU ピニング等の公平性強化、開催モード(私用 VM の自動停止)。
 
