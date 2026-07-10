@@ -31,7 +31,10 @@ spec:
       containers:
         - name: portal
           image: ghcr.io/kisepichu/inucon-portal:latest
-          imagePullPolicy: Always
+          # k3s ctr への直接インポート方式(README §2)の前提。Always だと
+          # push していない(レジストリに存在しない)イメージを pull しようとして
+          # ImagePullBackOff になる。
+          imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 3000
