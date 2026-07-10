@@ -29,8 +29,10 @@ Task 11 のうち、**ローカルで完結する部分**(Dockerfile / k8s マ�
 ## 2. イメージ build & apphost へのインポート(レジストリ不使用)
 
 **採用方式(Phase 2 実績)**: 公開レジストリ(ghcr.io)には push せず、amd64 でビルドした
-イメージを `docker save | ssh | k3s ctr images import` で apphost の containerd に直接
-取り込む。イメージを公開面に出さずに済み、imagePullSecret も不要。
+イメージを tarball にして apphost へ転送し、`k3s ctr images import` で containerd に直接
+取り込む(下記手順例のとおり scp の 2 段方式。import に必要な sudo がパスワード対話を
+要求するため、stdin をパイプで塞ぐストリーミング 1-liner とは両立しない)。イメージを
+公開面に出さずに済み、imagePullSecret も不要。
 `deployment.yaml` の `imagePullPolicy: IfNotPresent` はこの方式の前提
 (`Always` だと push していない = レジストリ側に存在しないイメージを pull しようとして失敗する)。
 
