@@ -83,7 +83,8 @@ Sys.Audit    # ← /nodes/eevee/status(RAM ガード)に必須。VM.Audit だけ
 
 - 注: `VM.Monitor` は PVE 9 では無効な priv 名(role add が失敗する)。guest agent 権限は `VM.GuestAgent.*` に細分化されている。
 - 実測: このトークンで `GET /nodes/eevee/status`(mem.free 取得)/ `GET /nodes/eevee/qemu`(VM 一覧 6 台)/ `GET .../storage/local/content?content=snippets`(snippet 一覧)が成功。clone/start/exec の書き込み系は Task 3 の Live 実装で通す。
-- env のキー: `PROXMOX_API_URL`(=`https://192.0.2.10:8006/api2/json`)、`PROXMOX_TOKEN_ID`(=`portal@pve!inucon`)、`PROXMOX_TOKEN_SECRET`。TLS は自己署名のため CloudflarePort/ProxmoxPort の HttpClient は検証スキップ(LAN 内固定ホスト)。
+- env のキー: `PROXMOX_API_URL`(=`https://192.0.2.10:8006/api2/json`)、`PROXMOX_TOKEN_ID`(=`portal@pve!inucon`)、`PROXMOX_TOKEN_SECRET`。
+- **TLS(Proxmox の自己署名証明書)**: 検証スキップを既定にしない。方針は (1) eevee の証明書 or その CA を k8s Secret に入れてポータルの HttpClient の信頼ストアに追加(検証有効のまま)、または (2) 証明書フィンガープリントのピン留め(`PROXMOX_TLS_FINGERPRINT` を env で渡し一致確認)。どうしても検証無効にする場合は `PROXMOX_TLS_INSECURE=true` の明示フラグ + ホスト固定(192.0.2.10 のみ)+ Proxmox 用途限定を併記し、既定 false にする。Cloudflare API は公開 CA なので通常検証。Task 3 で (1) か (2) を採用して確定する。
 
 ## リスク 5: Cloudflare Access アプリ数の上限
 

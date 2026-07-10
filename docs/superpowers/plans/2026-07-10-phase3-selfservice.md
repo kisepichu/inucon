@@ -52,7 +52,7 @@ docs/superpowers/research/2026-07-11-phase3-spike.md  Task 1 の spike 結果
 - [ ] **Step 3: guest agent exec の挙動(リスク 3)。** `agent/exec` + `agent/exec-status` で isucon ユーザーの authorized_keys に追記できるか、出力サイズ/タイムアウトを実測。API の正確なエンドポイント形と応答をメモ
 - [ ] **Step 4: RAM ガードの閾値(リスク 4)。** `nodes/eevee/status` の memory と ARC の関係を実測し、「空き」の定義と作成拒否の閾値(例: 4GB VM を作る前に free ≥ 5GB)を決めてメモ
 - [ ] **Step 5: Access アプリ数上限(リスク 5)** を Cloudflare ドキュメント/API で確認しメモ
-- [ ] **Step 6: benchvm トンネル(0000aaaa)の remotely managed 化。** 現ローカル ingress(team1-1/team2-1)を CF API の tunnel configurations に載せ替え(apphost と同運用)。nixos-config-private の benchvm ingress 定義に「実効性なし・ドキュメントのみ」注記を追加して PR。**この Step は既存の SSH 経路に影響するため、切り替え後に `ssh inucon-team1-1.kisen.one` が通ることを確認してからマージ**
+- [ ] **Step 6: benchvm トンネル(0000aaaa)の remotely managed 化。** cloudflared を **token 方式**(`cloudflared tunnel run` + env `TUNNEL_TOKEN`)で起動する systemd サービスに置き換え、ingress を CF API の tunnel configurations で管理する。**重要**: `--config` 方式(NixOS の services.cloudflared モジュール)はローカル ingress を使い remote を無視するため使えない(spike で実測)。apphost は locally managed のままで方式が異なる(統一しない)。**既存の SSH 経路に影響するため、切り替え後に `ssh inucon-team1-1.kisen.one` が通ることを確認してからマージ**。→ **spike(Task 1)で実施済み**(nixos-config-private #9)
 - [ ] **Step 7: spike の結論をスペックに反映**(採用方式でリスク欄を「解決済み」に更新する追記 PR。または本計画の後続タスクの記述を確定値へ更新)
 - [ ] **Step 8: /commit(spike メモ)→ /pr → /pr-review → マージ**(nixos PR も)
 
@@ -109,7 +109,7 @@ export const ipFor: (teamNumber: number, index: number) => string     // 10.100.
 **Interfaces:** スペック §アーキテクチャの 3 port(Effect.Effect 表記)をそのまま。エラー型 `ProxmoxError` / `CloudflareError` / `GithubKeysError` / `ProvisionTimeout` は `Data.TaggedError`(RepoError と同じ置き場: ports.ts)。
 
 **実装の要点(Task 1 spike の確定値を使う):**
-- Proxmox Live: HttpClient + トークンヘッダ(`Authorization: PVEAPIToken=<id>=<secret>`)。TLS は自己署名のため検証スキップ設定を明示(LAN 内・固定ホスト)。`cloneVm` は clone タスクの UPID を `tasklog`/`status` でポーリングして完了待ち。`guestExec` は exec → exec-status ポーリング
+- Proxmox Live: HttpClient + トークンヘッダ(`Authorization: PVEAPIToken=<id>=<secret>`)。**TLS は検証スキップを既定にしない** — eevee 証明書/CA を信頼ストアに追加(検証有効)か、フィンガープリントのピン留め(`PROXMOX_TLS_FINGERPRINT` を env で渡し一致確認)を採用する(spike メモの方針参照)。`cloneVm` は clone タスクの UPID を `tasklog`/`status` でポーリングして完了待ち。`guestExec` は exec → exec-status ポーリング
 - Cloudflare Live: Phase 1-2 の runbook の API を関数化。`ensureAccessApp` は GET → 和集合 → PUT。`ensureInstanceRoute` は DNS CNAME upsert + tunnel configurations の ingress 追加(catch-all の前に挿入、全置換なので既存保持)
 - GithubKeys Live: `GET https://github.com/<login>.keys`、空なら GithubKeysError、各行を公開鍵形式で検証
 

@@ -161,7 +161,7 @@ Phase 2 の admin 用インスタンス手動登録(POST /api/instances)は「Te
 
 ## 前提インフラ作業(実装計画の冒頭タスク)
 
-1. **benchvm トンネル(0000aaaa)の remotely managed 化**: 現ローカル ingress(team1-1/team2-1)を API の tunnel configurations に載せ替え。NixOS 側の ingress 定義は apphost 同様「ドキュメント化のみ・実効性なし」の注記に変更(nixos-config-private へ PR)。※apphost での実績(Phase 2)と同じ運用に統一する
+1. **benchvm トンネル(0000aaaa)の remotely managed 化**: cloudflared を token 方式(`cloudflared tunnel run` + env `TUNNEL_TOKEN`)の systemd サービスにし、ingress を CF API の tunnel configurations で管理する。**`--config` 方式(services.cloudflared モジュール)は remote を pull しない**ため使わない(spike 実測)。apphost は locally managed のまま(方式は統一しない)。→ spike(Task 1、nixos-config-private #9)で実施済み。詳細: `../research/2026-07-11-phase3-spike.md`
 2. **Proxmox API トークン作成**(eevee): portal 用・最小権限。値は k8s Secret へ
 3. k8s Secret に `PROXMOX_API_TOKEN` / `CF_API_TOKEN` 追加、deployment の envFrom は既存 Secret を流用
 
