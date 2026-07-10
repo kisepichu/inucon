@@ -4,6 +4,7 @@ import type { InstanceId, TeamId } from "../../../domain/ids.js"
 import { Instance } from "../../../domain/instance.js"
 import { DuplicateInstanceIndex } from "../../../domain/errors.js"
 import { InstanceRepo } from "../../../application/ports.js"
+import { RepoError } from "../../../application/ports.js"
 import { decodeRow, optionToNull, wrapSqlError } from "./support.js"
 
 interface InstanceRow {
@@ -28,7 +29,13 @@ const INSTANCE_COLUMNS = `
 `
 
 const decodeInstance = (row: InstanceRow) =>
-  decodeRow(Instance, { ...row, progress: JSON.parse(row.progress) as unknown })
+  // progress は TEXT に JSON 配列で保存されている。壊れた値でプロセスを落とさない
+  // よう Effect.try でパースし、失敗も RepoError として E チャネルに載せる
+  // (後段の Schema.decodeUnknown の失敗と同じ扱い)。
+  Effect.try({
+    try: () => JSON.parse(row.progress) as unknown,
+    catch: (cause) => new RepoError({ cause })
+  }).pipe(Effect.flatMap((progress) => decodeRow(Instance, { ...row, progress })))
 
 export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlClient> = Layer.effect(
   InstanceRepo,
