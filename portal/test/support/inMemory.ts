@@ -10,8 +10,15 @@ import { User } from "../../src/domain/user.js"
 import type { Team } from "../../src/domain/team.js"
 import {
   BenchJobRepo,
+  CloudflareError,
+  CloudflarePort,
   ContestRepo,
+  GithubKeysError,
+  GithubKeysPort,
   InstanceRepo,
+  ProvisionTimeout,
+  ProxmoxError,
+  ProxmoxPort,
   RunnerConfig,
   SessionRepo,
   TeamRepo,
@@ -307,3 +314,212 @@ export const makeAuthReposTest = (): Layer.Layer<UserRepo | SessionRepo> =>
       return Context.make(UserRepo, userRepo).pipe(Context.add(SessionRepo, sessionRepo))
     })
   )
+
+// Phase 3(Task 3)の 3 port のインメモリ実装。Task 4 の払い出し/撤収 saga・
+// 招待フローのテストで、実 HTTP なしにオーケストレーションの分岐(冪等性・
+// 補償処理・失敗時のロールバック)を検証するために使う。
+//
+// 各 make*Test は `{ layer, getState }` を返す(ports.ts の 3 port には
+// リポジトリのような読み取り専用メソッドが無いため、呼び出し履歴・結果状態を
+// テストから検証する手段として getState という Effect を追加で提供する。他の
+// インメモリ実装(Layer のみを返す)とはこの点で異なる)。
+
+export type ProxmoxOperation =
+  | "cloneVm"
+  | "configureCloudInit"
+  | "setVnet"
+  | "startVm"
+  | "stopAndDestroyVm"
+  | "waitForGuestAgent"
+  | "guestExec"
+  | "getNodeFreeMemBytes"
+
+export interface ProxmoxTestState {
+  readonly clonedVmids: ReadonlyArray<number>
+  readonly configuredVmids: ReadonlyArray<number>
+  readonly vnetByVmid: Readonly<Record<number, string>>
+  readonly startedVmids: ReadonlyArray<number>
+  readonly destroyedVmids: ReadonlyArray<number>
+  readonly authorizedKeysByVmid: Readonly<Record<number, ReadonlyArray<string>>>
+  readonly guestExecCalls: ReadonlyArray<{ vmid: number; command: ReadonlyArray<string> }>
+}
+
+const emptyProxmoxState: ProxmoxTestState = {
+  clonedVmids: [],
+  configuredVmids: [],
+  vnetByVmid: {},
+  startedVmids: [],
+  destroyedVmids: [],
+  authorizedKeysByVmid: {},
+  guestExecCalls: []
+}
+
+// authorized_keys への追記を模す固定コマンド(実装は
+// src/infrastructure/proxmox/client.ts の guestExec 呼び出し元 — Task 4/5 —
+// が組み立てる想定の printf 形 `printf "%s\n" "<key>"` と同じ検出ロジック)。
+// フォーマット(printf の直後が "%s\n"、その次が鍵)と配列長を確認してから
+// 抽出し、printf を使う別コマンドを誤検出しない。
+const extractAppendedKey = (command: ReadonlyArray<string>): string | undefined => {
+  const idx = command.findIndex((c) => c === "printf")
+  if (idx === -1) return undefined
+  // argv 上の printf フォーマット文字列(バックスラッシュ + n の 4 文字 "%s\n")。
+  if (command[idx + 1] !== "%s\\n") return undefined
+  if (idx + 2 >= command.length) return undefined
+  return command[idx + 2]
+}
+
+// options.failWith: 特定の操作を常に指定エラーで失敗させる(saga の補償処理・
+// エラーハンドリングをテストするためのフック)。waitForGuestAgent だけ
+// ProvisionTimeout も許容する(ports.ts のシグネチャに合わせる)。
+type ProxmoxFailWith = Partial<Record<Exclude<ProxmoxOperation, "waitForGuestAgent">, ProxmoxError>> & {
+  waitForGuestAgent?: ProxmoxError | ProvisionTimeout
+}
+
+export const makeProxmoxPortTest = (
+  options: {
+    freeMemBytes?: number
+    guestAgentReady?: boolean
+    failWith?: ProxmoxFailWith
+  } = {}
+): { layer: Layer.Layer<ProxmoxPort>; getState: Effect.Effect<ProxmoxTestState> } => {
+  const stateRef = Ref.unsafeMake(emptyProxmoxState)
+  const freeMemBytes = options.freeMemBytes ?? 6_000_000_000
+  const guestAgentReady = options.guestAgentReady ?? true
+
+  const guarded = <A>(
+    op: Exclude<ProxmoxOperation, "waitForGuestAgent">,
+    succeed: Effect.Effect<A, never>
+  ): Effect.Effect<A, ProxmoxError> => {
+    const failure = options.failWith?.[op]
+    return failure !== undefined ? Effect.fail(failure) : succeed
+  }
+
+  const layer = Layer.succeed(ProxmoxPort, {
+    cloneVm: ({ newVmid }) =>
+      guarded(
+        "cloneVm",
+        Ref.update(stateRef, (s) => ({ ...s, clonedVmids: [...s.clonedVmids, newVmid] }))
+      ),
+    configureCloudInit: ({ vmid }) =>
+      guarded(
+        "configureCloudInit",
+        Ref.update(stateRef, (s) => ({ ...s, configuredVmids: [...s.configuredVmids, vmid] }))
+      ),
+    setVnet: ({ bridge, vmid }) =>
+      guarded(
+        "setVnet",
+        Ref.update(stateRef, (s) => ({ ...s, vnetByVmid: { ...s.vnetByVmid, [vmid]: bridge } }))
+      ),
+    startVm: (vmid) =>
+      guarded(
+        "startVm",
+        Ref.update(stateRef, (s) => ({ ...s, startedVmids: [...s.startedVmids, vmid] }))
+      ),
+    // 冪等: 何度呼んでも destroyedVmids に重複追加しない。
+    stopAndDestroyVm: (vmid) =>
+      guarded(
+        "stopAndDestroyVm",
+        Ref.update(stateRef, (s) => ({
+          ...s,
+          destroyedVmids: s.destroyedVmids.includes(vmid) ? s.destroyedVmids : [...s.destroyedVmids, vmid]
+        }))
+      ),
+    waitForGuestAgent: (vmid, timeoutMillis) => {
+      const failure = options.failWith?.waitForGuestAgent
+      if (failure !== undefined) return Effect.fail(failure)
+      return guestAgentReady ? Effect.void : Effect.fail(new ProvisionTimeout({ vmid, timeoutMillis }))
+    },
+    // authorized_keys 追記コマンド(printf "%s\n" "<key>" >> ...)を検出して
+    // 重複無しで追記する。それ以外のコマンドは記録だけして成功を返す。
+    guestExec: ({ command, vmid }) =>
+      guarded(
+        "guestExec",
+        Ref.modify(stateRef, (s): readonly [{ exitcode: number; out: string }, ProxmoxTestState] => {
+          const key = extractAppendedKey(command)
+          const currentKeys = s.authorizedKeysByVmid[vmid] ?? []
+          const updatedKeys = key === undefined || currentKeys.includes(key) ? currentKeys : [...currentKeys, key]
+          const nextState: ProxmoxTestState = {
+            ...s,
+            authorizedKeysByVmid: { ...s.authorizedKeysByVmid, [vmid]: updatedKeys },
+            guestExecCalls: [...s.guestExecCalls, { vmid, command }]
+          }
+          return [{ exitcode: 0, out: `${updatedKeys.length} authorized_keys\n` }, nextState]
+        })
+      ),
+    getNodeFreeMemBytes: guarded("getNodeFreeMemBytes", Effect.succeed(freeMemBytes))
+  })
+
+  return { layer, getState: Ref.get(stateRef) }
+}
+
+export interface CloudflareTestState {
+  readonly routesByHostname: Readonly<Record<string, string>>
+  readonly accessEmailsByHostname: Readonly<Record<string, ReadonlyArray<string>>>
+}
+
+const emptyCloudflareState: CloudflareTestState = { routesByHostname: {}, accessEmailsByHostname: {} }
+
+export type CloudflareOperation = "ensureInstanceRoute" | "removeInstanceRoute" | "ensureAccessApp" | "removeAccessApp"
+
+export const makeCloudflarePortTest = (
+  options: { failWith?: Partial<Record<CloudflareOperation, CloudflareError>> } = {}
+): { layer: Layer.Layer<CloudflarePort>; getState: Effect.Effect<CloudflareTestState> } => {
+  const stateRef = Ref.unsafeMake(emptyCloudflareState)
+
+  const guarded = <A>(op: CloudflareOperation, succeed: Effect.Effect<A, never>): Effect.Effect<A, CloudflareError> => {
+    const failure = options.failWith?.[op]
+    return failure !== undefined ? Effect.fail(failure) : succeed
+  }
+
+  const layer = Layer.succeed(CloudflarePort, {
+    ensureInstanceRoute: ({ hostname, ip }) =>
+      guarded(
+        "ensureInstanceRoute",
+        Ref.update(stateRef, (s) => ({ ...s, routesByHostname: { ...s.routesByHostname, [hostname]: ip } }))
+      ),
+    removeInstanceRoute: (hostname) =>
+      guarded(
+        "removeInstanceRoute",
+        Ref.update(stateRef, (s) => {
+          const { [hostname]: _removed, ...rest } = s.routesByHostname
+          return { ...s, routesByHostname: rest }
+        })
+      ),
+    // 現行 include との和集合(締め出し防止。ports.ts の意味論をそのまま再現)。
+    ensureAccessApp: ({ emails, hostname }) =>
+      guarded(
+        "ensureAccessApp",
+        Ref.update(stateRef, (s) => {
+          const current = s.accessEmailsByHostname[hostname] ?? []
+          const union = Array.from(new Set([...current, ...emails]))
+          return { ...s, accessEmailsByHostname: { ...s.accessEmailsByHostname, [hostname]: union } }
+        })
+      ),
+    removeAccessApp: (hostname) =>
+      guarded(
+        "removeAccessApp",
+        Ref.update(stateRef, (s) => {
+          const { [hostname]: _removed, ...rest } = s.accessEmailsByHostname
+          return { ...s, accessEmailsByHostname: rest }
+        })
+      )
+  })
+
+  return { layer, getState: Ref.get(stateRef) }
+}
+
+// login → 公開鍵一覧の対応表で GithubKeysPort をスタブする
+// (test/support/githubOAuthStub.ts の makeGithubOAuthStub と同じ形)。
+// 対応表にない login、または空配列が登録された login は GithubKeysError で失敗する
+// (Live 実装の「空は GithubKeysError」と同じ意味論)。
+export const makeGithubKeysPortTest = (
+  byLogin: Record<string, ReadonlyArray<string>> = {}
+): Layer.Layer<GithubKeysPort> =>
+  Layer.succeed(GithubKeysPort, {
+    fetchKeys: (login) => {
+      const keys = byLogin[login]
+      return keys !== undefined && keys.length > 0
+        ? Effect.succeed(keys)
+        : Effect.fail(new GithubKeysError({ cause: `no keys registered for ${login}` }))
+    }
+  })
