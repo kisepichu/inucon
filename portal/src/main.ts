@@ -4,7 +4,7 @@ import { HttpApiBuilder, HttpMiddleware } from "@effect/platform"
 import { NodeHttpClient, NodeHttpServer, NodeRuntime } from "@effect/platform-node"
 import { Config, Effect, Layer } from "effect"
 import { api } from "shared"
-import { AuthConfig, RunnerConfig } from "./application/ports.js"
+import { AuthConfig, ProvisioningConfig, RunnerConfig } from "./application/ports.js"
 import { GithubOAuthLive } from "./infrastructure/github/oauth.js"
 import { AdminLive } from "./infrastructure/http/handlers/admin.js"
 import { AuthLive } from "./infrastructure/http/handlers/auth.js"
@@ -69,6 +69,34 @@ const RunnerConfigLive = Layer.effect(
     }),
     Effect.map((jobTimeoutMillis) => ({ jobTimeoutMillis }))
   )
+)
+
+// 払い出しガードの閾値・タイムアウト(Phase 3、Task 4)。既定は spike メモ
+// §リスク4 の RAM 閾値 5GiB(= 1 インスタンス 4GiB + 予備 1GiB)と、guest agent
+// 待機 120 秒。RunnerConfigLive と同じく Config から組み立て、値は正の整数に
+// バリデートする(不正値でも Layer 構築を失敗させて早期に気付ける)。この
+// Layer は env 依存が既定値ありのため単体では起動を壊さないが、消費者である
+// ProvisionerLive は実 port Live(Proxmox/Cloudflare/Github)を要し、それらは
+// env 必須のため MainLive への配線は Task 7 に委ねる(下記 WorkerLive の注記)。
+export const ProvisioningConfigLive = Layer.effect(
+  ProvisioningConfig,
+  Effect.gen(function* () {
+    const minFreeMemBytes = yield* Config.integer("PROVISION_MIN_FREE_MEM_BYTES").pipe(
+      Config.withDefault(5_000_000_000),
+      Config.validate({
+        message: "PROVISION_MIN_FREE_MEM_BYTES must be a positive integer",
+        validation: (n) => n > 0
+      })
+    )
+    const guestAgentTimeoutMillis = yield* Config.integer("PROVISION_GUEST_AGENT_TIMEOUT_MILLIS").pipe(
+      Config.withDefault(120_000),
+      Config.validate({
+        message: "PROVISION_GUEST_AGENT_TIMEOUT_MILLIS must be a positive integer",
+        validation: (n) => n > 0
+      })
+    )
+    return { minFreeMemBytes, guestAgentTimeoutMillis }
+  })
 )
 
 const ApiLive = HttpApiBuilder.api(api).pipe(
@@ -145,6 +173,27 @@ const WorkerLive = TimeoutSweeperLive.pipe(
   Layer.provide(ReposLive),
   Layer.provide(MigratorLive)
 )
+
+// 払い出し/撤収オーケストレーションのワーカー(Task 4)は
+// ProvisionerLive(infrastructure/worker/provisioner.ts)として定義済みで、
+// ProvisioningConfigLive も上で用意した。ただし ProvisionerLive の実行には
+// 実 port Live(ProxmoxLive / CloudflareLive / GithubKeysLive)が必要で、
+// それらは PROXMOX_* / CF_API_TOKEN 等の env を Layer 構築時に必須とする
+// (未設定だと Layer.launch が起動時に失敗する)。dev/test では env が無いのが
+// 通常のため、ここで MainLive に merge すると「env 未設定で起動が壊れる」形に
+// なってしまう。スペックの実装計画でも実 Layer の配線(k8s Secret / TLS 方針の
+// 確定含む)は Task 7(本番検証)に切られているため、本 Task では
+// ProvisionerLive を MainLive に配線しない。Task 7 で
+//   ProvisionerLive.pipe(
+//     Layer.provide(ProvisioningConfigLive),
+//     Layer.provide(ReposLive),            // InstanceRepo / TeamRepo
+//     Layer.provide(ProxmoxLive.pipe(Layer.provide(ProxmoxHttpClientLive))),
+//     Layer.provide(CloudflareLive.pipe(Layer.provide(NodeHttpClient.layer))),
+//     Layer.provide(GithubKeysLive.pipe(Layer.provide(NodeHttpClient.layer))),
+//     Layer.provide(MigratorLive)
+//   )
+// の形で WorkerLive に足す(TimeoutSweeper と同じ ReposLive/MigratorLive の
+// 同一参照メモ化に乗せる)。
 
 // migration/seed は HttpLive・WorkerLive の依存(Layer.provide)経由で実行される
 // (メモ化により 1 回だけ)。トップレベルにはそれらを消費するコンポーネント

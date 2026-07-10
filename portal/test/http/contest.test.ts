@@ -30,7 +30,7 @@ describe("GET /api/contest", () => {
     Effect.gen(function* () {
       const contests = yield* ContestRepo
       yield* contests.save(
-        new Contest({ id: ContestId.make("contest-1"), name: "INUCON", problemKey: "private-isu", status: "preparing" })
+        new Contest({ id: ContestId.make("contest-1"), name: "INUCON", problemKey: "private-isu", status: "preparing", instanceQuota: 3 })
       )
 
       const { cookieHeader } = yield* login()
@@ -54,7 +54,7 @@ describe("POST /api/admin/contest/start", () => {
     Effect.gen(function* () {
       const contests = yield* ContestRepo
       yield* contests.save(
-        new Contest({ id: ContestId.make("contest-start-403"), name: "C", problemKey: "p", status: "preparing" })
+        new Contest({ id: ContestId.make("contest-start-403"), name: "C", problemKey: "p", status: "preparing", instanceQuota: 3 })
       )
       const { cookieHeader } = yield* login({ isAdmin: false })
       const res = yield* start(cookieHeader)
@@ -74,7 +74,7 @@ describe("POST /api/admin/contest/start", () => {
     Effect.gen(function* () {
       const contests = yield* ContestRepo
       yield* contests.save(
-        new Contest({ id: ContestId.make("contest-start-ok"), name: "C", problemKey: "p", status: "preparing" })
+        new Contest({ id: ContestId.make("contest-start-ok"), name: "C", problemKey: "p", status: "preparing", instanceQuota: 3 })
       )
       const { cookieHeader } = yield* asAdmin()
       const res = yield* start(cookieHeader)
@@ -88,7 +88,7 @@ describe("POST /api/admin/contest/start", () => {
     Effect.gen(function* () {
       const contests = yield* ContestRepo
       yield* contests.save(
-        new Contest({ id: ContestId.make("contest-start-conflict"), name: "C", problemKey: "p", status: "running" })
+        new Contest({ id: ContestId.make("contest-start-conflict"), name: "C", problemKey: "p", status: "running", instanceQuota: 3 })
       )
       const { cookieHeader } = yield* asAdmin()
       const res = yield* start(cookieHeader)
@@ -110,7 +110,7 @@ describe("POST /api/admin/contest/finish", () => {
     Effect.gen(function* () {
       const contests = yield* ContestRepo
       yield* contests.save(
-        new Contest({ id: ContestId.make("contest-finish-403"), name: "C", problemKey: "p", status: "running" })
+        new Contest({ id: ContestId.make("contest-finish-403"), name: "C", problemKey: "p", status: "running", instanceQuota: 3 })
       )
       const { cookieHeader } = yield* login({ isAdmin: false })
       const res = yield* finish(cookieHeader)
@@ -130,7 +130,7 @@ describe("POST /api/admin/contest/finish", () => {
     Effect.gen(function* () {
       const contests = yield* ContestRepo
       yield* contests.save(
-        new Contest({ id: ContestId.make("contest-finish-ok"), name: "C", problemKey: "p", status: "running" })
+        new Contest({ id: ContestId.make("contest-finish-ok"), name: "C", problemKey: "p", status: "running", instanceQuota: 3 })
       )
       const { cookieHeader } = yield* asAdmin()
       const res = yield* finish(cookieHeader)
@@ -144,7 +144,7 @@ describe("POST /api/admin/contest/finish", () => {
     Effect.gen(function* () {
       const contests = yield* ContestRepo
       yield* contests.save(
-        new Contest({ id: ContestId.make("contest-finish-conflict"), name: "C", problemKey: "p", status: "preparing" })
+        new Contest({ id: ContestId.make("contest-finish-conflict"), name: "C", problemKey: "p", status: "preparing", instanceQuota: 3 })
       )
       const { cookieHeader } = yield* asAdmin()
       const res = yield* finish(cookieHeader)

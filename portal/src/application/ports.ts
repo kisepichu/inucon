@@ -12,6 +12,7 @@ import type { BenchJobId, InstanceId, TeamId, UserId } from "../domain/ids.js"
 import type { Instance } from "../domain/instance.js"
 import type { Team } from "../domain/team.js"
 import type { User } from "../domain/user.js"
+import { ProvisionInProgress, QuotaExceeded } from "./errors.js"
 
 // リポジトリ層(infrastructure、Task 4 が実装)の失敗はすべてこれに包む。
 export class RepoError extends Data.TaggedError("RepoError")<{ cause: unknown }> {}
@@ -100,9 +101,33 @@ export class InstanceRepo extends Context.Tag("app/InstanceRepo")<
     // instances.(team_id, idx) の UNIQUE 制約は「INSERT ... SELECT ... WHERE
     // NOT EXISTS ... RETURNING」の単一原子的操作で検出する(TeamRepo.create /
     // benchJobRepo.insertIfAllowed と同じ TOCTOU 回避パターン、SQLite 実装)。
-    // 0 行挿入なら DuplicateInstanceIndex。
+    // 0 行挿入なら DuplicateInstanceIndex。admin 専用の台帳取り込み経路
+    // (createInstance ユースケース、Phase 2 からの引き継ぎ)専用で、quota/
+    // 進行中チェックは行わない(取り込み対象は既に起動済みの実 VM)。
     readonly create: (i: Instance) => Effect.Effect<Instance, RepoError | DuplicateInstanceIndex>
     readonly remove: (id: InstanceId) => Effect.Effect<void, RepoError>
+    // requestCreateInstance(Task 4、追加ボタン)専用の原子的 guard 付き
+    // INSERT。単一操作内で (1) チームの creating+running 数 < quota、
+    // (2) チームに進行中(creating/deleting)が無いこと、(3) (team_id, idx) の
+    // 重複が無いこと、を検証してから INSERT する(TOCTOU 回避、
+    // benchJobRepo.insertIfAllowed と同型)。0 行挿入時は原因を優先順位
+    // (quota → 進行中 → 重複 index)で判定して対応する型付きエラーを返す。
+    readonly createIfAllowed: (
+      i: Instance,
+      quota: number
+    ) => Effect.Effect<Instance, RepoError | QuotaExceeded | ProvisionInProgress | DuplicateInstanceIndex>
+    // saga(provisioning.ts)が各ステップ後に progress/status/errorMessage/
+    // updatedAt を保存するための全量更新(id で 1 行を丸ごと置き換える)。
+    readonly update: (i: Instance) => Effect.Effect<void, RepoError>
+    // ワーカー(provisioner.ts)が 1 tick で拾う対象。creating/deleting のうち
+    // 最も古い(createdAt 昇順)1 件を返す。全体で同時 1 インスタンスのみ
+    // オーケストレーションする制約(スペック §アーキテクチャ)は、ワーカーが
+    // 単一の非並行ループでこれを毎回 1 件だけ取得し、そのインスタンスの
+    // saga を完了させてから次の tick に進むことで実現する(BenchJob の
+    // dequeueNextQueued=全体 running 1 本と同型の設計意図。ただし instance の
+    // 状態機械は saga 全体の完了まで creating/deleting のままなので、こちらは
+    // 状態遷移による排他ではなく「ワーカーの取得順序」による排他)。
+    readonly findNextForOrchestration: Effect.Effect<Option.Option<Instance>, RepoError>
   }
 >() {}
 
@@ -254,5 +279,16 @@ export class GithubKeysPort extends Context.Tag("app/GithubKeysPort")<
   {
     // 空(鍵未登録)は GithubKeysError。authorized_keys 形式として不正な行は除去する。
     readonly fetchKeys: (login: string) => Effect.Effect<ReadonlyArray<string>, GithubKeysError>
+  }
+>() {}
+
+// インスタンス払い出しのガード閾値・タイムアウト(Phase 3、Task 4)。main.ts で
+// Config から組み立てる(RunnerConfig と同じ方針)。既定値はスペック §Instance
+// 集約・spike メモ §リスク4: RAM は 5GiB(= 1 インスタンス 4GiB + 予備 1GiB)。
+export class ProvisioningConfig extends Context.Tag("app/ProvisioningConfig")<
+  ProvisioningConfig,
+  {
+    readonly minFreeMemBytes: number
+    readonly guestAgentTimeoutMillis: number
   }
 >() {}

@@ -61,7 +61,8 @@ layer("ContestRepo", (it) => {
         id: ContestId.make("contest-1"),
         name: "INUCON",
         problemKey: "problem-1",
-        status: "preparing"
+        status: "preparing",
+        instanceQuota: 3
       })
       yield* repo.save(contest)
       const after = yield* repo.getCurrent
@@ -76,13 +77,15 @@ layer("ContestRepo", (it) => {
         id: ContestId.make("contest-a"),
         name: "A",
         problemKey: "p1",
-        status: "preparing"
+        status: "preparing",
+        instanceQuota: 3
       })
       const second = new Contest({
         id: ContestId.make("contest-b"),
         name: "B",
         problemKey: "p2",
-        status: "running"
+        status: "running",
+        instanceQuota: 3
       })
       yield* repo.save(first)
       yield* repo.save(second)

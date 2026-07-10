@@ -19,6 +19,7 @@ interface UserRow {
   readonly githubLogin: string
   readonly displayName: string
   readonly isAdmin: number
+  readonly email: string | null
 }
 
 const decodeTeam = (row: TeamRow) => decodeRow(Team, row)
@@ -96,7 +97,7 @@ export const TeamRepoLive: Layer.Layer<TeamRepo, never, SqlClient.SqlClient> = L
         wrapSqlError(
           sql<UserRow>`
             SELECT users.id AS id, users.github_id AS githubId, users.github_login AS githubLogin,
-                   users.display_name AS displayName, users.is_admin AS isAdmin
+                   users.display_name AS displayName, users.is_admin AS isAdmin, users.email AS email
             FROM team_members
             JOIN users ON users.id = team_members.user_id
             WHERE team_members.team_id = ${teamId}

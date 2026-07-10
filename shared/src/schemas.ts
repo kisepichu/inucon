@@ -22,7 +22,12 @@ export const User = Schema.Struct({
   githubId: Schema.Int,
   githubLogin: Schema.String,
   displayName: Schema.String,
-  isAdmin: Schema.Boolean
+  isAdmin: Schema.Boolean,
+  // Phase 3: Cloudflare Access ログイン用メール(admin が招待時に入力する。
+  // GitHub OAuth では取得しない)。CurrentUser タグ経由で domain の User を
+  // そのまま橋渡しするため、domain/user.ts と同一の表現(OptionFromNullOr =
+  // Type は Option<string>、wire は null 許容文字列)にして構造的に一致させる。
+  email: Schema.OptionFromNullOr(Schema.String)
 })
 export type User = typeof User.Type
 

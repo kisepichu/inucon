@@ -1,4 +1,5 @@
 import { Data } from "effect"
+import type { InstanceId, TeamId } from "../domain/ids.js"
 
 // ユースケース(オーケストレーション)固有のエラー。
 //
@@ -39,3 +40,36 @@ export class MemberConflict extends Data.TaggedError("MemberConflict")<{
 
 // POST /api/bench-jobs: instanceId 指定時に解決先の Instance が存在しない。
 export class InstanceNotFound extends Data.TaggedError("InstanceNotFound")<{}> {}
+
+// requestCreateInstance(Task 4): 該当チームの creating+running 数が既に
+// Contest.instanceQuota 以上(スペック §Instance 集約 不変条件1)。InstanceRepo
+// が quota 再検証 + INSERT を単一の原子的操作(createIfAllowed)で行うため、
+// TeamJobAlreadyQueued と同じ「リポジトリが検出して返す」形のユースケース側
+// エラー。
+export class QuotaExceeded extends Data.TaggedError("QuotaExceeded")<{
+  teamId: TeamId
+  quota: number
+}> {}
+
+// requestCreateInstance(Task 4): 該当チームに進行中(creating/deleting)の
+// オーケストレーションが既にある(スペック §Instance 集約 不変条件2、連打・
+// 競合防止)。QuotaExceeded と同様 createIfAllowed が検出する。
+export class ProvisionInProgress extends Data.TaggedError("ProvisionInProgress")<{
+  teamId: TeamId
+}> {}
+
+// requestCreateInstance(Task 4): eevee の空き RAM が閾値未満(spike メモ
+// §リスク4、既定 5GiB)。ProxmoxPort.getNodeFreeMemBytes は DB トランザクション
+// の外側(別システムへの HTTP 呼び出し)で検証するため、DuplicateInstanceIndex
+// 等とは違いリポジトリではなくユースケース自身が判定して返す。
+export class InsufficientMemory extends Data.TaggedError("InsufficientMemory")<{
+  freeBytes: number
+  requiredBytes: number
+}> {}
+
+// requestDeleteInstance(Task 4): 削除対象の privateIp を targetIp とする
+// BenchJob が queued/running(スペック §Instance 集約 不変条件4、ベンチ対象の
+// 消失防止)。409 にマップする。
+export class InstanceInUse extends Data.TaggedError("InstanceInUse")<{
+  instanceId: InstanceId
+}> {}

@@ -8,6 +8,7 @@ import { UserId } from "../../src/domain/ids.js"
 import type { Instance } from "../../src/domain/instance.js"
 import { User } from "../../src/domain/user.js"
 import type { Team } from "../../src/domain/team.js"
+import { ProvisionInProgress, QuotaExceeded } from "../../src/application/errors.js"
 import {
   BenchJobRepo,
   CloudflareError,
@@ -16,6 +17,7 @@ import {
   GithubKeysError,
   GithubKeysPort,
   InstanceRepo,
+  ProvisioningConfig,
   ProvisionTimeout,
   ProxmoxError,
   ProxmoxPort,
@@ -124,7 +126,62 @@ export const makeInstanceRepoTest = (initial: ReadonlyArray<Instance> = []): Lay
               return [Either.right(i), [...instances, i]]
             }
           ).pipe(Effect.flatMap(Either.match({ onLeft: Effect.fail, onRight: Effect.succeed }))),
-        remove: (id: InstanceId) => Ref.update(instancesRef, (instances) => instances.filter((i) => i.id !== id))
+        remove: (id: InstanceId) => Ref.update(instancesRef, (instances) => instances.filter((i) => i.id !== id)),
+        // requestCreateInstance(Task 4)専用の原子的 guard 付き INSERT。単一の
+        // Ref.modify コールバック内で (1) quota、(2) 進行中無し、(3) idx 重複
+        // 無し、を判定してから挿入する(本番 SQLite 実装の単一 INSERT ...
+        // WHERE ... RETURNING 文と同じ TOCTOU 回避を Ref の単一操作で模す)。
+        createIfAllowed: (
+          i: Instance,
+          quota: number
+        ): Effect.Effect<Instance, QuotaExceeded | ProvisionInProgress | DuplicateInstanceIndex> =>
+          Ref.modify(
+            instancesRef,
+            (
+              instances
+            ): readonly [
+              Either.Either<Instance, QuotaExceeded | ProvisionInProgress | DuplicateInstanceIndex>,
+              ReadonlyArray<Instance>
+            ] => {
+              const activeCount = instances.filter(
+                (x) => x.teamId === i.teamId && (x.status === "creating" || x.status === "running")
+              ).length
+              if (activeCount >= quota) {
+                return [Either.left(new QuotaExceeded({ teamId: i.teamId, quota })), instances]
+              }
+              const inProgress = instances.some(
+                (x) => x.teamId === i.teamId && (x.status === "creating" || x.status === "deleting")
+              )
+              if (inProgress) {
+                return [Either.left(new ProvisionInProgress({ teamId: i.teamId })), instances]
+              }
+              const duplicate = instances.some(
+                (x) =>
+                  x.teamId === i.teamId &&
+                  x.index === i.index &&
+                  (x.status === "creating" || x.status === "running" || x.status === "deleting")
+              )
+              if (duplicate) {
+                return [Either.left(new DuplicateInstanceIndex({ teamId: i.teamId, index: i.index })), instances]
+              }
+              return [Either.right(i), [...instances, i]]
+            }
+          ).pipe(Effect.flatMap(Either.match({ onLeft: Effect.fail, onRight: Effect.succeed }))),
+        // saga(provisioning.ts)の各ステップ後の progress/status/errorMessage
+        // 保存。id で 1 件を丸ごと置き換える(本番 SQLite 実装の UPDATE と同じ
+        // 意味論)。
+        update: (i: Instance) =>
+          Ref.update(instancesRef, (instances) => instances.map((x) => (x.id === i.id ? i : x))),
+        // ワーカー(provisioner.ts)が 1 tick で拾う対象。creating/deleting の
+        // うち最も古い(createdAt 昇順)1 件を返す。
+        findNextForOrchestration: Ref.get(instancesRef).pipe(
+          Effect.map((instances) => {
+            const candidates = instances
+              .filter((i) => i.status === "creating" || i.status === "deleting")
+              .sort((a, b) => a.createdAt - b.createdAt)
+            return Option.fromNullable(candidates[0])
+          })
+        )
       }
     })
   )
@@ -248,6 +305,18 @@ export const makeBenchJobRepoTest = (initial: ReadonlyArray<BenchJob> = []): Lay
 export const RunnerConfigTest = (jobTimeoutMillis: number): Layer.Layer<RunnerConfig> =>
   Layer.succeed(RunnerConfig, { jobTimeoutMillis })
 
+// 払い出しガードの閾値・タイムアウト(Task 4)。既定は本番既定と同じ
+// 5GiB(minFreeMemBytes)/ 120 秒(guestAgentTimeoutMillis)。テストで
+// RAM 不足分岐を作るときは minFreeMemBytes を大きくして freeMemBytes を
+// 下回らせる(あるいは makeProxmoxPortTest の freeMemBytes を小さくする)。
+export const ProvisioningConfigTest = (
+  overrides: { minFreeMemBytes?: number; guestAgentTimeoutMillis?: number } = {}
+): Layer.Layer<ProvisioningConfig> =>
+  Layer.succeed(ProvisioningConfig, {
+    minFreeMemBytes: overrides.minFreeMemBytes ?? 5_000_000_000,
+    guestAgentTimeoutMillis: overrides.guestAgentTimeoutMillis ?? 120_000
+  })
+
 // UserRepo と SessionRepo のインメモリ実装。findValidUser が users と sessions
 // を JOIN する(本番 SQL 実装と同じ意味論)ため、両者で状態を共有する必要が
 // あり、1 つの Layer で両タグをまとめて提供する。
@@ -280,7 +349,8 @@ export const makeAuthReposTest = (): Layer.Layer<UserRepo | SessionRepo> =>
                 githubId: u.githubId,
                 githubLogin: u.githubLogin,
                 displayName: u.displayName,
-                isAdmin: u.isAdmin
+                isAdmin: u.isAdmin,
+                email: Option.none()
               })
               return [created, [...users, created]]
             })

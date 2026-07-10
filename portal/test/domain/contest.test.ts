@@ -7,7 +7,7 @@ import { ContestId } from "../../src/domain/ids.js"
 const contestId = ContestId.make("11111111-1111-1111-1111-111111111111")
 
 const makeContest = (status: Contest["status"]) =>
-  new Contest({ id: contestId, name: "INUCON", problemKey: "problem-1", status })
+  new Contest({ id: contestId, name: "INUCON", problemKey: "problem-1", status, instanceQuota: 3 })
 
 describe("startContest / finishContest", () => {
   it("preparing → start → running → finish → finished と遷移できる", () => {

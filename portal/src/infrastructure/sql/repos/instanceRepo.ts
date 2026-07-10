@@ -3,6 +3,7 @@ import { Effect, Layer, Option } from "effect"
 import type { InstanceId, TeamId } from "../../../domain/ids.js"
 import { Instance } from "../../../domain/instance.js"
 import { DuplicateInstanceIndex } from "../../../domain/errors.js"
+import { ProvisionInProgress, QuotaExceeded } from "../../../application/errors.js"
 import { InstanceRepo } from "../../../application/ports.js"
 import { RepoError } from "../../../application/ports.js"
 import { decodeRow, optionToNull, wrapSqlError } from "./support.js"
@@ -87,7 +88,95 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
           return yield* decodeInstance(rows[0])
         }),
 
-      remove: (id: InstanceId) => wrapSqlError(sql`DELETE FROM instances WHERE id = ${id}`).pipe(Effect.asVoid)
+      remove: (id: InstanceId) => wrapSqlError(sql`DELETE FROM instances WHERE id = ${id}`).pipe(Effect.asVoid),
+
+      // requestCreateInstance(Task 4、追加ボタン)専用の原子的 guard 付き
+      // INSERT。単一の INSERT ... SELECT ... WHERE ... RETURNING 文で
+      // (1) チームの creating+running 数 < quota、(2) チームに進行中
+      // (creating/deleting)が無いこと、(3) (team_id, idx) の重複が無いこと、
+      // を検証してから挿入する(TOCTOU 回避、benchJobRepo.insertIfAllowed と
+      // 同型)。0 行挿入時は追加の SELECT で原因を優先順位(quota → 進行中 →
+      // 重複)で判定する(currentStatusOrDie と同じ「失敗時のみ読み直す」
+      // 方針。実際の許可判定は上の単一原子的操作が行っており、この読み直しは
+      // 呼び出し元に返すエラー種別を選ぶためだけに使う)。
+      createIfAllowed: (i: Instance, quota: number) =>
+        wrapSqlError(
+          sql.withTransaction(
+            Effect.gen(function* () {
+              const rows = yield* sql<InstanceRow>`
+                INSERT INTO instances
+                  (id, team_id, idx, vmid, private_ip, status, progress, error_message, created_at, updated_at)
+                SELECT
+                  ${i.id}, ${i.teamId}, ${i.index}, ${i.vmid}, ${i.privateIp}, ${i.status},
+                  ${JSON.stringify(i.progress)}, ${optionToNull(i.errorMessage)}, ${i.createdAt}, ${i.updatedAt}
+                WHERE
+                  (
+                    SELECT COUNT(*) FROM instances
+                    WHERE team_id = ${i.teamId} AND status IN ('creating', 'running')
+                  ) < ${quota}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM instances WHERE team_id = ${i.teamId} AND status IN ('creating', 'deleting')
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM instances
+                    WHERE team_id = ${i.teamId} AND idx = ${i.index}
+                      AND status IN ('creating', 'running', 'deleting')
+                  )
+                RETURNING ${columns}
+              `
+              if (rows.length > 0) {
+                return yield* decodeInstance(rows[0])
+              }
+
+              const activeCountRows = yield* sql<{ activeCount: number }>`
+                SELECT COUNT(*) AS activeCount FROM instances
+                WHERE team_id = ${i.teamId} AND status IN ('creating', 'running')
+              `
+              if (activeCountRows[0].activeCount >= quota) {
+                return yield* Effect.fail(new QuotaExceeded({ teamId: i.teamId, quota }))
+              }
+
+              const inProgressRows = yield* sql<{ id: string }>`
+                SELECT id FROM instances WHERE team_id = ${i.teamId} AND status IN ('creating', 'deleting')
+              `
+              if (inProgressRows.length > 0) {
+                return yield* Effect.fail(new ProvisionInProgress({ teamId: i.teamId }))
+              }
+
+              return yield* Effect.fail(new DuplicateInstanceIndex({ teamId: i.teamId, index: i.index }))
+            })
+          )
+        ),
+
+      // saga(provisioning.ts)が各ステップ後に progress/status/errorMessage/
+      // updatedAt を保存するための全量更新(id で 1 行を丸ごと置き換える)。
+      update: (i: Instance) =>
+        wrapSqlError(
+          sql`
+            UPDATE instances
+            SET vmid = ${i.vmid}, private_ip = ${i.privateIp}, status = ${i.status},
+                progress = ${JSON.stringify(i.progress)}, error_message = ${optionToNull(i.errorMessage)},
+                updated_at = ${i.updatedAt}
+            WHERE id = ${i.id}
+          `
+        ).pipe(Effect.asVoid),
+
+      // ワーカー(provisioner.ts)が 1 tick で拾う対象。creating/deleting の
+      // うち最も古い(created_at 昇順、同値は id で決定的に)1 件を返す。
+      findNextForOrchestration: wrapSqlError(
+        sql<InstanceRow>`
+          SELECT ${columns} FROM instances
+          WHERE status IN ('creating', 'deleting')
+          ORDER BY created_at, id
+          LIMIT 1
+        `
+      ).pipe(
+        Effect.flatMap((rows) =>
+          rows.length === 0
+            ? Effect.succeed(Option.none<Instance>())
+            : decodeInstance(rows[0]).pipe(Effect.map(Option.some))
+        )
+      )
     }
   })
 )
