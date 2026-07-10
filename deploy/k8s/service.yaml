@@ -16,7 +16,7 @@ spec:
 # NodePort: ランナー(benchvm)が LAN 内から直接叩く経路用(スペック §リスク・
 # 未確認事項「ランナー→ポータルの LAN 直結」)。apphost の実際の Service
 # 公開方式(NodePort か Ingress の LAN 解決か)は実配線確認後に見直す前提の
-# 暫定経路。ポート番号は README のランナー起動手順(RUNNER_POLL_URL 等)と
+# 暫定経路。ポート番号は README のランナー起動手順(PORTAL_URL)と
 # 合わせること。
 apiVersion: v1
 kind: Service
