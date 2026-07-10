@@ -32,7 +32,8 @@ spec:
         - name: portal
           image: ghcr.io/kisepichu/inucon-portal:latest
           # k3s ctr への直接インポート方式(README §2)の前提。Always だと
-          # 存在しないレジストリへ pull しに行って ImagePullBackOff になる。
+          # push していない(レジストリに存在しない)イメージを pull しようとして
+          # ImagePullBackOff になる。
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

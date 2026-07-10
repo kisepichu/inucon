@@ -32,7 +32,7 @@ Task 11 のうち、**ローカルで完結する部分**(Dockerfile / k8s マ�
 イメージを `docker save | ssh | k3s ctr images import` で apphost の containerd に直接
 取り込む。イメージを公開面に出さずに済み、imagePullSecret も不要。
 `deployment.yaml` の `imagePullPolicy: IfNotPresent` はこの方式の前提
-(`Always` だと存在しないレジストリへ pull しに行って失敗する)。
+(`Always` だと push していない = レジストリ側に存在しないイメージを pull しようとして失敗する)。
 
 **重要: ビルドマシンの CPU アーキテクチャが Apple Silicon(arm64)の場合、デプロイ先の apphost が amd64 VM のため、クロスビルドが必須です。そのまま `docker build` を実行すると、apphost で `exec format error` で起動に失敗します。**
 
