@@ -27,4 +27,10 @@ describe("describeHttpFailure", () => {
   it("requestPath は urlParams を落としてパスのみ返す", () => {
     expect(requestPath(req)).toBe("/api2/json/nodes/eevee/status")
   })
+
+  it("フォールバック(相対 URL)でもクエリ文字列を落とす", () => {
+    const rel = HttpClientRequest.get(`/api2/json/x?token=${secret}`)
+    expect(requestPath(rel)).toBe("/api2/json/x")
+    expect(requestPath(rel)).not.toContain("super-secret-token-value")
+  })
 })

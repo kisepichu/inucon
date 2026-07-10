@@ -11,10 +11,22 @@ import { Option } from "effect"
 // 残した文字列を格納する(ヘッダ・クエリ文字列・トークンは含めない)。
 
 // クエリパラメータ(urlParams)を含まない、URL のパス部分のみを取り出す。
+// toUrl が None のフォールバックでも、req.url に混じりうるクエリ文字列を
+// 落とす(URL にトークンが入っていた場合の漏洩を防ぐ)。絶対 URL ならパス部を、
+// 相対でもクエリ以降を捨てる。
+const stripQuery = (raw: string): string => {
+  try {
+    return new URL(raw).pathname
+  } catch {
+    const q = raw.indexOf("?")
+    return q === -1 ? raw : raw.slice(0, q)
+  }
+}
+
 export const requestPath = (req: HttpClientRequest.HttpClientRequest): string =>
   HttpClientRequest.toUrl(req).pipe(
     Option.map((u) => u.pathname),
-    Option.getOrElse(() => req.url)
+    Option.getOrElse(() => stripQuery(req.url))
   )
 
 // 任意の失敗値(RequestError/ResponseError/ParseError 等)を安全な文字列に変換する。

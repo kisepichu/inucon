@@ -130,14 +130,16 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         Effect.scoped
       )
 
-    // 204/404 を許容し、404 は None(冪等操作用)。
+    // 冪等操作用。404(対象 VM が既に無い)と 204(No Content = 待つべき
+    // タスクが無い)はどちらも None を返し、それ以外の成功はボディの UPID を
+    // Some で返す。
     const requestUpidOrNotFound = (
       req: HttpClientRequest.HttpClientRequest
     ): Effect.Effect<Option.Option<string>, ProxmoxError> =>
       client.execute(req).pipe(
         Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) })),
         Effect.flatMap((response) => {
-          if (response.status === 404) return Effect.succeed(Option.none<string>())
+          if (response.status === 404 || response.status === 204) return Effect.succeed(Option.none<string>())
           if (response.status < 200 || response.status >= 300) {
             return Effect.fail(
               new ProxmoxError({ cause: `Proxmox API ${req.method} ${requestPath(req)} → ${response.status}` })
