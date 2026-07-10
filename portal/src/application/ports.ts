@@ -19,6 +19,21 @@ export class RepoError extends Data.TaggedError("RepoError")<{ cause: unknown }>
 // GitHub OAuth コード交換の失敗。
 export class OAuthFailed extends Data.TaggedError("OAuthFailed")<{ cause: unknown }> {}
 
+// Proxmox VE API 呼び出しの失敗(HTTP 層・タスク失敗など)。
+export class ProxmoxError extends Data.TaggedError("ProxmoxError")<{ cause: unknown }> {}
+
+// Cloudflare API 呼び出しの失敗(DNS / tunnel configurations / Access)。
+export class CloudflareError extends Data.TaggedError("CloudflareError")<{ cause: unknown }> {}
+
+// GitHub 公開鍵取得の失敗(鍵未登録 = 空を含む)。
+export class GithubKeysError extends Data.TaggedError("GithubKeysError")<{ cause: unknown }> {}
+
+// waitForGuestAgent が timeoutMillis 以内に guest agent の応答を確認できなかった。
+export class ProvisionTimeout extends Data.TaggedError("ProvisionTimeout")<{
+  vmid: number
+  timeoutMillis: number
+}> {}
+
 export class UuidGen extends Context.Tag("app/UuidGen")<
   UuidGen,
   { readonly next: Effect.Effect<string> }
@@ -179,4 +194,65 @@ export class RunnerConfig extends Context.Tag("app/RunnerConfig")<
 export class AuthConfig extends Context.Tag("app/AuthConfig")<
   AuthConfig,
   { readonly adminGithubLogins: ReadonlyArray<string> }
+>() {}
+
+// Proxmox VE API(https://192.0.2.10:8006/api2/json)。トークン認証。
+// Phase 3 のインスタンス払い出し/撤収オーケストレーション(Task 4)が使う。
+export class ProxmoxPort extends Context.Tag("app/ProxmoxPort")<
+  ProxmoxPort,
+  {
+    readonly cloneVm: (args: {
+      templateVmid: number
+      newVmid: number
+      name: string
+    }) => Effect.Effect<void, ProxmoxError>
+    readonly configureCloudInit: (args: {
+      vmid: number
+      ip: string
+      gateway: string
+      sshKeys: string
+    }) => Effect.Effect<void, ProxmoxError>
+    readonly setVnet: (args: { vmid: number; bridge: string }) => Effect.Effect<void, ProxmoxError>
+    readonly startVm: (vmid: number) => Effect.Effect<void, ProxmoxError>
+    // 冪等: VM が既に存在しない場合も成功扱い。
+    readonly stopAndDestroyVm: (vmid: number) => Effect.Effect<void, ProxmoxError>
+    readonly waitForGuestAgent: (
+      vmid: number,
+      timeoutMillis: number
+    ) => Effect.Effect<void, ProxmoxError | ProvisionTimeout>
+    readonly guestExec: (args: {
+      vmid: number
+      command: ReadonlyArray<string>
+    }) => Effect.Effect<{ exitcode: number; out: string }, ProxmoxError>
+    readonly getNodeFreeMemBytes: Effect.Effect<number, ProxmoxError>
+  }
+>() {}
+
+// Cloudflare API(DNS / Tunnel remote config / Access)。Phase 1-2 の runbook
+// (ダッシュボード手動運用)実績の API 化。すべて冪等(ensure/remove)。
+export class CloudflarePort extends Context.Tag("app/CloudflarePort")<
+  CloudflarePort,
+  {
+    // DNS CNAME(→ benchvm tunnel)+ tunnel ingress(ssh://ip:22)の追加/更新。
+    readonly ensureInstanceRoute: (args: {
+      hostname: string
+      ip: string
+    }) => Effect.Effect<void, CloudflareError>
+    readonly removeInstanceRoute: (hostname: string) => Effect.Effect<void, CloudflareError>
+    // Access アプリ作成 or ポリシー更新(現行 include との和集合で PUT — 締め出し防止)。
+    readonly ensureAccessApp: (args: {
+      hostname: string
+      emails: ReadonlyArray<string>
+    }) => Effect.Effect<void, CloudflareError>
+    readonly removeAccessApp: (hostname: string) => Effect.Effect<void, CloudflareError>
+  }
+>() {}
+
+// GitHub 公開鍵の取得(https://github.com/<login>.keys)。
+export class GithubKeysPort extends Context.Tag("app/GithubKeysPort")<
+  GithubKeysPort,
+  {
+    // 空(鍵未登録)は GithubKeysError。authorized_keys 形式として不正な行は除去する。
+    readonly fetchKeys: (login: string) => Effect.Effect<ReadonlyArray<string>, GithubKeysError>
+  }
 >() {}
