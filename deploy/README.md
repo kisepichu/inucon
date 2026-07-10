@@ -126,23 +126,27 @@ kubectl -n inucon get pods,svc,ingress
 
 ## 5. apphost cloudflared に inucon.kisen.one を追加
 
-**重要(Phase 2 で判明)**: apphost のトンネル(0000bbbb-...)は **remotely managed** で、
-Cloudflare 側に保存された設定が配信されて適用される。`nixos-config-private` の
-`services.cloudflared.tunnels.*.ingress`(ローカル config.yml)は**リモート設定に上書きされて
-効かない**(cloudflared のログに `Updated to new configuration ... version=N` が出るのが目印)。
+**訂正(Phase 3 spike で判明)**: apphost のトンネル(0000bbbb-...)は **locally managed**。
+`cloudflared tunnel run --config <file>`(= NixOS の `services.cloudflared` モジュールが
+生成する起動方式)は**常にローカル config の ingress を使い、Cloudflare 側の remote 設定を
+無視する**(remote を pull させるには `--token` 起動が必要 — benchvm 参照)。よって
+`inucon.kisen.one` は `nixos-config-private` PR #7 で追加した apphost の**ローカル ingress**
+(`services.cloudflared ... "inucon.kisen.one" = "http://127.0.0.1:80"`)で稼働している。
+Phase 2 の当ドキュメントの「remotely managed」記述は誤りだった。
 
-実際に効く手順は Cloudflare API での ingress 追加:
+手順:
 
 1. DNS: `CNAME inucon.kisen.one -> 0000bbbb-...cfargotunnel.com`(proxied)を作成
    (`infra/.cf-api-token`、DNS Edit 権限)。
-2. トンネルのリモート設定を取得し、ingress に
-   `{"hostname":"inucon.kisen.one","service":"http://localhost:80"}` を **catch-all(http_status:404)の前**に
-   挿入して PUT する(**全置換**なので既存エントリを必ず含めること):
-   `GET/PUT https://api.cloudflare.com/client/v4/accounts/<ACC>/cfd_tunnel/<TUNNEL>/configurations`
-   (Tunnel Edit 権限、ヘッダは `infra/.cf-auth-header` 経由)。
-3. `nixos-config-private` 側の ingress 記述はドキュメントとしては残っているが実効性はない
-   (nixos-config-private #7 の注記参照)。firewall(NodePort 30080 の LAN 許可)は NixOS 側が実体。
+2. `nixos-config-private` の `hosts/apphost` の `services.cloudflared` ingress に
+   `"inucon.kisen.one" = "http://127.0.0.1:80"` を追加(PR #7 で実施済み)し、nixos-rebuild。
+3. firewall(NodePort 30080 の LAN 許可)も NixOS 側が実体。
 4. 確認: `curl -s -o /dev/null -w '%{http_code}\n' https://inucon.kisen.one/api/health` が `200` を返すこと。
+
+> benchvm のトンネル(0000aaaa、チーム SSH)は Phase 3 で **token 方式の remotely managed** に
+> 切り替えた(ポータルがインスタンス増減で ingress を CF API から動的更新するため)。apphost
+> とは方式が異なる(apphost はローカル config で十分なため据え置き)。詳細:
+> `docs/superpowers/research/2026-07-11-phase3-spike.md`。
 
 ## 6. benchvm にランナーを配置(systemd)
 

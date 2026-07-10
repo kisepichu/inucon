@@ -14,9 +14,12 @@
 > - **デプロイ逸脱 1(イメージ配布)**: ghcr.io への公開 push は不採用とし、
 >   `docker save | ssh | k3s ctr images import` の直接インポート方式にした(公開レジストリに
 >   出さない方が private として健全なため)。deployment の imagePullPolicy は IfNotPresent。
-> - **デプロイ逸脱 2(cloudflared)**: apphost のトンネルは **remotely managed** で、
->   NixOS 側の config.yml の ingress は Cloudflare 側の設定に上書きされ**無効**。
->   inucon.kisen.one の ingress 追加は Cloudflare API(cfd_tunnel/configurations)で行った。
+> - **デプロイ逸脱 2(cloudflared)**: inucon.kisen.one を apphost の cloudflared ingress に
+>   追加して公開。**※訂正(Phase 3 spike, 2026-07-11)**: 当初「apphost は remotely managed で
+>   ローカル ingress は無視される」と記録したが誤り。`--config` 起動は常にローカル ingress を
+>   使い、remote 設定を pull するには `--token` 起動が要る。apphost は locally managed のままで、
+>   inucon.kisen.one は nixos-config-private #7 の**ローカル ingress** で動いている。詳細:
+>   `../research/2026-07-11-phase3-spike.md`。
 > - **運用注意**: benchvm の LAN IP は DHCP で変動する(実測 .5 → .11)。NodePort 30080 の
 >   firewall 許可は LAN サブネット単位に変更済み(nixos-config-private #8)。
 > - ランナーの環境変数は暫定でファイル(/home/kise/.inucon/runner-env)。開催前に agenix 化(TODO)。
