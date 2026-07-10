@@ -552,4 +552,8 @@ describe("verifyInsecureHost(insecure 分岐のホスト限定、純粋関数)",
     const result = verifyInsecureHost("192.0.2.10", "evil.example.com")
     expect(result).toBeInstanceOf(Error)
   })
+
+  it("ホスト名の大小差は許容する(case-insensitive)", () => {
+    expect(verifyInsecureHost("Eevee.Kisen.One", "eevee.kisen.one")).toBeUndefined()
+  })
 })

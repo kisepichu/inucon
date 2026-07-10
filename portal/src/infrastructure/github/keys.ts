@@ -20,7 +20,8 @@ export const GithubKeysLive: Layer.Layer<GithubKeysPort, never, HttpClient.HttpC
     return {
       fetchKeys: (login) =>
         Effect.gen(function* () {
-          const request = HttpClientRequest.get(`https://github.com/${login}.keys`)
+          // login に / や ? が混じっても意図しないパス解釈にならないようエスケープする。
+          const request = HttpClientRequest.get(`https://github.com/${encodeURIComponent(login)}.keys`)
           const response = yield* client.execute(request).pipe(
             // Proxmox/Cloudflare と同様、生の RequestError(将来ヘッダ等を含みうる)
             // を cause に入れず、メソッド+パスのみの安全な文字列にする。

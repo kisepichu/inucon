@@ -301,6 +301,24 @@ describe("ensureInstanceRoute", () => {
 })
 
 describe("removeInstanceRoute", () => {
+  it.effect("同一 hostname の CNAME が複数あると CloudflareError で失敗する", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeCf({
+        dnsRecords: [
+          { id: "dup-1", type: "CNAME", name: "inucon-team1-1.kisen.one", content: "x.cfargotunnel.com", proxied: true },
+          { id: "dup-2", type: "CNAME", name: "inucon-team1-1.kisen.one", content: "y.cfargotunnel.com", proxied: true }
+        ]
+      })
+      const error = yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) => cf.ensureInstanceRoute({ hostname: "inucon-team1-1.kisen.one", ip: "10.100.1.11" })),
+        Effect.provide(portLayer(fake)),
+        Effect.flip
+      )
+      expect(error._tag).toBe("CloudflareError")
+      expect(String(error.cause)).toContain("重複")
+    })
+  )
+
   it.effect("DNS 削除 + ingress から該当ホストのみ除去(他は保持)", () =>
     Effect.gen(function* () {
       const fake = makeFakeCf({

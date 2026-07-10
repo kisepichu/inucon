@@ -364,7 +364,8 @@ export const verifyFingerprintMatch = (
 // checkServerIdentity で接続先ホストを PROXMOX_API_URL のホストに限定することで、
 // 想定外のホストへの接続はここで拒否する防御を入れる。
 export const verifyInsecureHost = (expectedHost: string, actualHost: string): Error | undefined =>
-  actualHost === expectedHost
+  // DNS ホスト名は大小非区別。表記揺れだけで誤って拒否しないよう正規化して比較する。
+  actualHost.toLowerCase() === expectedHost.toLowerCase()
     ? undefined
     : new Error(`PROXMOX_TLS_INSECURE is only permitted for host ${expectedHost}, got connection to ${actualHost}`)
 

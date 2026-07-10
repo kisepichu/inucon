@@ -160,7 +160,19 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
           HttpClientRequest.setUrlParam("name", hostname)
         ),
         DnsRecordsList
-      ).pipe(Effect.map((records) => records[0]))
+      ).pipe(
+        // 同一 hostname の CNAME が複数ある(手動運用の残骸等)場合、黙って
+        // 1 件だけ更新/削除すると経路が不安定になる。明示的に失敗させる。
+        Effect.flatMap((records) =>
+          records.length > 1
+            ? Effect.fail(
+                new CloudflareError({
+                  cause: `DNS CNAME ${hostname} が ${records.length} 件見つかりました(重複)。手動で整理してください。`
+                })
+              )
+            : Effect.succeed(records[0])
+        )
+      )
 
     const upsertDnsRecord = (hostname: string, content: string) =>
       Effect.gen(function* () {
