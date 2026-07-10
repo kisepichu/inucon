@@ -40,7 +40,7 @@ Phase 2 でポータル(キュー・スコアボード・チーム管理)が本�
 
 ### Instance 集約(状態機械の有効化)
 
-- フィールド追加: `vmid`(Proxmox VM ID)、`errorMessage`、`updatedAt`
+- フィールド追加: `vmid`(Proxmox VM ID)、`errorMessage`、`progress`(saga の進行ステップ記録 — 後述)、`updatedAt`
 - 状態機械(Phase 2 の `active` を `running` に読み替えて拡張):
 
 ```mermaid
@@ -119,7 +119,9 @@ admin: POST /api/admin/teams/:id/invites { githubLogin, email }
   → レスポンスは 3 点の成否。失敗項目は同じ API の再実行で埋める(全ステップ冪等)
 ```
 
-- メールの保管: `team_invites.email` と、users にも `email` カラムを追加(初ログイン時に invite から引き継ぐ)。Access ポリシー構成の情報源
+- **メールの情報源は招待時の admin 入力**(`team_invites.email` → 初ログイン時に `users.email` へ引き継ぎ。既ログインユーザーへの招待は即時 `users.email` を更新)。GitHub からの自動取得(user:email scope)はしない — Access のログインに使うメールと GitHub 登録メールは別物になりうるため、admin が Access 用メールを明示する
+- **締め出し防止**: Access ポリシーの更新は「現行ポリシーを GET → ポータル管理のメール集合との**和集合**で PUT」とし、全置換で既存の許可(手動追加分や email 未登録メンバーの既存許可)を消さない。メールからの削除(メンバー離脱)はスコープ外(手動)なので和集合で安全側に倒せる
+- **email 未登録メンバーの扱い**: Access 更新自体は実行しつつ、招待 API の結果に「email 未登録のため Access に追加されていないメンバー一覧」を warning として含める(黙って外れる状態を作らない)。既存ユーザー(Phase 2 でログイン済み、email=null)は、そのユーザー宛に招待 API を再実行すれば email が埋まり同期される(冪等設計の応用)
 - インスタンス**新規作成時**は「その時点のチームメンバー+招待中」のメール/鍵で Access アプリと authorized_keys を構成(招待済みの人は新 VM にも最初から入れる)
 - メンバー削除(離脱)は Phase 3 では admin の手作業(Access から外す等)。運用頻度が低いため自動化しない(スコープ節)
 
