@@ -52,7 +52,7 @@ docs/superpowers/research/2026-07-11-phase3-spike.md  Task 1 の spike 結果
 - [ ] **Step 3: guest agent exec の挙動(リスク 3)。** `agent/exec` + `agent/exec-status` で isucon ユーザーの authorized_keys に追記できるか、出力サイズ/タイムアウトを実測。API の正確なエンドポイント形と応答をメモ
 - [ ] **Step 4: RAM ガードの閾値(リスク 4)。** `nodes/eevee/status` の memory と ARC の関係を実測し、「空き」の定義と作成拒否の閾値(例: 4GB VM を作る前に free ≥ 5GB)を決めてメモ
 - [ ] **Step 5: Access アプリ数上限(リスク 5)** を Cloudflare ドキュメント/API で確認しメモ
-- [ ] **Step 6: benchvm トンネル(0000aaaa)の remotely managed 化。** cloudflared を **token 方式**(`cloudflared tunnel run` + env `TUNNEL_TOKEN`)で起動する systemd サービスに置き換え、ingress を CF API の tunnel configurations で管理する。**重要**: `--config` 方式(NixOS の services.cloudflared モジュール)はローカル ingress を使い remote を無視するため使えない(spike で実測)。apphost は locally managed のままで方式が異なる(統一しない)。**既存の SSH 経路に影響するため、切り替え後に `ssh inucon-team1-1.kisen.one` が通ることを確認してからマージ**。→ **spike(Task 1)で実施済み**(nixos-config-private #9)
+- [x] **Step 6: benchvm トンネル(0000aaaa)の remotely managed 化。** cloudflared を **token 方式**(`cloudflared tunnel run --token <TOKEN>`。env `TUNNEL_TOKEN` を渡せば `--token` フラグは省略可・等価)で起動する systemd サービスに置き換え、ingress を CF API の tunnel configurations で管理する。**重要**: `--config <file>` 方式(NixOS の services.cloudflared モジュール = credentials.json 起動)はローカル ingress を使い remote を無視するため使えない(spike で実測)。apphost は locally managed のままで方式が異なる(統一しない)。**既存の SSH 経路に影響するため、切り替え後に `ssh inucon-team1-1.kisen.one` が通ることを確認してからマージ**。→ **spike(Task 1)で実施済み**(nixos-config-private #9)
 - [ ] **Step 7: spike の結論をスペックに反映**(採用方式でリスク欄を「解決済み」に更新する追記 PR。または本計画の後続タスクの記述を確定値へ更新)
 - [ ] **Step 8: /commit(spike メモ)→ /pr → /pr-review → マージ**(nixos PR も)
 

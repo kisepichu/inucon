@@ -108,6 +108,6 @@ Cloudflare Zero Trust の Self-hosted Access アプリは無料プラン(最大 
 
 ## 追加の後片付け・申し送り
 
-- Phase 2 スペック/メモの「apphost は remotely managed」記述を訂正する(別途小 PR、または Phase 3 実装の中で更新)。
+- Phase 2 の「apphost は remotely managed」記述は**この PR で訂正済み**: `docs/superpowers/specs/2026-07-09-phase2-portal-design.md`(完了注記のデプロイ逸脱 2)、`deploy/README.md` §5、メモリ `inucon-homelab-environment.md`。
 - benchvm token は暫定ファイル。開催前に agenix 化(runner-env と同じ TODO 群)。
 - リスク 1/3/4/5 と Step 2/6 すべて完了。Task 2 以降(portal コード)に進める。
