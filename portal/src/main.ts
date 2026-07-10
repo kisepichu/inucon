@@ -18,6 +18,7 @@ import { TeamsLive } from "./infrastructure/http/handlers/teams.js"
 import { AdminOnlyLive, AuthenticationLive, RunnerAuthLive } from "./infrastructure/http/middleware.js"
 import { makeStaticMiddleware } from "./infrastructure/http/static.js"
 import { MigratorLive, SqlLive } from "./infrastructure/sql/client.js"
+import { SeedLive } from "./infrastructure/sql/seed.js"
 import { BenchJobRepoLive } from "./infrastructure/sql/repos/benchJobRepo.js"
 import { ContestRepoLive } from "./infrastructure/sql/repos/contestRepo.js"
 import { InstanceRepoLive } from "./infrastructure/sql/repos/instanceRepo.js"
@@ -105,6 +106,11 @@ const ServerLive = Layer.unwrapEffect(
 // README 兼ねる)。
 const webDistPath = fileURLToPath(new URL("../web/dist", import.meta.url))
 
+// 起動時シード(Task 11): 空の DB に対して INUCON コンテストを 1 件投入する。
+// ReposLive/MigratorLive は HttpLive・WorkerLive と同一の参照なので、
+// Layer のメモ化により SqlClient・Migrator の実行はプロセス全体で 1 回だけ。
+const SeedInitLive = SeedLive.pipe(Layer.provide(ReposLive), Layer.provide(MigratorLive))
+
 // Migration 依存: migration 前に最初のリクエストが来ると "no such table"
 // になる潜在レース。MigratorLive を依存として挟むことで、HTTP サーバー起動
 // 前に migration の完了を待たせる(参照は MainLive の MigratorLive と同一なので
@@ -118,7 +124,10 @@ const HttpLive = HttpApiBuilder.serve((httpApp) =>
 ).pipe(
   Layer.provide(ApiLive),
   Layer.provide(ServerLive),
-  Layer.provide(MigratorLive)
+  Layer.provide(MigratorLive),
+  // seed 完了前にリクエストを受けると新規 DB でコンテスト 404 になる窓が
+  // できるため、HTTP サーバーも seed の完了を待ってから起動する。
+  Layer.provide(SeedInitLive)
 )
 
 // タイムアウト回収ワーカー(Task 8)。ApiLive と同じ ReposLive/RunnerConfigLive
@@ -137,6 +146,9 @@ const WorkerLive = TimeoutSweeperLive.pipe(
   Layer.provide(MigratorLive)
 )
 
-const MainLive = Layer.mergeAll(HttpLive, MigratorLive, WorkerLive)
+// migration/seed は HttpLive・WorkerLive の依存(Layer.provide)経由で実行される
+// (メモ化により 1 回だけ)。トップレベルにはそれらを消費するコンポーネント
+// だけを並べ、順序は依存グラフに任せる。
+const MainLive = Layer.mergeAll(HttpLive, WorkerLive)
 
 Layer.launch(MainLive).pipe(NodeRuntime.runMain)

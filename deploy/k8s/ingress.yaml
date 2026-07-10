@@ -1,0 +1,23 @@
+# apphost k3s 同梱の Traefik を IngressController として使う。
+# TLS は k8s 側では終端しない: apphost の既存 cloudflared tunnel が
+# https://inucon.kisen.one を Cloudflare edge で終端し、ここ(Ingress の
+# ClusterIP/ノード)へ平文 HTTP で転送する構成(Phase 1 の benchvm 向け
+# tunnel と同じ方式)。README の「cloudflared ホスト名追加手順」を参照。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: inucon-portal
+  namespace: inucon
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: inucon.kisen.one
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: inucon-portal
+                port:
+                  name: http
