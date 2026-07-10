@@ -16,7 +16,7 @@ Phase 2 でポータル(キュー・スコアボード・チーム管理)が本�
 **含む:**
 
 - Instance 状態機械の有効化(Phase 2 は `active` のみの台帳だった)とオーケストレーション: Proxmox clone → cloud-init(IP/鍵)→ 起動 → Cloudflare(DNS / tunnel ingress / Access)→ running。削除はその逆 + 補償処理
-- ガード: チームごとのインスタンス上限(Contest 設定)、クローン前の eevee 空き RAM 確認、VM スペック固定(2vCPU/4GB)
+- ガード: チームごとのインスタンス上限(Contest 設定)、クローン前の eevee 空き RAM 確認、VM スペック固定(2vCPU/4GB/20GB)
 - 招待フロー: admin の 1 操作で「チーム割当(未ログインなら初ログイン時に自動所属)+ Access ポリシー更新 + 既存 VM への鍵注入」
 - 前提インフラ: ポータル用 Proxmox API トークン(最小権限)、benchvm トンネルの remotely managed 化、k8s Secret への各トークン追加
 
@@ -40,7 +40,7 @@ Phase 2 でポータル(キュー・スコアボード・チーム管理)が本�
 
 ### Instance 集約(状態機械の有効化)
 
-- フィールド追加: `vmid`(Proxmox VM ID)、`errorMessage`、`progress`(saga の進行ステップ記録 — 後述)、`updatedAt`
+- フィールド追加: `vmid`(Proxmox VM ID)、`errorMessage`、`progress`(saga の進行ステップ記録 — 後述)、`updatedAt`(epoch ミリ秒。status / progress を更新するたびに `Clock.currentTimeMillis` で更新 — 既存の時刻カラムと同じ規約)
 - 状態機械(Phase 2 の `active` を `running` に読み替えて拡張):
 
 ```mermaid
@@ -140,7 +140,7 @@ admin: POST /api/admin/teams/:id/invites { githubLogin, email }
 | instances | `vmid INTEGER`, `error_message TEXT`, `progress TEXT`, `updated_at INTEGER` 追加。status CHECK を `('creating','running','deleting','deleted','failed')` に拡張(既存 `active` 行は `running` へ UPDATE)。UNIQUE(team_id, idx) を「status IN ('creating','running','deleting')」の部分インデックスに置換 |
 | contests | `instance_quota INTEGER NOT NULL DEFAULT 3` 追加 |
 | users | `email TEXT` 追加(nullable) |
-| team_invites(新規) | `github_login`, `team_id`, `email`, `invited_at`。UNIQUE(github_login) |
+| team_invites(新規) | `github_login TEXT PRIMARY KEY`, `team_id TEXT NOT NULL REFERENCES teams(id)`, `email TEXT NOT NULL`, `invited_at INTEGER NOT NULL`(epoch ミリ秒) |
 
 ## HTTP API(差分)
 
