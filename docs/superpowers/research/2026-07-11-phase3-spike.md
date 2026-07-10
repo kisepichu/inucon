@@ -65,21 +65,48 @@ qm guest exec 1109 -- /bin/sh -c 'umask 077; mkdir -p /home/isucon/.ssh; \
 - **閾値の決定**: 1 インスタンス = 4GiB。作成前に `free ≥ 5GiB`(= 4GiB + 予備 1GiB)を要求する。現状 free 5.6GiB は team1-1/team2-1 稼働中の値なので、追加 1 台の余地はギリギリ。実運用は「重い私用 VM を止める」前提(親スペック)。
 - ProxmoxPort.getNodeFreeMemBytes は `/nodes/eevee/status` の `memory.free` を返す。ユースケースが `< 5GiB` なら作成拒否(InstanceQuota とは別のガード)。
 
-## リスク 2: Proxmox API トークンの最小権限 → **未実施(要ユーザー判断)**
+## リスク 2: Proxmox API トークンの最小権限 → ✅ 発行・実測済み
 
-トークン発行は新しい認証情報の作成なので、方式をユーザーに確認してから行う(下記「残: 要判断」)。必要になる privilege の見込み(Proxmox のロール権限名):
+eevee に portal 専用ロール `InuconPortal`(root/Administrator は使わない)+ ユーザー `portal@pve`(ログイン不可・トークンのみ)+ ACL(`/` に InuconPortal、propagate)を作成。トークン `portal@pve!inucon`(privsep=0)を発行し、値は apphost の `~/.inucon/portal-env`(k8s Secret の元)へ格納(リポジトリ・チャットには出さない)。
 
-- `VM.Clone`(clone)、`VM.Config.Disk` / `VM.Config.Network` / `VM.Config.Options` / `VM.Config.Cloudinit`(config set)、`VM.PowerMgmt`(start/stop)、`VM.Monitor` / `VM.GuestAgent.Audit` / `VM.GuestAgent.Unrestricted`(guest exec — PVE 9 では guest-agent 権限が細分化)、`VM.Audit`(status)、`Datastore.AllocateSpace` + `Datastore.Audit`(snippet upload / disk)。
-- スコープは `/vms`(competition VM 群)と対象 storage(`local` / `local-zfs`)に限定。Phase 1 の root/Administrator は portal に持ち込まない。
-- 実際に必要な最小セットは、トークン発行後に Task 3 の実 API 呼び出しで削りながら確定する。
+確定した最小 privilege(実際の API 呼び出しで削り込み・実測):
+
+```
+VM.Clone, VM.Allocate, VM.Audit,
+VM.Config.Disk, VM.Config.Network, VM.Config.Options, VM.Config.Cloudinit, VM.Config.CDROM,
+VM.PowerMgmt,
+VM.GuestAgent.Audit, VM.GuestAgent.Unrestricted,
+Datastore.AllocateSpace, Datastore.Audit,
+SDN.Use,
+Sys.Audit    # ← /nodes/eevee/status(RAM ガード)に必須。VM.Audit だけでは data:null で拒否される
+```
+
+- 注: `VM.Monitor` は PVE 9 では無効な priv 名(role add が失敗する)。guest agent 権限は `VM.GuestAgent.*` に細分化されている。
+- 実測: このトークンで `GET /nodes/eevee/status`(mem.free 取得)/ `GET /nodes/eevee/qemu`(VM 一覧 6 台)/ `GET .../storage/local/content?content=snippets`(snippet 一覧)が成功。clone/start/exec の書き込み系は Task 3 の Live 実装で通す。
+- env のキー: `PROXMOX_API_URL`(=`https://192.0.2.10:8006/api2/json`)、`PROXMOX_TOKEN_ID`(=`portal@pve!inucon`)、`PROXMOX_TOKEN_SECRET`。TLS は自己署名のため CloudflarePort/ProxmoxPort の HttpClient は検証スキップ(LAN 内固定ホスト)。
 
 ## リスク 5: Cloudflare Access アプリ数の上限
 
 Cloudflare Zero Trust の Self-hosted Access アプリは無料プラン(最大 50 seats)でもアプリ数自体に固定の小さな上限は明記されていない(seat = 認証ユーザー数の制限が主)。競技規模(2〜3 チーム × 0〜3 台 = 最大 ~9 SSH ホスト名)では問題にならない。開催前に実数で確認する程度でよい(TODO 据え置き)。
 
-## 残: 要ユーザー判断(Task 1 の Step 2 と Step 6)
+## Step 6: benchvm トンネルの remotely managed 化 → ✅ 完了(重要な訂正あり)
 
-1. **Proxmox API トークン発行**(Step 2): portal 用トークンを eevee で作る。新規認証情報の作成。値は apphost の k8s Secret にのみ入れる(リポジトリ・チャットに出さない)。
-2. **benchvm トンネル(0000aaaa)の remotely managed 化**(Step 6): 現在ローカル config の ingress(team1-1/team2-1)を CF API の tunnel configurations に移す。移行中に既存の `ssh inucon-team{N}-{M}.kisen.one` 経路が一時的に切れる可能性がある。apphost(0000bbbb)は Phase 2 で既に remotely managed 化済みで、同じ運用に統一する。
+**重大な訂正**: Phase 2 のスペック/メモの「apphost トンネルは remotely managed で、ローカル config の ingress は無視される」という記述は**誤り**だった。実測の真実:
 
-上記 2 点はどちらも「破壊的/認証情報」に該当するため、ユーザーの合図を待って実施する。それ以外の spike(リスク 1/3/4/5)は完了。
+- `cloudflared tunnel run --config <file>` 起動は**常にローカル ingress を使う**。ローカル config から ingress を消すと「No ingress rules ... will return 503」になり、remote 設定を pull しない。
+- **remotely managed にするには `cloudflared tunnel run --token <TOKEN>`(env `TUNNEL_TOKEN`)で起動する**必要がある。この TOKEN は tunnel credentials(credentials.json)とは別物で、CF API `GET /accounts/<acc>/cfd_tunnel/<id>/token` で取得する。token 起動時のみ cloudflared は remote 設定を pull し、ログに `Updated to new configuration ... version=N` が出る。
+- したがって apphost の `inucon.kisen.one` は**ローカル ingress**(nixos PR #7 で追加した `services.cloudflared` の記述)で動いている。apphost はまだ locally managed。
+
+**benchvm で実施した内容**:
+1. CF API で tunnel token を取得 → benchvm の `/root/.inucon-tunnel-env`(`TUNNEL_TOKEN=...`、root 600。**TODO: 開催前に agenix 化**)に格納
+2. NixOS の `services.cloudflared`(module、ローカル ingress)を廃し、`systemd.services.cloudflared-inucon`(`cloudflared tunnel --no-autoupdate run`、EnvironmentFile で token 注入)に置き換え(`hosts/benchvm/configuration.nix`)
+3. デプロイ後、`cloudflared-inucon` が remote 設定(team1-1/team2-1)を pull し version=2 を適用、`ssh inucon-team{N}-{M}.kisen.one` が通ることを確認
+4. **動的 ingress の実証**: CF API で `inucon-team1-2.kisen.one → ssh://10.100.1.12:22` を追加 → 数秒で cloudflared が version=3 を pull(ログに team1-2 出現)→ 削除で version=4。**ポータルが CF API で ingress を増減すれば benchvm に即反映される**ことを確認。これが Phase 3 のインスタンス増減の SSH 経路の基盤。
+
+**Phase 3 の CloudflarePort への含意**: `ensureInstanceRoute` / `removeInstanceRoute` は DNS CNAME upsert に加えて **tunnel configurations の GET → ingress 配列を編集(catch-all の前に挿入 / 該当ホスト削除)→ PUT** で実装する(全置換 PUT なので既存エントリを保持すること)。apphost 側は変更不要(ポータル自身の公開はローカル ingress のまま)。
+
+## 追加の後片付け・申し送り
+
+- Phase 2 スペック/メモの「apphost は remotely managed」記述を訂正する(別途小 PR、または Phase 3 実装の中で更新)。
+- benchvm token は暫定ファイル。開催前に agenix 化(runner-env と同じ TODO 群)。
+- リスク 1/3/4/5 と Step 2/6 すべて完了。Task 2 以降(portal コード)に進める。
