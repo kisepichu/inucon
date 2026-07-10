@@ -92,7 +92,7 @@ describe("makeProxmoxPortTest", () => {
     })
   )
 
-  it.effect("getNodeFreeMemBytes は指定値(既定 6GiB 相当)を返す", () =>
+  it.effect("getNodeFreeMemBytes は指定値(既定 6_000_000_000 bytes = 約 5.59GiB)を返す", () =>
     Effect.gen(function* () {
       const { layer } = makeProxmoxPortTest({ freeMemBytes: 1_234 })
       const free = yield* ProxmoxPort.pipe(Effect.flatMap((px) => px.getNodeFreeMemBytes), Effect.provide(layer))
