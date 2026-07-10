@@ -1,7 +1,8 @@
 import { Data } from "effect"
 import type { ContestStatus } from "./contest.js"
 import type { BenchJobStatus } from "./benchJob.js"
-import type { BenchJobId, TeamId } from "./ids.js"
+import type { InstanceStatus } from "./instance.js"
+import type { BenchJobId, InstanceId, TeamId } from "./ids.js"
 
 // Data.TaggedError(データのみ、Effect runtime 非依存)。
 // ContestStatus / BenchJobStatus は contest.ts / benchJob.ts で定義される型のみを
@@ -51,4 +52,12 @@ export class TeamNumberConflict extends Data.TaggedError("TeamNumberConflict")<{
 export class DuplicateInstanceIndex extends Data.TaggedError("DuplicateInstanceIndex")<{
   teamId: TeamId
   index: number
+}> {}
+
+// Instance の状態機械(instance.ts)における不正遷移。InvalidContestTransition /
+// InvalidJobTransition と同じ形。
+export class InvalidInstanceTransition extends Data.TaggedError("InvalidInstanceTransition")<{
+  instanceId: InstanceId
+  from: InstanceStatus
+  to: InstanceStatus
 }> {}

@@ -1,6 +1,6 @@
 import { HttpBody, HttpClient } from "@effect/platform"
 import { it } from "@effect/vitest"
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import { describe, expect } from "vitest"
 import { Contest } from "../../src/domain/contest.js"
 import { ContestId, InstanceId, TeamId } from "../../src/domain/ids.js"
@@ -258,8 +258,13 @@ describe("POST /api/bench-jobs: instanceId 指定", () => {
         id: InstanceId.make("inst-bench-1"),
         teamId: team.id,
         index: 1,
+        vmid: 1000 + teamNumber * 100 + 1,
         privateIp: `10.100.${teamNumber}.20`,
-        status: "active"
+        status: "running",
+        progress: ["clone_done", "configured", "started", "route_done", "access_done"],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
       })
       yield* instances.create(instance)
 
@@ -279,8 +284,13 @@ describe("POST /api/bench-jobs: instanceId 指定", () => {
         id: InstanceId.make("inst-bench-other-team"),
         teamId: owner.team.id,
         index: 1,
+        vmid: 1000 + owner.teamNumber * 100 + 1,
         privateIp: `10.100.${owner.teamNumber}.30`,
-        status: "active"
+        status: "running",
+        progress: ["clone_done", "configured", "started", "route_done", "access_done"],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
       })
       yield* instances.create(instance)
 

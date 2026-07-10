@@ -66,12 +66,28 @@ export const TeamWithMembers = Schema.Struct({
 })
 export type TeamWithMembers = typeof TeamWithMembers.Type
 
+// Phase 3: instance.ts(domain)の状態機械と同じ値集合(境界のコピー、正は
+// portal/src/domain/instance.ts)。
+export const InstanceStatus = Schema.Literal("creating", "running", "deleting", "deleted", "failed")
+export type InstanceStatus = typeof InstanceStatus.Type
+
+export const ProvisionStep = Schema.Literal("clone_done", "configured", "started", "route_done", "access_done")
+export type ProvisionStep = typeof ProvisionStep.Type
+
+// domain の Instance(errorMessage が Option)は境界を跨がないため、ハンドラが
+// Option.getOrNull で変換してこの Struct(null 許容)に合わせる(BenchJob と
+// 同じ方針)。
 export const Instance = Schema.Struct({
   id: InstanceId,
   teamId: TeamId,
   index: Schema.Int.pipe(Schema.positive()),
+  vmid: Schema.Int,
   privateIp: Schema.String,
-  status: Schema.Literal("active")
+  status: InstanceStatus,
+  progress: Schema.Array(ProvisionStep),
+  errorMessage: Schema.NullOr(Schema.String),
+  createdAt: Schema.Int,
+  updatedAt: Schema.Int
 })
 export type Instance = typeof Instance.Type
 
@@ -88,11 +104,15 @@ export const SetTeamMembersRequest = Schema.Struct({
 })
 export type SetTeamMembersRequest = typeof SetTeamMembersRequest.Type
 
-// POST /api/instances
+// POST /api/instances: admin 専用の台帳取り込み経路(スペック §HTTP API
+// 差分)。vmid は省略可能 — 省略時は従来どおり vmidFor(teamNumber, index) で
+// 計算するが、Terraform 製 VM のように式に従わない実 VM を取り込む場合は
+// vmid を明示指定して実際の Proxmox vmid と台帳を一致させる。
 export const CreateInstanceRequest = Schema.Struct({
   teamId: TeamId,
   index: Schema.Int.pipe(Schema.positive()),
-  privateIp: Schema.String
+  privateIp: Schema.String,
+  vmid: Schema.optional(Schema.Int)
 })
 export type CreateInstanceRequest = typeof CreateInstanceRequest.Type
 
