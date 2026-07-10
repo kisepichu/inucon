@@ -52,9 +52,11 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
           )
         ),
 
-      // instances.(team_id, idx) の UNIQUE 制約は「INSERT ... SELECT ... WHERE
-      // NOT EXISTS ... RETURNING」の単一原子的操作で検出する(TOCTOU 回避、
-      // teamRepo.create / benchJobRepo.insertIfAllowed と同じ形)。
+      // (team_id, idx) の重複判定は migration 0002 の部分ユニークインデックス
+      // (status IN ('creating','running','deleting'))と同条件で行う。
+      // deleted/failed の行があっても同 idx を再作成できる。判定と INSERT は
+      // 「INSERT ... SELECT ... WHERE NOT EXISTS ... RETURNING」の単一原子的操作
+      // (TOCTOU 回避、teamRepo.create / benchJobRepo.insertIfAllowed と同じ形)。
       create: (i: Instance) =>
         Effect.gen(function* () {
           const rows = yield* wrapSqlError(
@@ -64,7 +66,11 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
               SELECT
                 ${i.id}, ${i.teamId}, ${i.index}, ${i.vmid}, ${i.privateIp}, ${i.status},
                 ${JSON.stringify(i.progress)}, ${optionToNull(i.errorMessage)}, ${i.createdAt}, ${i.updatedAt}
-              WHERE NOT EXISTS (SELECT 1 FROM instances WHERE team_id = ${i.teamId} AND idx = ${i.index})
+              WHERE NOT EXISTS (
+                SELECT 1 FROM instances
+                WHERE team_id = ${i.teamId} AND idx = ${i.index}
+                  AND status IN ('creating', 'running', 'deleting')
+              )
               RETURNING ${columns}
             `
           )

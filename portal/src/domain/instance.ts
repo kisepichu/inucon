@@ -66,8 +66,9 @@ export const markDeleted = (i: Instance, now: number): Either.Either<Instance, I
     ? Either.right(new Instance({ ...i, status: "deleted", updatedAt: now }))
     : Either.left(new InvalidInstanceTransition({ instanceId: i.id, from: i.status, to: "deleted" }))
 
-// creating/deleting → failed(途中失敗・撤収失敗)。失敗の記録は常に受理する
-// (どの状態からでも呼べる、呼び出し元がワーカーの補償フローに限定して使う)。
+// 任意状態 → failed(状態ガード無し)。失敗の記録は常に受理する。想定される
+// 呼び出しは creating の途中失敗・deleting の撤収失敗だが、型シグネチャは Either を
+// 返さず、正しい状態からのみ呼ぶ責任は呼び出し元(ワーカーの補償フロー)にある。
 export const markFailed = (i: Instance, message: string, now: number): Instance =>
   new Instance({ ...i, status: "failed", errorMessage: Option.some(message), updatedAt: now })
 

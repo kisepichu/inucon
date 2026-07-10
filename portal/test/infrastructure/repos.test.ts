@@ -309,6 +309,46 @@ layer("InstanceRepo: create 重複拒否", (it) => {
       expect(listed).toStrictEqual([first])
     })
   )
+
+  it.effect("deleted 行がある idx は再作成できる(部分ユニークインデックス)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const team = new Team({ id: TeamId.make("team-repo-idx-reuse"), name: "Idx Reuse", teamNumber: 104 })
+      yield* teams.create(team)
+
+      // idx=1 を deleted 状態で登録(過去に使って撤収済みの想定)
+      const old = new Instance({
+        id: InstanceId.make("instance-reuse-old"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1104,
+        privateIp: "10.100.104.11",
+        status: "deleted",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(old)
+
+      // 同 idx=1 を新規 creating で作れる(deleted は部分ユニークの対象外)
+      const fresh = new Instance({
+        id: InstanceId.make("instance-reuse-new"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1104,
+        privateIp: "10.100.104.11",
+        status: "creating",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 1,
+        updatedAt: 1
+      })
+      const created = yield* instances.create(fresh)
+      expect(created.id).toStrictEqual(fresh.id)
+    })
+  )
 })
 
 // BenchJobRepo は「全体で running は同時に 1 本まで」というテーブル全体に
