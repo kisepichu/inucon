@@ -4,6 +4,7 @@ import { Clock, Config, Effect, Either, Layer, Option, Redacted, Schema } from "
 import type { ConfigError } from "effect/ConfigError"
 import type * as Https from "node:https"
 import { ProvisionTimeout, ProxmoxError, ProxmoxPort } from "../../application/ports.js"
+import { describeHttpFailure, requestPath } from "../httpClientErrors.js"
 
 // Proxmox VE API(https://192.0.2.10:8006/api2/json)。トークン認証。
 // spike メモ(docs/superpowers/research/2026-07-11-phase3-spike.md)で確定した
@@ -38,6 +39,15 @@ const NodeStatusResponse = Schema.Struct({
 // --- 汎用ポーリングヘルパー ---
 // TestClock 経由で決定的にテストできるよう、Clock.currentTimeMillis で
 // deadline を判定し、Effect.sleep で待つ(実 wall time に依存しない)。
+//
+// 単発の HTTP 呼び出し(attempt)がハングすると、deadline 判定は attempt 完了後にしか
+// 行われないため、pollUntil 全体のタイムアウトが事実上効かなくなる。これを防ぐため、
+// 個々の attempt を Effect.timeoutOption で縛る。attempt がタイムアウトした場合は
+// 「まだ完了していない」扱いにして次のラウンド(次の attempt)へ進める(HTTP エラーや
+// デコードエラーなど、attempt が実際に E で失敗した場合はそのまま fail させ、リトライしない)。
+// 全体の deadline 超過は従来どおり onTimeout()。
+
+const DEFAULT_ATTEMPT_TIMEOUT_MILLIS = 10_000
 
 const pollUntil = <A, E>(opts: {
   attempt: Effect.Effect<A, E>
@@ -45,13 +55,15 @@ const pollUntil = <A, E>(opts: {
   intervalMillis: number
   timeoutMillis: number
   onTimeout: () => E
+  attemptTimeoutMillis?: number
 }): Effect.Effect<A, E> =>
   Effect.gen(function* () {
     const deadline = yield* Clock.currentTimeMillis.pipe(Effect.map((now) => now + opts.timeoutMillis))
+    const attemptTimeoutMillis = opts.attemptTimeoutMillis ?? DEFAULT_ATTEMPT_TIMEOUT_MILLIS
     const loop = (): Effect.Effect<A, E> =>
       Effect.gen(function* () {
-        const result = yield* opts.attempt
-        if (opts.isDone(result)) return result
+        const outcome = yield* opts.attempt.pipe(Effect.timeoutOption(`${attemptTimeoutMillis} millis`))
+        if (Option.isSome(outcome) && opts.isDone(outcome.value)) return outcome.value
         const now = yield* Clock.currentTimeMillis
         if (now >= deadline) return yield* Effect.fail(opts.onTimeout())
         yield* Effect.sleep(`${opts.intervalMillis} millis`)
@@ -105,14 +117,14 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
       schema: Schema.Schema<A, any>
     ): Effect.Effect<A, ProxmoxError> =>
       client.execute(req).pipe(
-        Effect.mapError((cause) => new ProxmoxError({ cause })),
+        Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) })),
         Effect.flatMap((response) =>
           response.status >= 200 && response.status < 300
             ? HttpClientResponse.schemaBodyJson(schema)(response).pipe(
-                Effect.mapError((cause) => new ProxmoxError({ cause }))
+                Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) }))
               )
             : Effect.fail(
-                new ProxmoxError({ cause: `Proxmox API ${req.method} ${req.url} → ${response.status}` })
+                new ProxmoxError({ cause: `Proxmox API ${req.method} ${requestPath(req)} → ${response.status}` })
               )
         ),
         Effect.scoped
@@ -123,17 +135,17 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
       req: HttpClientRequest.HttpClientRequest
     ): Effect.Effect<Option.Option<string>, ProxmoxError> =>
       client.execute(req).pipe(
-        Effect.mapError((cause) => new ProxmoxError({ cause })),
+        Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) })),
         Effect.flatMap((response) => {
           if (response.status === 404) return Effect.succeed(Option.none<string>())
           if (response.status < 200 || response.status >= 300) {
             return Effect.fail(
-              new ProxmoxError({ cause: `Proxmox API ${req.method} ${req.url} → ${response.status}` })
+              new ProxmoxError({ cause: `Proxmox API ${req.method} ${requestPath(req)} → ${response.status}` })
             )
           }
           return HttpClientResponse.schemaBodyJson(UpidResponse)(response).pipe(
             Effect.map((r) => Option.some(r.data)),
-            Effect.mapError((cause) => new ProxmoxError({ cause }))
+            Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) }))
           )
         }),
         Effect.scoped
@@ -141,12 +153,12 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
 
     const requestConfig = (req: HttpClientRequest.HttpClientRequest): Effect.Effect<void, ProxmoxError> =>
       client.execute(req).pipe(
-        Effect.mapError((cause) => new ProxmoxError({ cause })),
+        Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) })),
         Effect.flatMap((response) =>
           response.status >= 200 && response.status < 300
             ? Effect.void
             : Effect.fail(
-                new ProxmoxError({ cause: `Proxmox API ${req.method} ${req.url} → ${response.status}` })
+                new ProxmoxError({ cause: `Proxmox API ${req.method} ${requestPath(req)} → ${response.status}` })
               )
         ),
         Effect.scoped
@@ -285,8 +297,11 @@ export type ProxmoxTlsPolicy =
   | { readonly _tag: "insecure" }
   | { readonly _tag: "pinned"; readonly fingerprint256: string }
 
+// cert.fingerprint256 は "AA:BB:CC:..." 形式(コロン区切り大文字 hex)で得られる。
+// PROXMOX_TLS_FINGERPRINT はコロン有無・大小を問わず受け付けたいので、
+// 先頭の "SHA256:" プレフィックス・コロン・空白を除去し大文字化して正規化する。
 const normalizeFingerprint = (fingerprint: string): string =>
-  fingerprint.trim().toUpperCase().replace(/^SHA256:/, "")
+  fingerprint.trim().toUpperCase().replace(/^SHA256:/, "").replace(/[:\s]/g, "")
 
 export const resolveProxmoxTlsPolicy = (args: {
   insecure: boolean
@@ -306,6 +321,36 @@ export const resolveProxmoxTlsPolicy = (args: {
   )
 }
 
+// checkServerIdentity 相当のフィンガープリント比較(純粋関数)。
+// eevee は自己署名証明書のため、通常の CA チェーン検証は必ず失敗する。
+// そのため pinned 分岐では rejectUnauthorized: false でチェーン検証自体をスキップし、
+// その代わりに checkServerIdentity でこの関数を呼んで SHA256 フィンガープリントの
+// 一致を必須にする(= チェーン検証はスキップするが、フィンガープリントが一致する
+// 固定ホストのみ信頼する)。一致すれば undefined(Node の checkServerIdentity の
+// 「OK」を表す規約)、不一致なら Error(ハンドシェイク拒否)を返す。
+// 実 TLS ハンドシェイクを起こさずに検証できるよう、cert 全体ではなく
+// fingerprint256 のみを引数に取る形で切り出している。
+export const verifyFingerprintMatch = (
+  expectedFingerprint256: string,
+  actualFingerprint256: string | undefined
+): Error | undefined => {
+  const actual = normalizeFingerprint(actualFingerprint256 ?? "")
+  return actual === expectedFingerprint256
+    ? undefined
+    : new Error(`Proxmox TLS fingerprint mismatch: expected ${expectedFingerprint256}, got ${actual}`)
+}
+
+// insecure(PROXMOX_TLS_INSECURE=true)分岐用のホスト限定チェック(純粋関数)。
+// rejectUnauthorized: false は https.Agent 全体に効くため、この Layer が誤って
+// Proxmox 以外の通信にも provide された場合、証明書検証が丸ごとスキップされてしまう
+// (この Layer は PROXMOX_API_URL のホスト専用の HttpClient として provide される前提)。
+// checkServerIdentity で接続先ホストを PROXMOX_API_URL のホストに限定することで、
+// 想定外のホストへの接続はここで拒否する防御を入れる。
+export const verifyInsecureHost = (expectedHost: string, actualHost: string): Error | undefined =>
+  actualHost === expectedHost
+    ? undefined
+    : new Error(`PROXMOX_TLS_INSECURE is only permitted for host ${expectedHost}, got connection to ${actualHost}`)
+
 // main.ts(Task 4/7 の Layer 合成)でこの Layer を HttpClient として provide する。
 // checkServerIdentity を上書きしてホスト名/CA チェーン検証をフィンガープリント
 // 一致確認に置き換える(自己署名証明書でも安全にピン留めできる)。
@@ -314,23 +359,26 @@ export const ProxmoxHttpClientLive: Layer.Layer<HttpClient.HttpClient, ConfigErr
     Effect.gen(function* () {
       const insecure = yield* Config.boolean("PROXMOX_TLS_INSECURE").pipe(Config.withDefault(false))
       const fingerprint = yield* Config.option(Config.string("PROXMOX_TLS_FINGERPRINT"))
+      const apiUrl = yield* Config.string("PROXMOX_API_URL")
       const policy = yield* Either.match(resolveProxmoxTlsPolicy({ insecure, fingerprint }), {
         onLeft: Effect.fail,
         onRight: Effect.succeed
       })
+      const proxmoxHost = new URL(apiUrl).hostname
 
+      // pinned: 自己署名証明書のピン留めの標準パターン(rejectUnauthorized: false +
+      // checkServerIdentity でフィンガープリント一致を必須化)。rejectUnauthorized を
+      // デフォルト(true)のままにすると、eevee の自己署名証明書は checkServerIdentity に
+      // 到達する前に通常のチェーン検証で必ず失敗するため、ピン留めが機能しない。
       const agentOptions: Https.AgentOptions =
         policy._tag === "insecure"
-          ? { rejectUnauthorized: false }
+          ? {
+              rejectUnauthorized: false,
+              checkServerIdentity: (host) => verifyInsecureHost(proxmoxHost, host)
+            }
           : {
-              checkServerIdentity: (_host, cert) => {
-                const actual = normalizeFingerprint(cert.fingerprint256 ?? "")
-                return actual === policy.fingerprint256
-                  ? undefined
-                  : new Error(
-                      `Proxmox TLS fingerprint mismatch: expected ${policy.fingerprint256}, got ${actual}`
-                    )
-              }
+              rejectUnauthorized: false,
+              checkServerIdentity: (_host, cert) => verifyFingerprintMatch(policy.fingerprint256, cert.fingerprint256)
             }
 
       return NodeHttpClient.layerWithoutAgent.pipe(Layer.provide(NodeHttpClient.makeAgentLayer(agentOptions)))

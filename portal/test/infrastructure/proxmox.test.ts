@@ -3,7 +3,12 @@ import { it } from "@effect/vitest"
 import { ConfigProvider, Effect, Either, Fiber, Layer, Option, TestClock } from "effect"
 import { describe, expect } from "vitest"
 import { ProvisionTimeout, ProxmoxError, ProxmoxPort } from "../../src/application/ports.js"
-import { ProxmoxLive, resolveProxmoxTlsPolicy } from "../../src/infrastructure/proxmox/client.js"
+import {
+  ProxmoxLive,
+  resolveProxmoxTlsPolicy,
+  verifyFingerprintMatch,
+  verifyInsecureHost
+} from "../../src/infrastructure/proxmox/client.js"
 
 // ProxmoxLive を、Proxmox VE API を模した fake HttpClient の上で検証する
 // (githubOAuth.test.ts と同じパターン)。実 HTTP・実 TLS は発生しない。
@@ -44,7 +49,7 @@ interface TaskState {
 const makeFakeProxmox = (
   overrides?: {
     tasks?: Record<string, ReadonlyArray<{ status: string; exitstatus?: string }>>
-    agentPingSequence?: ReadonlyArray<"ok" | "not-ready">
+    agentPingSequence?: ReadonlyArray<"ok" | "not-ready" | "hang">
     memoryFreeBytes?: number
     notFoundVmids?: ReadonlyArray<number>
   }
@@ -142,6 +147,13 @@ const makeFakeProxmox = (
     if (pingMatch && method === "POST") {
       const outcome = agentPingSequence[Math.min(agentPingCallCount, agentPingSequence.length - 1)]
       agentPingCallCount++
+      if (outcome === "hang") {
+        // 単発の HTTP 呼び出しがハングする状況を模する(pollUntil の個々の
+        // attempt timeout が無ければ、これだけで永遠に先へ進めなくなる)。
+        return Effect.sleep("20 seconds").pipe(
+          Effect.andThen(Effect.succeed(jsonResponse(request, { data: "still not ready" }, 500)))
+        )
+      }
       if (outcome === "ok") {
         return Effect.succeed(jsonResponse(request, { data: {} }))
       }
@@ -357,6 +369,27 @@ describe("waitForGuestAgent", () => {
       }
     })
   )
+
+  it.effect("単発の HTTP 呼び出しがハングしても attempt timeout で次のラウンドへ進み、全体タイムアウトで ProvisionTimeout になる", () =>
+    Effect.gen(function* () {
+      // ping が毎回ハング(20 秒)する。pollUntil に個々の attempt timeout(既定 10 秒)が
+      // 無ければ、最初の attempt がハングしたまま全体の 15 秒デッドライン判定に
+      // 一度も到達できず、テストの TestClock.adjust だけでは完了しない。
+      const fake = makeFakeProxmox({ agentPingSequence: ["hang", "hang", "hang", "hang"] })
+      const fiber = yield* Effect.fork(
+        ProxmoxPort.pipe(
+          Effect.flatMap((px) => px.waitForGuestAgent(1101, 15_000)),
+          Effect.provide(portLayer(fake))
+        )
+      )
+      yield* TestClock.adjust("40 seconds")
+      const result = yield* Fiber.join(fiber).pipe(Effect.either)
+      expect(Either.isLeft(result)).toBe(true)
+      if (Either.isLeft(result)) {
+        expect(result.left).toBeInstanceOf(ProvisionTimeout)
+      }
+    })
+  )
 })
 
 describe("guestExec", () => {
@@ -418,13 +451,13 @@ describe("resolveProxmoxTlsPolicy(TLS 方針の決定、純粋関数)", () => {
     expect(Either.isRight(policy) && policy.right._tag === "insecure").toBe(true)
   })
 
-  it("PROXMOX_TLS_FINGERPRINT があれば pinned", () => {
+  it("PROXMOX_TLS_FINGERPRINT があれば pinned(コロンを除去して正規化する)", () => {
     const policy = resolveProxmoxTlsPolicy({
       insecure: false,
       fingerprint: Option.some("AA:BB:CC")
     })
     expect(
-      Either.isRight(policy) && policy.right._tag === "pinned" && policy.right.fingerprint256 === "AA:BB:CC"
+      Either.isRight(policy) && policy.right._tag === "pinned" && policy.right.fingerprint256 === "AABBCC"
     ).toBe(true)
   })
 
@@ -436,5 +469,47 @@ describe("resolveProxmoxTlsPolicy(TLS 方針の決定、純粋関数)", () => {
   it("insecure=true が優先される(fingerprint 併存時も insecure)", () => {
     const policy = resolveProxmoxTlsPolicy({ insecure: true, fingerprint: Option.some("AA:BB") })
     expect(Either.isRight(policy) && policy.right._tag === "insecure").toBe(true)
+  })
+})
+
+// pinned 分岐は rejectUnauthorized: false + checkServerIdentity でフィンガープリント
+// 一致を必須にする(自己署名証明書のピン留めの標準パターン)。実 TLS ハンドシェイクを
+// 起こさずに、checkServerIdentity 相当の比較ロジックだけを純粋関数としてテストする。
+describe("verifyFingerprintMatch(checkServerIdentity 相当、純粋関数)", () => {
+  it("フィンガープリントが一致すれば undefined(Node の checkServerIdentity の OK 規約)", () => {
+    // expectedFingerprint256 は resolveProxmoxTlsPolicy が既に正規化した(コロン除去済み)値、
+    // actualFingerprint256 は cert.fingerprint256 の生の形("AA:BB:CC" 形式)を想定。
+    const result = verifyFingerprintMatch("AABBCC", "AA:BB:CC")
+    expect(result).toBeUndefined()
+  })
+
+  it("大文字小文字を正規化して比較する", () => {
+    const result = verifyFingerprintMatch("AABBCC", "aa:bb:cc")
+    expect(result).toBeUndefined()
+  })
+
+  it("フィンガープリントが不一致なら Error(ハンドシェイク拒否)", () => {
+    const result = verifyFingerprintMatch("AABBCC", "AA:BB:DD")
+    expect(result).toBeInstanceOf(Error)
+  })
+
+  it("証明書に fingerprint256 が無い(undefined)場合も不一致として Error", () => {
+    const result = verifyFingerprintMatch("AABBCC", undefined)
+    expect(result).toBeInstanceOf(Error)
+  })
+})
+
+// insecure(PROXMOX_TLS_INSECURE=true)分岐は rejectUnauthorized: false が
+// https.Agent 全体に効くため、誤って Proxmox 以外の通信にこの Layer が provide
+// された場合の被害を限定するホスト限定チェック(純粋関数)。
+describe("verifyInsecureHost(insecure 分岐のホスト限定、純粋関数)", () => {
+  it("接続先が PROXMOX_API_URL のホストと一致すれば undefined", () => {
+    const result = verifyInsecureHost("192.0.2.10", "192.0.2.10")
+    expect(result).toBeUndefined()
+  })
+
+  it("接続先が異なるホストなら Error(ハンドシェイク拒否)", () => {
+    const result = verifyInsecureHost("192.0.2.10", "evil.example.com")
+    expect(result).toBeInstanceOf(Error)
   })
 })
