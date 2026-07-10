@@ -103,7 +103,7 @@ export const ipFor: (teamNumber: number, index: number) => string     // 10.100.
 
 **Files:**
 - Modify: `portal/src/application/ports.ts`(3 port + エラー型追加)
-- Create: `portal/src/infrastructure/proxmox/client.ts`, `cloudflare/client.ts`, `github/keys.ts`
+- Create: `portal/src/infrastructure/proxmox/client.ts`, `portal/src/infrastructure/cloudflare/client.ts`, `portal/src/infrastructure/github/keys.ts`
 - Test: `portal/test/infrastructure/{proxmox,cloudflare,githubKeys}.test.ts`(HTTP スタブ)+ インメモリ port(`portal/test/support/inMemory.ts` 拡張)
 
 **Interfaces:** スペック §アーキテクチャの 3 port(Effect.Effect 表記)をそのまま。エラー型 `ProxmoxError` / `CloudflareError` / `GithubKeysError` / `ProvisionTimeout` は `Data.TaggedError`(RepoError と同じ置き場: ports.ts)。
@@ -124,7 +124,7 @@ export const ipFor: (teamNumber: number, index: number) => string     // 10.100.
 
 **Files:**
 - Create: `portal/src/application/usecases/provisioning.ts`(saga 本体)、`portal/src/infrastructure/worker/provisioner.ts`(常駐 Layer)
-- Modify: `portal/src/application/usecases/instances.ts`(追加/削除ユースケース)、`ports.ts`(InstanceRepo に状態遷移メソッド追加)、`main.ts`(ワーカー merge)
+- Modify: `portal/src/application/usecases/instances.ts`(追加/削除ユースケース)、`portal/src/application/ports.ts`(InstanceRepo に状態遷移メソッド追加)、`portal/src/main.ts`(ワーカー merge)
 - Test: `portal/test/application/provisioning.test.ts`、`portal/test/worker/provisioner.test.ts`(TestClock + インメモリ port)
 
 **要点:**
@@ -146,8 +146,8 @@ export const ipFor: (teamNumber: number, index: number) => string     // 10.100.
 ### Task 5: 招待自動化(invites API + 初ログイン自動所属 + Access/鍵注入)
 
 **Files:**
-- Create: `portal/src/application/usecases/invites.ts`、`portal/src/infrastructure/sql/repos/inviteRepo.ts`、`portal/src/infrastructure/http/handlers/`(admin へ invites 追加)
-- Modify: `usecases/auth.ts`(初ログイン時に team_invites を消費して所属 + email 引き継ぎ)、`shared/src/api.ts`、`main.ts`
+- Create: `portal/src/application/usecases/invites.ts`、`portal/src/infrastructure/sql/repos/inviteRepo.ts`、`portal/src/infrastructure/http/handlers/admin.ts`(既存を拡張、invites エンドポイント追加)
+- Modify: `portal/src/application/usecases/auth.ts`(初ログイン時に team_invites を消費して所属 + email 引き継ぎ)、`shared/src/api.ts`、`portal/src/main.ts`
 - Test: `portal/test/application/invites.test.ts`、`portal/test/http/invites.test.ts`
 
 **要点(スペック §招待フロー):**
