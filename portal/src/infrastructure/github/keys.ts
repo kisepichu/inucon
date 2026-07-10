@@ -1,6 +1,7 @@
 import { HttpClient, HttpClientRequest } from "@effect/platform"
 import { Effect, Layer } from "effect"
 import { GithubKeysError, GithubKeysPort } from "../../application/ports.js"
+import { describeHttpFailure } from "../httpClientErrors.js"
 
 // authorized_keys 形式(<keytype> <base64> [comment])の許可リスト検証。
 // 計画の Global Constraints(2026-07-10-phase3-selfservice.md)で確定した正規表現をそのまま使う。
@@ -21,7 +22,9 @@ export const GithubKeysLive: Layer.Layer<GithubKeysPort, never, HttpClient.HttpC
         Effect.gen(function* () {
           const request = HttpClientRequest.get(`https://github.com/${login}.keys`)
           const response = yield* client.execute(request).pipe(
-            Effect.mapError((cause) => new GithubKeysError({ cause }))
+            // Proxmox/Cloudflare と同様、生の RequestError(将来ヘッダ等を含みうる)
+            // を cause に入れず、メソッド+パスのみの安全な文字列にする。
+            Effect.mapError((cause) => new GithubKeysError({ cause: describeHttpFailure(request, cause) }))
           )
           if (response.status !== 200) {
             return yield* Effect.fail(
@@ -29,7 +32,7 @@ export const GithubKeysLive: Layer.Layer<GithubKeysPort, never, HttpClient.HttpC
             )
           }
           const body = yield* response.text.pipe(
-            Effect.mapError((cause) => new GithubKeysError({ cause }))
+            Effect.mapError((cause) => new GithubKeysError({ cause: describeHttpFailure(request, cause) }))
           )
           if (body.trim() === "") {
             return yield* Effect.fail(new GithubKeysError({ cause: `no keys registered for ${login}` }))
