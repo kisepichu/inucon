@@ -1,6 +1,6 @@
 import { SqlClient } from "@effect/sql"
 import { it } from "@effect/vitest"
-import { Effect } from "effect"
+import { Cause, Effect, Option } from "effect"
 import { expect } from "vitest"
 import migration0001 from "../../src/infrastructure/sql/migrations/0001_initial.js"
 import migration0002 from "../../src/infrastructure/sql/migrations/0002_selfservice.js"
@@ -111,6 +111,11 @@ layer("migration 0002: fail-fast(孤立 instances 行の安全網)", (it) => {
       // 実行し、fail-fast のロールバックが機能することを確認する。
       const exit = yield* Effect.exit(sql.withTransaction(migration0002))
       expect(exit._tag).toBe("Failure")
+      // defect ではなく typed failure(MigrationDataError)で落ちる
+      if (exit._tag === "Failure") {
+        const err = Cause.failureOption(exit.cause)
+        expect(Option.isSome(err) && (err.value as { _tag?: string })._tag).toBe("MigrationDataError")
+      }
 
       // ロールバックにより instances は 0001 のスキーマ・行のまま残る
       // (instances_new も DROP TABLE も実行されていない)。

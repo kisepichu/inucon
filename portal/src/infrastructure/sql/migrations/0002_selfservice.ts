@@ -1,5 +1,11 @@
 import { SqlClient } from "@effect/sql"
-import { Effect } from "effect"
+import { Data, Effect } from "effect"
+
+// 移行時のデータ不整合(想定されるエラー)。defect ではなく通常の failure に
+// することで、Migrator のエラー分類・ログで移行失敗として扱いやすくする。
+export class MigrationDataError extends Data.TaggedError("MigrationDataError")<{
+  readonly message: string
+}> {}
 
 // 本番 DB(apphost)が既に稼働中のため 0001 は変更しない(前方専用)。
 //
@@ -62,10 +68,13 @@ export default Effect.gen(function* () {
     migratedCount: number
   }>`SELECT COUNT(*) AS migratedCount FROM instances_new`
   if (sourceCount !== migratedCount) {
-    yield* Effect.dieMessage(
-      `migration 0002: instances (${sourceCount} 行) と instances_new (${migratedCount} 行) の行数が一致しません。` +
-        `teams に存在しない team_id を持つ孤立 instances 行が INNER JOIN で移行されなかった可能性があります。` +
-        `SELECT * FROM instances WHERE team_id NOT IN (SELECT id FROM teams) で調査してください。`
+    yield* Effect.fail(
+      new MigrationDataError({
+        message:
+          `migration 0002: instances (${sourceCount} 行) と instances_new (${migratedCount} 行) の行数が一致しません。` +
+          `teams に存在しない team_id を持つ孤立 instances 行が INNER JOIN で移行されなかった可能性があります。` +
+          `SELECT * FROM instances WHERE team_id NOT IN (SELECT id FROM teams) で調査してください。`
+      })
     )
   }
 

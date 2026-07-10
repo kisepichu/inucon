@@ -20,7 +20,9 @@ export class Instance extends Schema.Class<Instance>("Instance")({
   updatedAt: Schema.Int
 }) {}
 
-// スペック §Instance 集約 不変条件3: vmid は 1000 + teamNumber*100 + index
+// vmid の通常規則(スペック §Instance 集約 不変条件3): 1000 + teamNumber*100 + index。
+// 払い出し(saga)ではこの式で vmid を決めるが、admin の台帳取り込み
+// (POST /api/instances)は式に従わない実 VM の vmid を明示指定できる(既定値扱い)。
 // (実績: team1-1 = 1101)。IP は既存規則 10.100.<teamNumber>.1<index>。
 export const vmidFor = (teamNumber: number, index: number): number => 1000 + teamNumber * 100 + index
 
