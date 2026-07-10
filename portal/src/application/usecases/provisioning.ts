@@ -2,6 +2,7 @@ import { Clock, Effect, Either, Option } from "effect"
 import { addStep, markDeleted, markFailed, markProvisioned } from "../../domain/instance.js"
 import type { Instance, ProvisionStep } from "../../domain/instance.js"
 import type { TeamId } from "../../domain/ids.js"
+import { InsufficientMemory } from "../errors.js"
 import {
   CloudflareError,
   CloudflarePort,
@@ -118,42 +119,61 @@ export const runProvisioning = (
         return updated
       })
 
-    // 逆順の補償: access_done → route_done → (clone_done/configured/started
-    // のいずれかがあれば VM 破棄。VM に関する 3 ステップはどれも「VM が
-    // Proxmox 上に存在する」ことを意味するので stopAndDestroyVm 1 回で足りる
-    // (冪等な port なので複数回呼んでも安全)。Cloudflare 系の失敗は
-    // ログに残して次のステップへ進む(1 つの補償失敗で残りの補償を諦めない、
-    // TimeoutSweeper と同じ生存性優先の考え方)。
+    // 逆順の補償(Task 4 レビュー C1 修正): access_done → route_done → VM 破棄を
+    // progress の内容に関わらず毎回すべて試みる。理由は「clone 成功直後・
+    // progress 保存前にプロセスが落ちた」場合、instance.progress には
+    // clone_done が記録されておらず、旧実装(progress を見て絞る)だと
+    // stopAndDestroyVm が呼ばれず孤児 VM が残ってしまうため。
+    // removeAccessApp/removeInstanceRoute/stopAndDestroyVm はすべて冪等
+    // (対象が無くても成功する)なので、progress に無関係に全部呼んでよい
+    // (呼んでも実害が無い一方、呼び漏らすと孤児資源が残る非対称なリスクの
+    // ほうが大きい)。各補償ステップの失敗はログに残して次へ進む(1 つの
+    // 補償失敗で残りの補償を諦めない、TimeoutSweeper と同じ生存性優先)。
     const compensate = (instance: Instance) =>
       Effect.gen(function* () {
-        if (instance.progress.includes("access_done")) {
-          yield* cloudflare
-            .removeAccessApp(hostname)
-            .pipe(Effect.catchAll((e) => Effect.logError(`compensate removeAccessApp failed: ${describeError(e)}`)))
-        }
-        if (instance.progress.includes("route_done")) {
-          yield* cloudflare
-            .removeInstanceRoute(hostname)
-            .pipe(
-              Effect.catchAll((e) => Effect.logError(`compensate removeInstanceRoute failed: ${describeError(e)}`))
-            )
-        }
-        if (instance.progress.some((p) => p === "clone_done" || p === "configured" || p === "started")) {
-          yield* proxmox
-            .stopAndDestroyVm(instance.vmid)
-            .pipe(Effect.catchAll((e) => Effect.logError(`compensate stopAndDestroyVm failed: ${describeError(e)}`)))
-        }
+        yield* cloudflare
+          .removeAccessApp(hostname)
+          .pipe(Effect.catchAll((e) => Effect.logError(`compensate removeAccessApp failed: ${describeError(e)}`)))
+        yield* cloudflare
+          .removeInstanceRoute(hostname)
+          .pipe(Effect.catchAll((e) => Effect.logError(`compensate removeInstanceRoute failed: ${describeError(e)}`)))
+        yield* proxmox
+          .stopAndDestroyVm(instance.vmid)
+          .pipe(Effect.catchAll((e) => Effect.logError(`compensate stopAndDestroyVm failed: ${describeError(e)}`)))
       })
 
     const advance = Effect.gen(function* () {
       let instance = initial
 
       if (!instance.progress.includes("clone_done")) {
-        yield* proxmox.cloneVm({
-          templateVmid: TEMPLATE_VMID,
-          newVmid: instance.vmid,
-          name: `inucon-team${team.teamNumber}-${instance.index}`
-        })
+        // 再入可能性(Task 4 レビュー C1): 前回の実行が cloneVm 成功後・
+        // progress 保存前に落ちていると、instance.progress には clone_done が
+        // 無いままだが Proxmox 上には既に vmid の VM が存在する。vmidFor は
+        // 決定的なので、そのまま cloneVm を呼び直すと同一 vmid への二重 clone
+        // になり Proxmox 側で失敗する(復旧不能)。事前に vmExists で確認し、
+        // 既に存在すれば cloneVm をスキップして clone_done 扱いにする。
+        const alreadyExists = yield* proxmox.vmExists(instance.vmid)
+        if (!alreadyExists) {
+          // RAM ガードの再検証(Task 4 レビュー I2): requestCreateInstance の
+          // admission 時点のガードは「追加ボタンを押した瞬間」の空き容量しか
+          // 見ていない。複数チームが同時に追加すると、ワーカーが順番に
+          // clone するまでの間に他インスタンスの clone で実際の空きが
+          // 閾値を割り込みうる。実際に VM を作る(cloneVm を呼ぶ)直前に
+          // 再確認し、閾値未満なら InsufficientMemory で fail させる(saga の
+          // 失敗経路に乗せ、補償 → markFailed へ畳み込む)。既に vmExists な
+          // 場合は新規に容量を消費しないため再検証は不要。
+          const freeBytes = yield* proxmox.getNodeFreeMemBytes
+          if (freeBytes < config.minFreeMemBytes) {
+            return yield* Effect.fail(
+              new InsufficientMemory({ freeBytes, requiredBytes: config.minFreeMemBytes })
+            )
+          }
+          yield* proxmox.cloneVm({
+            templateVmid: TEMPLATE_VMID,
+            newVmid: instance.vmid,
+            name: `inucon-team${team.teamNumber}-${instance.index}`
+          })
+        }
         instance = yield* persistStep(instance, "clone_done")
       }
 

@@ -217,6 +217,45 @@ describe("requestCreateInstance(ガード)", () => {
       expect(instance.status).toBe("creating")
     }).pipe(Effect.provide(baseGuardLayer()))
   )
+
+  // ガード順序(Task 4 レビュー M5): quota/進行中は DB 読み取りだけの安価な
+  // 判定なので、Proxmox への HTTP 呼び出しを伴う RAM ガードより先に評価する。
+  // quota 超過 と RAM 不足の両方が同時に成り立つ状況を作り、返るエラーが
+  // QuotaExceeded(DB 側)であって InsufficientMemory(RAM 側)ではないことを
+  // 確認することで、DB チェックが先に fail-fast していることを検証する。
+  it.effect("quota 超過かつ RAM 不足が同時に成り立つ場合、安価な quota チェックが先に効く(QuotaExceeded)", () =>
+    Effect.gen(function* () {
+      const exit = yield* Effect.exit(requestCreateInstance({ user: alice, teamId: team1Id, index: 3 }))
+      expect(exit).toStrictEqual(Exit.fail(new QuotaExceeded({ teamId: team1Id, quota: 2 })))
+    }).pipe(
+      Effect.provide(
+        baseGuardLayer({
+          quota: 2,
+          freeMemBytes: 1_000_000_000,
+          minFreeMemBytes: 5_000_000_000,
+          instances: [
+            runningInstance({ id: "r1", teamId: team1Id, index: 1, teamNumber: 1 }),
+            runningInstance({ id: "r2", teamId: team1Id, index: 2, teamNumber: 1 })
+          ]
+        })
+      )
+    )
+  )
+
+  it.effect("進行中かつ RAM 不足が同時に成り立つ場合、安価な進行中チェックが先に効く(ProvisionInProgress)", () =>
+    Effect.gen(function* () {
+      const exit = yield* Effect.exit(requestCreateInstance({ user: alice, teamId: team1Id, index: 2 }))
+      expect(exit).toStrictEqual(Exit.fail(new ProvisionInProgress({ teamId: team1Id })))
+    }).pipe(
+      Effect.provide(
+        baseGuardLayer({
+          freeMemBytes: 1_000_000_000,
+          minFreeMemBytes: 5_000_000_000,
+          instances: [creatingInstance({ id: "c1", teamId: team1Id, index: 1, teamNumber: 1 })]
+        })
+      )
+    )
+  )
 })
 
 describe("requestDeleteInstance(ガード)", () => {
@@ -286,6 +325,52 @@ describe("requestDeleteInstance(ガード)", () => {
       )
     }).pipe(
       Effect.provide(deleteLayer({ instances: [creatingInstance({ id: "c-del", teamId: team1Id, index: 1, teamNumber: 1 })] }))
+    )
+  )
+
+  // I4: failed(C1 の孤児 VM や途中失敗の残骸)も削除経路を受理し、掃除(撤収
+  // saga)に乗せられることを確認する。domain の beginDeleting は元々
+  // running/failed 両方から deleting への遷移を許していたが、旧
+  // requestDeleteInstance は running のみ受理しており failed を掃除する手段が
+  // 無かった。
+  it.effect("failed インスタンスも削除できる(running/failed → deleting)", () =>
+    Effect.gen(function* () {
+      const failedInstance = new Instance({
+        id: InstanceId.make("failed-1"),
+        teamId: team1Id,
+        index: 1,
+        vmid: vmidFor(1, 1),
+        privateIp: ipFor(1, 1),
+        status: "failed",
+        progress: ["clone_done"],
+        errorMessage: Option.some("boom"),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      const result = yield* requestDeleteInstance({ user: alice, instanceId: failedInstance.id })
+      expect(result.status).toBe("deleting")
+      const repo = yield* InstanceRepo
+      const stored = yield* repo.findById(failedInstance.id)
+      expect(Option.getOrThrow(stored).status).toBe("deleting")
+    }).pipe(
+      Effect.provide(
+        deleteLayer({
+          instances: [
+            new Instance({
+              id: InstanceId.make("failed-1"),
+              teamId: team1Id,
+              index: 1,
+              vmid: vmidFor(1, 1),
+              privateIp: ipFor(1, 1),
+              status: "failed",
+              progress: ["clone_done"],
+              errorMessage: Option.some("boom"),
+              createdAt: 0,
+              updatedAt: 0
+            })
+          ]
+        })
+      )
     )
   )
 
@@ -425,17 +510,129 @@ describe("runProvisioning(払い出し saga)", () => {
     })
   )
 
-  it.effect("最初の cloneVm 失敗時: 何も作っていないので VM 破棄も呼ばれず failed", () =>
-    Effect.gen(function* () {
-      const initial = creatingInstance({ id: "prov-fail-clone", teamId: team1Id, index: 1, teamNumber: 1 })
-      const { layer, proxmox } = sagaLayerWith(initial, {
-        proxmox: { failWith: { cloneVm: new ProxmoxError({ cause: "boom" }) } }
+  it.effect(
+    "最初の cloneVm 失敗時: cloneVm は未成功だが補償は progress 非依存で毎回全部試みる(C1、冪等なので無害)",
+    () =>
+      Effect.gen(function* () {
+        const initial = creatingInstance({ id: "prov-fail-clone", teamId: team1Id, index: 1, teamNumber: 1 })
+        const { layer, proxmox } = sagaLayerWith(initial, {
+          proxmox: { failWith: { cloneVm: new ProxmoxError({ cause: "boom" }) } }
+        })
+        const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
+
+        expect(result.status).toBe("failed")
+        const px = yield* proxmox.getState
+        // cloneVm 自体は失敗して何も作っていないが、補償(compensate)は
+        // progress の内容を見ずに stopAndDestroyVm を必ず呼ぶ(C1 修正:
+        // 「progress 未保存だが実は VM が存在する」ケースを取りこぼさないため)。
+        // stopAndDestroyVm は冪等なので、対象が無くても呼ぶこと自体は無害。
+        expect(px.destroyedVmids).toStrictEqual([vmid1])
+        expect(px.clonedVmids).toStrictEqual([])
       })
+  )
+
+  it.effect("再入可能性(C1): クラッシュ前に cloneVm だけ成功していた場合、再開時は vmExists=true で clone をスキップする", () =>
+    Effect.gen(function* () {
+      // progress は保存されなかった(= [])が、Proxmox 上には既に vmid の VM が
+      // 存在する状態(クラッシュ前の cloneVm 成功・persistStep 失敗を模す)。
+      const initial = creatingInstance({ id: "prov-resume-clone", teamId: team1Id, index: 1, teamNumber: 1 })
+      const proxmox = makeProxmoxPortTest({ existingVmids: [vmid1] })
+      const cloudflare = makeCloudflarePortTest()
+      const layer = Layer.mergeAll(
+        makeInstanceRepoTest([initial]),
+        teamRepoLayer,
+        githubKeysLayer,
+        proxmox.layer,
+        cloudflare.layer,
+        ProvisioningConfigTest()
+      )
+
+      const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
+
+      expect(result.status).toBe("running")
+      expect(result.progress).toStrictEqual(["clone_done", "configured", "started", "route_done", "access_done"])
+      // cloneVm は一度も呼ばれていない(スキップされた)。
+      const px = yield* proxmox.getState
+      expect(px.clonedVmids).toStrictEqual([])
+    })
+  )
+
+  it.effect(
+    "再入可能性(C1): クラッシュ前に cloneVm だけ成功 → 別ステップで失敗した場合、補償は vmExists=true の VM を stopAndDestroy する",
+    () =>
+      Effect.gen(function* () {
+        // progress=[](未保存)だが VM は既に存在し、configureCloudInit で失敗
+        // させて補償に到達させる。旧実装(progress.includes("clone_done") を
+        // 見て絞る補償)だとここで stopAndDestroyVm が呼ばれず孤児 VM が残る
+        // (C1 の核心のバグ)。
+        const initial = creatingInstance({ id: "prov-resume-fail", teamId: team1Id, index: 1, teamNumber: 1 })
+        const proxmox = makeProxmoxPortTest({
+          existingVmids: [vmid1],
+          failWith: { configureCloudInit: new ProxmoxError({ cause: "boom" }) }
+        })
+        const cloudflare = makeCloudflarePortTest()
+        const layer = Layer.mergeAll(
+          makeInstanceRepoTest([initial]),
+          teamRepoLayer,
+          githubKeysLayer,
+          proxmox.layer,
+          cloudflare.layer,
+          ProvisioningConfigTest()
+        )
+
+        const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
+
+        expect(result.status).toBe("failed")
+        const px = yield* proxmox.getState
+        expect(px.clonedVmids).toStrictEqual([])
+        expect(px.destroyedVmids).toStrictEqual([vmid1])
+      })
+  )
+
+  it.effect("RAM 再検証(I2): clone 直前に空きが閾値未満なら InsufficientMemory で failed(補償も試みる)", () =>
+    Effect.gen(function* () {
+      const initial = creatingInstance({ id: "prov-ram-fail", teamId: team1Id, index: 1, teamNumber: 1 })
+      const proxmox = makeProxmoxPortTest({ freeMemBytes: 1_000_000_000 })
+      const cloudflare = makeCloudflarePortTest()
+      const layer = Layer.mergeAll(
+        makeInstanceRepoTest([initial]),
+        teamRepoLayer,
+        githubKeysLayer,
+        proxmox.layer,
+        cloudflare.layer,
+        ProvisioningConfigTest({ minFreeMemBytes: 5_000_000_000 })
+      )
+
       const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
 
       expect(result.status).toBe("failed")
+      expect(Option.isSome(result.errorMessage)).toBe(true)
       const px = yield* proxmox.getState
-      expect(px.destroyedVmids).toStrictEqual([])
+      // 空き不足でガードに引っかかったので cloneVm は呼ばれていない。
+      expect(px.clonedVmids).toStrictEqual([])
+    })
+  )
+
+  it.effect("RAM 再検証(I2): 既に vmExists=true(clone 済み)なら RAM 不足でも clone をスキップして進む", () =>
+    Effect.gen(function* () {
+      // 既に clone 済みの VM が存在する状況では、新たに容量を消費しないため
+      // RAM ガードの再検証は行わない(cloneVm 自体を呼ばないので無関係)。
+      const initial = creatingInstance({ id: "prov-resume-lowram", teamId: team1Id, index: 1, teamNumber: 1 })
+      const proxmox = makeProxmoxPortTest({ existingVmids: [vmid1], freeMemBytes: 1_000_000_000 })
+      const cloudflare = makeCloudflarePortTest()
+      const layer = Layer.mergeAll(
+        makeInstanceRepoTest([initial]),
+        teamRepoLayer,
+        githubKeysLayer,
+        proxmox.layer,
+        cloudflare.layer,
+        ProvisioningConfigTest({ minFreeMemBytes: 5_000_000_000 })
+      )
+
+      const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
+
+      expect(result.status).toBe("running")
+      const px = yield* proxmox.getState
       expect(px.clonedVmids).toStrictEqual([])
     })
   )

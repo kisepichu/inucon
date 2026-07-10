@@ -241,6 +241,12 @@ export class ProxmoxPort extends Context.Tag("app/ProxmoxPort")<
     readonly startVm: (vmid: number) => Effect.Effect<void, ProxmoxError>
     // 冪等: VM が既に存在しない場合も成功扱い。
     readonly stopAndDestroyVm: (vmid: number) => Effect.Effect<void, ProxmoxError>
+    // clone ステップを再入可能にするための存在確認(Task 4 レビュー C1)。
+    // `GET /nodes/<node>/qemu/<vmid>/status/current` が 200 なら true、404 なら
+    // false を返す。clone 成功直後・progress 保存前にプロセスが落ちた場合の
+    // 再開時、この確認で「既に clone 済み」を検出して cloneVm の再実行(同一
+    // vmid への二重 clone は Proxmox 側で失敗する)を避ける。
+    readonly vmExists: (vmid: number) => Effect.Effect<boolean, ProxmoxError>
     readonly waitForGuestAgent: (
       vmid: number,
       timeoutMillis: number

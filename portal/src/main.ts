@@ -2,9 +2,11 @@ import { createServer } from "node:http"
 import { fileURLToPath } from "node:url"
 import { HttpApiBuilder, HttpMiddleware } from "@effect/platform"
 import { NodeHttpClient, NodeHttpServer, NodeRuntime } from "@effect/platform-node"
-import { Config, Effect, Layer } from "effect"
+import { Config, Effect, Layer, Option } from "effect"
 import { api } from "shared"
 import { AuthConfig, ProvisioningConfig, RunnerConfig } from "./application/ports.js"
+import { CloudflareLive } from "./infrastructure/cloudflare/client.js"
+import { GithubKeysLive } from "./infrastructure/github/keys.js"
 import { GithubOAuthLive } from "./infrastructure/github/oauth.js"
 import { AdminLive } from "./infrastructure/http/handlers/admin.js"
 import { AuthLive } from "./infrastructure/http/handlers/auth.js"
@@ -17,6 +19,7 @@ import { ScoreboardLive } from "./infrastructure/http/handlers/scoreboard.js"
 import { TeamsLive } from "./infrastructure/http/handlers/teams.js"
 import { AdminOnlyLive, AuthenticationLive, RunnerAuthLive } from "./infrastructure/http/middleware.js"
 import { makeStaticMiddleware } from "./infrastructure/http/static.js"
+import { ProxmoxHttpClientLive, ProxmoxLive } from "./infrastructure/proxmox/client.js"
 import { MigratorLive, SqlLive } from "./infrastructure/sql/client.js"
 import { SeedLive } from "./infrastructure/sql/seed.js"
 import { BenchJobRepoLive } from "./infrastructure/sql/repos/benchJobRepo.js"
@@ -26,6 +29,7 @@ import { SessionRepoLive } from "./infrastructure/sql/repos/sessionRepo.js"
 import { TeamRepoLive } from "./infrastructure/sql/repos/teamRepo.js"
 import { UserRepoLive } from "./infrastructure/sql/repos/userRepo.js"
 import { UuidGenLive } from "./infrastructure/sql/uuid.js"
+import { ProvisionerLive } from "./infrastructure/worker/provisioner.js"
 import { TimeoutSweeperLive } from "./infrastructure/worker/timeoutSweeper.js"
 
 // ADMIN_GITHUB_LOGINS(カンマ区切り)に載っている githubLogin はログイン時に
@@ -174,30 +178,45 @@ const WorkerLive = TimeoutSweeperLive.pipe(
   Layer.provide(MigratorLive)
 )
 
-// 払い出し/撤収オーケストレーションのワーカー(Task 4)は
-// ProvisionerLive(infrastructure/worker/provisioner.ts)として定義済みで、
-// ProvisioningConfigLive も上で用意した。ただし ProvisionerLive の実行には
-// 実 port Live(ProxmoxLive / CloudflareLive / GithubKeysLive)が必要で、
-// それらは PROXMOX_* / CF_API_TOKEN 等の env を Layer 構築時に必須とする
-// (未設定だと Layer.launch が起動時に失敗する)。dev/test では env が無いのが
-// 通常のため、ここで MainLive に merge すると「env 未設定で起動が壊れる」形に
-// なってしまう。スペックの実装計画でも実 Layer の配線(k8s Secret / TLS 方針の
-// 確定含む)は Task 7(本番検証)に切られているため、本 Task では
-// ProvisionerLive を MainLive に配線しない。Task 7 で
-//   ProvisionerLive.pipe(
-//     Layer.provide(ProvisioningConfigLive),
-//     Layer.provide(ReposLive),            // InstanceRepo / TeamRepo
-//     Layer.provide(ProxmoxLive.pipe(Layer.provide(ProxmoxHttpClientLive))),
-//     Layer.provide(CloudflareLive.pipe(Layer.provide(NodeHttpClient.layer))),
-//     Layer.provide(GithubKeysLive.pipe(Layer.provide(NodeHttpClient.layer))),
-//     Layer.provide(MigratorLive)
-//   )
-// の形で WorkerLive に足す(TimeoutSweeper と同じ ReposLive/MigratorLive の
-// 同一参照メモ化に乗せる)。
+// 払い出し/撤収オーケストレーションのワーカー(Task 4 レビュー I3)。
+// ProvisionerLive の実行には実 port Live(ProxmoxLive / CloudflareLive /
+// GithubKeysLive)が必要で、ProxmoxLive/CloudflareLive は PROXMOX_*/CF_* 系の
+// env を Layer 構築時に必須とする(未設定だと Layer 構築自体が ConfigError で
+// 失敗する)。dev/test や env 未設定の現行本番でも起動を壊さないよう、
+// PROXMOX_API_URL の有無を Config.option で確認し、
+// - 設定されていれば実 Layer 一式(下記)を組み立てて配線する
+// - 設定されていなければワーカーを起動しない no-op Layer(Layer.empty)に
+//   フォールバックする
+// という条件分岐を Layer.unwrapEffect で行う(Layer 構築そのものを Effect
+// として遅延させ、Config を読んでから分岐する)。
+//
+// TLS の HttpClient 分離(Task 3 レビュー指摘): ProxmoxHttpClientLive は
+// PROXMOX_TLS_INSECURE/PROXMOX_TLS_FINGERPRINT に基づく Proxmox 専用の
+// checkServerIdentity 上書き(自己署名証明書のピン留め、または insecure 時の
+// 接続先ホスト限定)を行うため、Cloudflare/GitHub 向けの通常の
+// NodeHttpClient.layer とは別の HttpClient として ProxmoxLive にだけ
+// provide する(誤って同じ HttpClient を Cloudflare/GitHub 呼び出しにも
+// 使うと、TLS 検証がホスト非限定でスキップ/ピン留めされてしまう)。
+const ProvisionerConditionalLive = Layer.unwrapEffect(
+  Config.option(Config.string("PROXMOX_API_URL")).pipe(
+    Effect.map((proxmoxApiUrl) =>
+      Option.isSome(proxmoxApiUrl)
+        ? ProvisionerLive.pipe(
+            Layer.provide(ProvisioningConfigLive),
+            Layer.provide(ReposLive), // InstanceRepo / TeamRepo
+            Layer.provide(ProxmoxLive.pipe(Layer.provide(ProxmoxHttpClientLive))),
+            Layer.provide(CloudflareLive.pipe(Layer.provide(NodeHttpClient.layer))),
+            Layer.provide(GithubKeysLive.pipe(Layer.provide(NodeHttpClient.layer))),
+            Layer.provide(MigratorLive)
+          )
+        : Layer.empty
+    )
+  )
+)
 
 // migration/seed は HttpLive・WorkerLive の依存(Layer.provide)経由で実行される
 // (メモ化により 1 回だけ)。トップレベルにはそれらを消費するコンポーネント
 // だけを並べ、順序は依存グラフに任せる。
-const MainLive = Layer.mergeAll(HttpLive, WorkerLive)
+const MainLive = Layer.mergeAll(HttpLive, WorkerLive, ProvisionerConditionalLive)
 
 Layer.launch(MainLive).pipe(NodeRuntime.runMain)

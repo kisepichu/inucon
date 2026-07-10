@@ -5,7 +5,15 @@ import { InstanceId, TeamId } from "../../domain/ids.js"
 import { beginDeleting, Instance, newInstance, vmidFor } from "../../domain/instance.js"
 import type { ProvisionStep } from "../../domain/instance.js"
 import type { User } from "../../domain/user.js"
-import { ContestNotFound, Forbidden, InsufficientMemory, InstanceInUse, TeamNotFound } from "../errors.js"
+import {
+  ContestNotFound,
+  Forbidden,
+  InsufficientMemory,
+  InstanceInUse,
+  ProvisionInProgress,
+  QuotaExceeded,
+  TeamNotFound
+} from "../errors.js"
 import { BenchJobRepo, ContestRepo, InstanceRepo, ProvisioningConfig, ProxmoxPort, TeamRepo, UuidGen } from "../ports.js"
 
 // スペック §HTTP API(差分): この admin 専用経路は「Terraform 製 VM の台帳
@@ -104,6 +112,14 @@ export const removeInstance = (args: { instanceId: InstanceId }) =>
 // トランザクションの外側で先に検証する(作成前に free ≥ 閾値を要求する、
 // spike メモ §リスク4)。ガード通過後は creating 行を返す(202 相当、実処理は
 // ワーカー/saga が引き継ぐ)。
+//
+// ガード順序(Task 4 レビュー M5): quota/進行中は DB 読み取りだけの安価な
+// 判定である一方、RAM ガードは Proxmox への実 HTTP 呼び出しを伴う。
+// createIfAllowed が最終的にトランザクション内で quota/進行中を原子的に
+// 再検証するため二重判定にはなるが、「軽い方を先に」失敗させることで、
+// どうせ弾かれる quota 超過/進行中のリクエストで無駄な Proxmox 呼び出しを
+// 起こさない(fail-fast)。ここでの事前チェックは非原子的(TOCTOU あり)だが、
+// 正しさの最終保証は原子的な createIfAllowed 側にあるため実害は無い。
 export const requestCreateInstance = (args: { user: User; teamId: TeamId; index: number }) =>
   Effect.gen(function* () {
     const teams = yield* TeamRepo
@@ -113,17 +129,28 @@ export const requestCreateInstance = (args: { user: User; teamId: TeamId; index:
 
     yield* assertTeamMemberOrAdmin(args.user, args.teamId)
 
+    const contests = yield* ContestRepo
+    const contest = yield* contests.getCurrent.pipe(
+      Effect.flatMap(Option.match({ onNone: () => Effect.fail(new ContestNotFound()), onSome: Effect.succeed }))
+    )
+
+    const instances = yield* InstanceRepo
+    const existing = yield* instances.listByTeam(team.id)
+    const activeCount = existing.filter((x) => x.status === "creating" || x.status === "running").length
+    if (activeCount >= contest.instanceQuota) {
+      return yield* Effect.fail(new QuotaExceeded({ teamId: team.id, quota: contest.instanceQuota }))
+    }
+    const inProgress = existing.some((x) => x.status === "creating" || x.status === "deleting")
+    if (inProgress) {
+      return yield* Effect.fail(new ProvisionInProgress({ teamId: team.id }))
+    }
+
     const config = yield* ProvisioningConfig
     const proxmox = yield* ProxmoxPort
     const freeBytes = yield* proxmox.getNodeFreeMemBytes
     if (freeBytes < config.minFreeMemBytes) {
       return yield* Effect.fail(new InsufficientMemory({ freeBytes, requiredBytes: config.minFreeMemBytes }))
     }
-
-    const contests = yield* ContestRepo
-    const contest = yield* contests.getCurrent.pipe(
-      Effect.flatMap(Option.match({ onNone: () => Effect.fail(new ContestNotFound()), onSome: Effect.succeed }))
-    )
 
     const uuidGen = yield* UuidGen
     const id = InstanceId.make(yield* uuidGen.next)
@@ -136,19 +163,23 @@ export const requestCreateInstance = (args: { user: User; teamId: TeamId; index:
       now
     })
 
-    const instances = yield* InstanceRepo
     return yield* instances.createIfAllowed(instance, contest.instanceQuota)
   })
 
-// DELETE /api/instances/:id(削除ボタン、スペック §HTTP API): running のみ受理
-// する(creating/deleting/deleted/failed からの削除要求は
-// InvalidInstanceTransition = 409。failed の残骸掃除は admin の別経路が扱う
-// 想定で、このユーザー向け経路では対象にしない)。削除対象の privateIp を
-// targetIp とする BenchJob が queued/running なら InstanceInUse(409、ベンチ
-// 対象の消失防止)。ガード通過後は beginDeleting で deleting へ遷移させ、
-// 実処理(撤収 saga)はワーカーが引き継ぐ。存在しない instanceId は「他チームの
-// インスタンス」と同じ Forbidden として扱う(cancelBench と同様、ID の存在
-// 有無を漏らさない)。
+// DELETE /api/instances/:id(削除ボタン、スペック §HTTP API): running または
+// failed を受理する(creating/deleting/deleted からの削除要求は
+// InvalidInstanceTransition = 409)。failed 許容は Task 4 レビュー I4:
+// domain の beginDeleting は running/failed 両方から deleting への遷移を
+// 許すが、旧実装はこの経路で running しか受け付けておらず、C1 の孤児 VM や
+// 途中失敗で failed になったインスタンスをユーザー自身が掃除できなかった。
+// 認可(当該チーム or admin)は従来どおり。削除対象の privateIp を targetIp
+// とする BenchJob が queued/running なら InstanceInUse(409、ベンチ対象の
+// 消失防止) — failed インスタンスは running ではないため通常このチェックに
+// 引っかかることは無いが、ガード自体は running/failed で分岐させず維持する
+// (対象 IP が偶然一致するケースを含め、単純さを優先)。ガード通過後は
+// beginDeleting で deleting へ遷移させ、実処理(撤収 saga)はワーカーが
+// 引き継ぐ。存在しない instanceId は「他チームのインスタンス」と同じ
+// Forbidden として扱う(cancelBench と同様、ID の存在有無を漏らさない)。
 export const requestDeleteInstance = (args: { user: User; instanceId: InstanceId }) =>
   Effect.gen(function* () {
     const instances = yield* InstanceRepo
@@ -158,7 +189,7 @@ export const requestDeleteInstance = (args: { user: User; instanceId: InstanceId
 
     yield* assertTeamMemberOrAdmin(args.user, instance.teamId)
 
-    if (instance.status !== "running") {
+    if (instance.status !== "running" && instance.status !== "failed") {
       return yield* Effect.fail(
         new InvalidInstanceTransition({ instanceId: instance.id, from: instance.status, to: "deleting" })
       )

@@ -1,6 +1,6 @@
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "@effect/platform"
 import { it } from "@effect/vitest"
-import { ConfigProvider, Effect, Either, Fiber, Layer, Option, TestClock } from "effect"
+import { ConfigProvider, Effect, Either, Exit, Fiber, Layer, Option, TestClock } from "effect"
 import { describe, expect } from "vitest"
 import { ProvisionTimeout, ProxmoxError, ProxmoxPort } from "../../src/application/ports.js"
 import {
@@ -52,6 +52,8 @@ const makeFakeProxmox = (
     agentPingSequence?: ReadonlyArray<"ok" | "not-ready" | "hang" | "forbidden">
     memoryFreeBytes?: number
     notFoundVmids?: ReadonlyArray<number>
+    // status/current(vmExists)を復旧不能なエラー(403 等)で応答させる vmid。
+    statusCurrentErrorVmids?: ReadonlyArray<number>
   }
 ) => {
   const requests: Array<HttpClientRequest.HttpClientRequest> = []
@@ -61,6 +63,7 @@ const makeFakeProxmox = (
   const agentPingSequence = overrides?.agentPingSequence ?? ["ok"]
   let agentPingCallCount = 0
   const notFoundVmids = new Set(overrides?.notFoundVmids ?? [])
+  const statusCurrentErrorVmids = new Set(overrides?.statusCurrentErrorVmids ?? [])
 
   const registerTask = (key: string): string => {
     const upid = `UPID:eevee:${++upidCounter}:${key}`
@@ -116,6 +119,19 @@ const makeFakeProxmox = (
       }
       const upid = registerTask("destroy")
       return Effect.succeed(jsonResponse(request, { data: upid }))
+    }
+
+    // status/current(vmExists)
+    const statusCurrentMatch = path.match(/^\/api2\/json\/nodes\/eevee\/qemu\/(\d+)\/status\/current$/)
+    if (statusCurrentMatch && method === "GET") {
+      const vmid = Number(statusCurrentMatch[1])
+      if (statusCurrentErrorVmids.has(vmid)) {
+        return Effect.succeed(jsonResponse(request, { errors: "forbidden" }, 403))
+      }
+      if (notFoundVmids.has(vmid)) {
+        return Effect.succeed(jsonResponse(request, { errors: "no such VM" }, 404))
+      }
+      return Effect.succeed(jsonResponse(request, { data: { status: "running" } }))
     }
 
     // task status polling
@@ -326,6 +342,44 @@ describe("startVm / stopAndDestroyVm", () => {
         Effect.flatMap((px) => px.stopAndDestroyVm(9999)),
         Effect.provide(portLayer(fake))
       )
+    })
+  )
+})
+
+describe("vmExists(clone 再入可能性チェック、Task 4 レビュー C1)", () => {
+  it.effect("status/current が 200 なら true", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox()
+      const exists = yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.vmExists(1101)),
+        Effect.provide(portLayer(fake))
+      )
+      expect(exists).toBe(true)
+      expect(fake.requests.some((r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/1101/status/current")).toBe(true)
+    })
+  )
+
+  it.effect("status/current が 404 なら false", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox({ notFoundVmids: [1101] })
+      const exists = yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.vmExists(1101)),
+        Effect.provide(portLayer(fake))
+      )
+      expect(exists).toBe(false)
+    })
+  )
+
+  it.effect("404/2xx 以外(例: 403)は復旧不能な ProxmoxError", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox({ statusCurrentErrorVmids: [1101] })
+      const exit = yield* Effect.exit(
+        ProxmoxPort.pipe(
+          Effect.flatMap((px) => px.vmExists(1101)),
+          Effect.provide(portLayer(fake))
+        )
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
     })
   )
 })

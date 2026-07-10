@@ -43,6 +43,54 @@ describe("makeProxmoxPortTest", () => {
     })
   )
 
+  // vmExists(Task 4 レビュー C1): cloneVm で existingVmids に追加され、
+  // stopAndDestroyVm で除去される。options.existingVmids で「クラッシュ前に
+  // clone だけ成功した」状態を直接シードできることも確認する。
+  it.effect("vmExists は cloneVm で true になり stopAndDestroyVm で false に戻る", () =>
+    Effect.gen(function* () {
+      const { getState, layer } = makeProxmoxPortTest()
+      const before = yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.vmExists(1101)),
+        Effect.provide(layer)
+      )
+      expect(before).toBe(false)
+
+      yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.cloneVm({ templateVmid: 9100, newVmid: 1101, name: "x" })),
+        Effect.provide(layer)
+      )
+      const afterClone = yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.vmExists(1101)),
+        Effect.provide(layer)
+      )
+      expect(afterClone).toBe(true)
+
+      yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.stopAndDestroyVm(1101)),
+        Effect.provide(layer)
+      )
+      const afterDestroy = yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.vmExists(1101)),
+        Effect.provide(layer)
+      )
+      expect(afterDestroy).toBe(false)
+
+      const state = yield* getState
+      expect(state.existingVmids).toStrictEqual([])
+    })
+  )
+
+  it.effect("options.existingVmids で初期状態から vmExists=true をシードできる", () =>
+    Effect.gen(function* () {
+      const { layer } = makeProxmoxPortTest({ existingVmids: [1101] })
+      const exists = yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.vmExists(1101)),
+        Effect.provide(layer)
+      )
+      expect(exists).toBe(true)
+    })
+  )
+
   it.effect("guestExec で authorized_keys 追記コマンドを検出し、重複を除いて追記する", () =>
     Effect.gen(function* () {
       const { getState, layer } = makeProxmoxPortTest()

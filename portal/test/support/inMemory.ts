@@ -403,6 +403,7 @@ export type ProxmoxOperation =
   | "waitForGuestAgent"
   | "guestExec"
   | "getNodeFreeMemBytes"
+  | "vmExists"
 
 export interface ProxmoxTestState {
   readonly clonedVmids: ReadonlyArray<number>
@@ -412,6 +413,11 @@ export interface ProxmoxTestState {
   readonly destroyedVmids: ReadonlyArray<number>
   readonly authorizedKeysByVmid: Readonly<Record<number, ReadonlyArray<string>>>
   readonly guestExecCalls: ReadonlyArray<{ vmid: number; command: ReadonlyArray<string> }>
+  // vmExists の判定元(Task 4 レビュー C1)。cloneVm で追加、stopAndDestroyVm で
+  // 除去する(実 Proxmox の「clone すれば存在し、destroy すれば消える」を模す)。
+  // 初期値は options.existingVmids で「クラッシュ前に clone だけ成功し
+  // progress 未保存のまま再開する」ケースを直接シードできる。
+  readonly existingVmids: ReadonlyArray<number>
 }
 
 const emptyProxmoxState: ProxmoxTestState = {
@@ -421,7 +427,8 @@ const emptyProxmoxState: ProxmoxTestState = {
   startedVmids: [],
   destroyedVmids: [],
   authorizedKeysByVmid: {},
-  guestExecCalls: []
+  guestExecCalls: [],
+  existingVmids: []
 }
 
 // authorized_keys への追記を模す固定コマンド(実装は
@@ -450,9 +457,12 @@ export const makeProxmoxPortTest = (
     freeMemBytes?: number
     guestAgentReady?: boolean
     failWith?: ProxmoxFailWith
+    // 「クラッシュ前に clone だけ成功したが progress は保存されなかった」を
+    // 直接シードするための初期 vmExists 状態(Task 4 レビュー C1)。
+    existingVmids?: ReadonlyArray<number>
   } = {}
 ): { layer: Layer.Layer<ProxmoxPort>; getState: Effect.Effect<ProxmoxTestState> } => {
-  const stateRef = Ref.unsafeMake(emptyProxmoxState)
+  const stateRef = Ref.unsafeMake({ ...emptyProxmoxState, existingVmids: options.existingVmids ?? [] })
   const freeMemBytes = options.freeMemBytes ?? 6_000_000_000
   const guestAgentReady = options.guestAgentReady ?? true
 
@@ -468,7 +478,11 @@ export const makeProxmoxPortTest = (
     cloneVm: ({ newVmid }) =>
       guarded(
         "cloneVm",
-        Ref.update(stateRef, (s) => ({ ...s, clonedVmids: [...s.clonedVmids, newVmid] }))
+        Ref.update(stateRef, (s) => ({
+          ...s,
+          clonedVmids: [...s.clonedVmids, newVmid],
+          existingVmids: s.existingVmids.includes(newVmid) ? s.existingVmids : [...s.existingVmids, newVmid]
+        }))
       ),
     configureCloudInit: ({ vmid }) =>
       guarded(
@@ -485,13 +499,15 @@ export const makeProxmoxPortTest = (
         "startVm",
         Ref.update(stateRef, (s) => ({ ...s, startedVmids: [...s.startedVmids, vmid] }))
       ),
-    // 冪等: 何度呼んでも destroyedVmids に重複追加しない。
+    // 冪等: 何度呼んでも destroyedVmids に重複追加しない。existingVmids から
+    // 除去することで、以後の vmExists(vmid) は false を返すようになる。
     stopAndDestroyVm: (vmid) =>
       guarded(
         "stopAndDestroyVm",
         Ref.update(stateRef, (s) => ({
           ...s,
-          destroyedVmids: s.destroyedVmids.includes(vmid) ? s.destroyedVmids : [...s.destroyedVmids, vmid]
+          destroyedVmids: s.destroyedVmids.includes(vmid) ? s.destroyedVmids : [...s.destroyedVmids, vmid],
+          existingVmids: s.existingVmids.filter((v) => v !== vmid)
         }))
       ),
     waitForGuestAgent: (vmid, timeoutMillis) => {
@@ -516,7 +532,12 @@ export const makeProxmoxPortTest = (
           return [{ exitcode: 0, out: `${updatedKeys.length} authorized_keys\n` }, nextState]
         })
       ),
-    getNodeFreeMemBytes: guarded("getNodeFreeMemBytes", Effect.succeed(freeMemBytes))
+    getNodeFreeMemBytes: guarded("getNodeFreeMemBytes", Effect.succeed(freeMemBytes)),
+    vmExists: (vmid) =>
+      guarded(
+        "vmExists",
+        Ref.get(stateRef).pipe(Effect.map((s) => s.existingVmids.includes(vmid)))
+      )
   })
 
   return { layer, getState: Ref.get(stateRef) }

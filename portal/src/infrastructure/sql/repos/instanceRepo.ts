@@ -163,6 +163,13 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
 
       // ワーカー(provisioner.ts)が 1 tick で拾う対象。creating/deleting の
       // うち最も古い(created_at 昇順、同値は id で決定的に)1 件を返す。
+      // 注意(Task 4 レビュー M6): この SELECT は行ロック(SELECT ... FOR
+      // UPDATE 相当)を取らない単純な読み取りであり、単一プロセス(ワーカーは
+      // main.ts で 1 fiber のみ forkScoped する前提、provisioner.ts のコメント
+      // 参照)がこの関数を直列に呼ぶことでのみ「同時 1 インスタンス」の排他が
+      // 成立する。複数プロセスから並行に呼ばれると同じ行を同時に拾い得る
+      // (SQLite はプロセス内シングルスレッドだが、この関数自体は競合防止を
+      // 提供しない)。
       findNextForOrchestration: wrapSqlError(
         sql<InstanceRow>`
           SELECT ${columns} FROM instances
