@@ -104,11 +104,15 @@ export const SetTeamMembersRequest = Schema.Struct({
 })
 export type SetTeamMembersRequest = typeof SetTeamMembersRequest.Type
 
-// POST /api/instances
+// POST /api/instances: admin 専用の台帳取り込み経路(スペック §HTTP API
+// 差分)。vmid は省略可能 — 省略時は従来どおり vmidFor(teamNumber, index) で
+// 計算するが、Terraform 製 VM のように式に従わない実 VM を取り込む場合は
+// vmid を明示指定して実際の Proxmox vmid と台帳を一致させる。
 export const CreateInstanceRequest = Schema.Struct({
   teamId: TeamId,
   index: Schema.Int.pipe(Schema.positive()),
-  privateIp: Schema.String
+  privateIp: Schema.String,
+  vmid: Schema.optional(Schema.Int)
 })
 export type CreateInstanceRequest = typeof CreateInstanceRequest.Type
 

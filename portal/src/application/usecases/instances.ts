@@ -43,8 +43,15 @@ export const listTeamInstances = (args: { user: User; teamId: TeamId }) =>
 // POST /api/instances: privateIp がチームサブネット外なら domain の
 // validateBenchTarget が TargetIpOutOfSubnet を返す(422 にマップ)。同一
 // (team, index) の重複は InstanceRepo.create が DuplicateInstanceIndex を
-// 返す(409 にマップ)。
-export const createInstance = (args: { teamId: TeamId; index: number; privateIp: string }) =>
+// 返す(409 にマップ)。vmid が指定されればそれをそのまま台帳に記録し
+// (Terraform 製 VM の実績 vmid を取り込む用途)、省略時は従来どおり
+// vmidFor(teamNumber, index) で計算する(後方互換)。
+export const createInstance = (args: {
+  teamId: TeamId
+  index: number
+  privateIp: string
+  vmid?: number | undefined
+}) =>
   Effect.gen(function* () {
     const teams = yield* TeamRepo
     const team = yield* teams.findById(args.teamId).pipe(
@@ -63,7 +70,7 @@ export const createInstance = (args: { teamId: TeamId; index: number; privateIp:
       id,
       teamId: args.teamId,
       index: args.index,
-      vmid: vmidFor(team.teamNumber, args.index),
+      vmid: args.vmid ?? vmidFor(team.teamNumber, args.index),
       privateIp: args.privateIp,
       status: "running",
       progress: ALL_PROVISION_STEPS,

@@ -52,6 +52,23 @@ export default Effect.gen(function* () {
     JOIN teams t ON t.id = i.team_id
   `
 
+  // fail-fast: INNER JOIN は teams に存在しない team_id を持つ孤立行を
+  // silently drop する。Migrator は各 migration を withTransaction で包む
+  // (@effect/sql の SqliteMigrator)ため、ここで行数不一致を検出して例外を
+  // 投げれば移行全体がロールバックされ、instances は元のまま残る(本番
+  // データを黙って失う事故を防ぐ安全網)。
+  const [{ sourceCount }] = yield* sql<{ sourceCount: number }>`SELECT COUNT(*) AS sourceCount FROM instances`
+  const [{ migratedCount }] = yield* sql<{
+    migratedCount: number
+  }>`SELECT COUNT(*) AS migratedCount FROM instances_new`
+  if (sourceCount !== migratedCount) {
+    yield* Effect.dieMessage(
+      `migration 0002: instances (${sourceCount} 行) と instances_new (${migratedCount} 行) の行数が一致しません。` +
+        `teams に存在しない team_id を持つ孤立 instances 行が INNER JOIN で移行されなかった可能性があります。` +
+        `SELECT * FROM instances WHERE team_id NOT IN (SELECT id FROM teams) で調査してください。`
+    )
+  }
+
   yield* sql`DROP TABLE instances`
   yield* sql`ALTER TABLE instances_new RENAME TO instances`
 

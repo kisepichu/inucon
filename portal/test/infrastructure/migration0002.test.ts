@@ -79,6 +79,50 @@ layer("migration 0002: 既存 active 行の移行", (it) => {
   )
 })
 
+layer("migration 0002: fail-fast(孤立 instances 行の安全網)", (it) => {
+  it.effect("teams に無い team_id を持つ孤立行があると 0002 は失敗し instances は元のまま残る", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient
+      yield* migration0001
+
+      yield* insertTeam(sql, { id: "team-orphan-ok", teamNumber: 30 })
+      yield* insertLegacyActiveInstance(sql, {
+        id: "inst-ok",
+        teamId: "team-orphan-ok",
+        idx: 1,
+        privateIp: "10.100.30.11"
+      })
+      // teams に存在しない team_id を持つ孤立行(INNER JOIN では drop される)。
+      // instances.team_id は REFERENCES teams(id) かつ better-sqlite3 は
+      // foreign_keys が既定 ON のため、通常の INSERT では作れない(過去の
+      // データ不整合や手動修復スクリプトなど FK 検査が外れていた状況を模す
+      // ため、この行の挿入だけ一時的に FK 検査を OFF にする)。
+      yield* sql`PRAGMA foreign_keys = OFF`
+      yield* insertLegacyActiveInstance(sql, {
+        id: "inst-orphan",
+        teamId: "team-does-not-exist",
+        idx: 1,
+        privateIp: "10.100.99.11"
+      })
+      yield* sql`PRAGMA foreign_keys = ON`
+
+      // Migrator 本体は各 migration を withTransaction で包む
+      // (@effect/sql の Migrator.js)。それを模して 0002 をトランザクション内で
+      // 実行し、fail-fast のロールバックが機能することを確認する。
+      const exit = yield* Effect.exit(sql.withTransaction(migration0002))
+      expect(exit._tag).toBe("Failure")
+
+      // ロールバックにより instances は 0001 のスキーマ・行のまま残る
+      // (instances_new も DROP TABLE も実行されていない)。
+      const rows = yield* sql<{ id: string; status: string }>`
+        SELECT id, status FROM instances ORDER BY id
+      `
+      expect(rows.map((r) => r.id)).toStrictEqual(["inst-ok", "inst-orphan"])
+      expect(rows.every((r) => r.status === "active")).toBe(true)
+    })
+  )
+})
+
 layer("migration 0002: 新規カラム/テーブル", (it) => {
   it.effect("contests.instance_quota / users.email / team_invites が作られる", () =>
     Effect.gen(function* () {

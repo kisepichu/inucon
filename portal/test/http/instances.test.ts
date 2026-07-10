@@ -146,6 +146,40 @@ describe("POST /api/instances", () => {
     }).pipe(Effect.provide(TestLayer))
   )
 
+  it.effect("vmid 省略時は vmidFor(teamNumber, index) の計算値が保存される", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const team = new Team({ id: TeamId.make("team-createinst-vmid-default"), name: "CreateInst VmidDefault", teamNumber: 55 })
+      yield* teams.create(team)
+
+      const { cookieHeader } = yield* asAdmin()
+      const res = yield* post(cookieHeader, { teamId: team.id, index: 1, privateIp: "10.100.55.10" })
+      expect(res.status).toBe(200)
+      const body = (yield* res.json) as { vmid: number }
+      // vmidFor(teamNumber=55, index=1) = 1000 + 55*100 + 1 = 6501
+      expect(body.vmid).toBe(6501)
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("vmid 明示指定時はその値が vmidFor の計算式を無視して保存される(Terraform 製 VM の台帳取り込み)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const team = new Team({ id: TeamId.make("team-createinst-vmid-explicit"), name: "CreateInst VmidExplicit", teamNumber: 56 })
+      yield* teams.create(team)
+
+      const { cookieHeader } = yield* asAdmin()
+      // vmidFor(56, 1) = 6601 になるはずだが、実 VM の vmid(9999)を明示指定する
+      const res = yield* post(cookieHeader, { teamId: team.id, index: 1, privateIp: "10.100.56.10", vmid: 9999 })
+      expect(res.status).toBe(200)
+      const body = (yield* res.json) as { vmid: number }
+      expect(body.vmid).toBe(9999)
+
+      const instances = yield* InstanceRepo
+      const listed = yield* instances.listByTeam(team.id)
+      expect(listed[0].vmid).toBe(9999)
+    }).pipe(Effect.provide(TestLayer))
+  )
+
   it.effect("同一 (team, index) の二重登録は409(HttpApiClient でも型付きエラーとして decode できる)", () =>
     Effect.gen(function* () {
       const teams = yield* TeamRepo
