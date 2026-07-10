@@ -146,6 +146,9 @@ const WorkerLive = TimeoutSweeperLive.pipe(
   Layer.provide(MigratorLive)
 )
 
-const MainLive = Layer.mergeAll(HttpLive, MigratorLive, WorkerLive, SeedInitLive)
+// migration/seed は HttpLive・WorkerLive の依存(Layer.provide)経由で実行される
+// (メモ化により 1 回だけ)。トップレベルにはそれらを消費するコンポーネント
+// だけを並べ、順序は依存グラフに任せる。
+const MainLive = Layer.mergeAll(HttpLive, WorkerLive)
 
 Layer.launch(MainLive).pipe(NodeRuntime.runMain)
