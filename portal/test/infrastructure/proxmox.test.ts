@@ -49,7 +49,7 @@ interface TaskState {
 const makeFakeProxmox = (
   overrides?: {
     tasks?: Record<string, ReadonlyArray<{ status: string; exitstatus?: string }>>
-    agentPingSequence?: ReadonlyArray<"ok" | "not-ready" | "hang">
+    agentPingSequence?: ReadonlyArray<"ok" | "not-ready" | "hang" | "forbidden">
     memoryFreeBytes?: number
     notFoundVmids?: ReadonlyArray<number>
   }
@@ -156,6 +156,10 @@ const makeFakeProxmox = (
       }
       if (outcome === "ok") {
         return Effect.succeed(jsonResponse(request, { data: {} }))
+      }
+      if (outcome === "forbidden") {
+        // トークン不正等、復旧不能なケース(pollUntil の deadline を待たず即 fail すべき)。
+        return Effect.succeed(jsonResponse(request, { errors: "invalid token" }, 403))
       }
       return Effect.succeed(jsonResponse(request, { data: "QEMU guest agent is not running" }, 500))
     }
@@ -366,6 +370,42 @@ describe("waitForGuestAgent", () => {
       expect(Either.isLeft(result)).toBe(true)
       if (Either.isLeft(result)) {
         expect(result.left).toBeInstanceOf(ProvisionTimeout)
+      }
+    })
+  )
+
+  it.effect("500(guest agent not running)が返る間はリトライし、最終的に 200 で ready になる", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox({ agentPingSequence: ["not-ready", "not-ready", "not-ready", "ok"] })
+      const fiber = yield* Effect.fork(
+        ProxmoxPort.pipe(
+          Effect.flatMap((px) => px.waitForGuestAgent(1101, 30_000)),
+          Effect.provide(portLayer(fake))
+        )
+      )
+      yield* TestClock.adjust("2 seconds")
+      yield* TestClock.adjust("2 seconds")
+      yield* TestClock.adjust("2 seconds")
+      const result = yield* Fiber.join(fiber)
+      expect(result).toBeUndefined()
+    })
+  )
+
+  it.effect("403(トークン不正)が返ると即 ProxmoxError で fail する(タイムアウトを待たない)", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox({ agentPingSequence: ["forbidden"] })
+      const fiber = yield* Effect.fork(
+        ProxmoxPort.pipe(
+          Effect.flatMap((px) => px.waitForGuestAgent(1101, 60_000)),
+          Effect.provide(portLayer(fake))
+        )
+      )
+      // deadline(60 秒)まで進めなくても、最初の attempt だけで即 fail するはず。
+      yield* TestClock.adjust("1 second")
+      const result = yield* Fiber.join(fiber).pipe(Effect.either)
+      expect(Either.isLeft(result)).toBe(true)
+      if (Either.isLeft(result)) {
+        expect(result.left).toBeInstanceOf(ProxmoxError)
       }
     })
   )

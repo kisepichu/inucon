@@ -246,13 +246,28 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
           if (Option.isSome(deleteUpid)) yield* waitForTask(deleteUpid.value)
         }),
 
+      // guest agent 未起動時、Proxmox は agent/ping に 500(QEMU guest agent is not
+      // running)を返す。これは「まだ ready でない」= リトライすべきケース。
+      // 一方 401/403(トークン不正)・404(VM 不在)などそれ以外の非 2xx、および
+      // client.execute 自体の失敗(ネットワーク層)は復旧不能なので pollUntil の
+      // deadline を待たず ProxmoxError で即 fail させる(pollUntil はこの E を
+      // 素通しし、false のときだけリトライする)。
       waitForGuestAgent: (vmid, timeoutMillis) =>
-        pollUntil({
-          attempt: client.execute(HttpClientRequest.post(`${nodeUrl}/qemu/${vmid}/agent/ping`)).pipe(
-            Effect.map((response) => response.status >= 200 && response.status < 300),
-            Effect.scoped,
-            Effect.orElseSucceed(() => false)
-          ),
+        pollUntil<boolean, ProxmoxError | ProvisionTimeout>({
+          attempt: Effect.suspend(() => {
+            const req = HttpClientRequest.post(`${nodeUrl}/qemu/${vmid}/agent/ping`)
+            return client.execute(req).pipe(
+              Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) })),
+              Effect.flatMap((response) => {
+                if (response.status >= 200 && response.status < 300) return Effect.succeed(true)
+                if (response.status >= 500 && response.status < 600) return Effect.succeed(false)
+                return Effect.fail(
+                  new ProxmoxError({ cause: `Proxmox API ${req.method} ${requestPath(req)} → ${response.status}` })
+                )
+              }),
+              Effect.scoped
+            )
+          }),
           isDone: (ready: boolean) => ready,
           intervalMillis: GUEST_AGENT_POLL_INTERVAL_MILLIS,
           timeoutMillis,
