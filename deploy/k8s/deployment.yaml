@@ -1,0 +1,69 @@
+# Deployment: replicas=1 固定(SQLite 単一ファイルのため水平スケール不可)。
+# strategy=Recreate: RollingUpdate だと新旧 Pod が同時に立ち上がろうとして
+# ReadWriteOnce の PVC を取り合い、新 Pod が Pending のまま詰まる。数秒の
+# ダウンタイムは許容(スペック §リスク・未確認事項)。
+#
+# 環境変数: GITHUB_CLIENT_ID/SECRET・ADMIN_GITHUB_LOGINS・RUNNER_TOKEN・
+# BASE_URL(・任意で JOB_TIMEOUT_MILLIS)は Secret `inucon-portal-env` から
+# envFrom で注入する(README の Secret 作成手順を参照)。PORT/DB_PATH は
+# 環境をまたいで変わらないためここに直書きする。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inucon-portal
+  namespace: inucon
+  labels:
+    app: inucon-portal
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: inucon-portal
+  template:
+    metadata:
+      labels:
+        app: inucon-portal
+    spec:
+      containers:
+        - name: portal
+          image: ghcr.io/kisepichu/inucon-portal:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: DB_PATH
+              value: /data/portal.db
+          envFrom:
+            - secretRef:
+                name: inucon-portal-env
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: inucon-portal-data

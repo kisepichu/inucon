@@ -4,10 +4,17 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/api.ts",
-    "./schemas": "./src/schemas.ts"
+    ".": {
+      "development": "./src/api.ts",
+      "default": "./dist/api.js"
+    },
+    "./schemas": {
+      "development": "./src/schemas.ts",
+      "default": "./dist/schemas.js"
+    }
   },
   "scripts": {
+    "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",
     "test": "echo \"no tests\" && exit 0"
   },

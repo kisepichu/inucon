@@ -18,6 +18,7 @@ import { TeamsLive } from "./infrastructure/http/handlers/teams.js"
 import { AdminOnlyLive, AuthenticationLive, RunnerAuthLive } from "./infrastructure/http/middleware.js"
 import { makeStaticMiddleware } from "./infrastructure/http/static.js"
 import { MigratorLive, SqlLive } from "./infrastructure/sql/client.js"
+import { SeedLive } from "./infrastructure/sql/seed.js"
 import { BenchJobRepoLive } from "./infrastructure/sql/repos/benchJobRepo.js"
 import { ContestRepoLive } from "./infrastructure/sql/repos/contestRepo.js"
 import { InstanceRepoLive } from "./infrastructure/sql/repos/instanceRepo.js"
@@ -137,6 +138,11 @@ const WorkerLive = TimeoutSweeperLive.pipe(
   Layer.provide(MigratorLive)
 )
 
-const MainLive = Layer.mergeAll(HttpLive, MigratorLive, WorkerLive)
+// 起動時シード(Task 11): 空の DB に対して INUCON コンテストを 1 件投入する。
+// ReposLive/MigratorLive は HttpLive・WorkerLive と同一の参照なので、
+// Layer のメモ化により SqlClient・Migrator の実行はプロセス全体で 1 回だけ。
+const SeedInitLive = SeedLive.pipe(Layer.provide(ReposLive), Layer.provide(MigratorLive))
+
+const MainLive = Layer.mergeAll(HttpLive, MigratorLive, WorkerLive, SeedInitLive)
 
 Layer.launch(MainLive).pipe(NodeRuntime.runMain)

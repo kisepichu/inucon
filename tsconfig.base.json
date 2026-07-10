@@ -3,6 +3,7 @@
     "strict": true,
     "module": "nodenext",
     "moduleResolution": "nodenext",
+    "customConditions": ["development"],
     "target": "es2022",
     "esModuleInterop": true,
     "skipLibCheck": true,

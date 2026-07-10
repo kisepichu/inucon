@@ -1,0 +1,15 @@
+# SQLite 単一ファイルを永続化する PVC。apphost k3s の local-path-provisioner
+# (k3s 同梱の StorageClass "local-path")を使う。ReadWriteOnce + replicas=1
+# 前提(スペック §リスク・未確認事項「SQLite 単一ファイル + k3s PVC」)。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: inucon-portal-data
+  namespace: inucon
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
