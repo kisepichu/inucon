@@ -396,7 +396,12 @@ export const ProxmoxHttpClientLive: Layer.Layer<HttpClient.HttpClient, ConfigErr
             }
           : {
               rejectUnauthorized: false,
-              checkServerIdentity: (_host, cert) => verifyFingerprintMatch(policy.fingerprint256, cert.fingerprint256)
+              // insecure 分岐と同様に、接続先ホストを PROXMOX_API_URL のホストに
+              // 限定してからフィンガープリントを判定する(この Layer が誤って別
+              // ホストへの HttpClient に provide された場合の防御)。
+              checkServerIdentity: (host, cert) =>
+                verifyInsecureHost(proxmoxHost, host) ??
+                verifyFingerprintMatch(policy.fingerprint256, cert.fingerprint256)
             }
 
       return NodeHttpClient.layerWithoutAgent.pipe(Layer.provide(NodeHttpClient.makeAgentLayer(agentOptions)))
