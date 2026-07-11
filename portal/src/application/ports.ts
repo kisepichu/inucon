@@ -11,6 +11,7 @@ import {
 import type { BenchJobId, InstanceId, TeamId, UserId } from "../domain/ids.js"
 import type { Instance } from "../domain/instance.js"
 import type { Team } from "../domain/team.js"
+import type { TeamInvite } from "../domain/teamInvite.js"
 import type { User } from "../domain/user.js"
 import { ProvisionInProgress, QuotaExceeded } from "./errors.js"
 
@@ -64,6 +65,10 @@ export class UserRepo extends Context.Tag("app/UserRepo")<
     readonly findManyByGithubLogins: (
       logins: ReadonlyArray<string>
     ) => Effect.Effect<ReadonlyArray<User>, RepoError>
+    // POST /api/admin/teams/:id/invites(Phase 3、Task 5): Access ログイン用
+    // メールを更新する。既ログインユーザーへの即時招待、および初ログイン時の
+    // team_invites 消費(auth.ts)の両方から呼ばれる。
+    readonly setEmail: (id: UserId, email: string) => Effect.Effect<void, RepoError>
   }
 >() {}
 
@@ -88,7 +93,25 @@ export class TeamRepo extends Context.Tag("app/TeamRepo")<
     // RETURNING」の単一原子的操作で TOCTOU を回避する、SQLite 実装)。
     readonly create: (t: Team) => Effect.Effect<void, RepoError | TeamNumberConflict>
     readonly setMembers: (teamId: TeamId, userIds: ReadonlyArray<UserId>) => Effect.Effect<void, RepoError>
+    // 単一メンバーの追加(全量置換の setMembers とは別に、Phase 3 の招待
+    // フローが使う)。冪等: 既に(どのチームであれ)所属済みの userId は
+    // 何もしない(team_members.user_id は UNIQUE のため、呼び出し元が
+    // 事前に「他チーム所属していないか」を確認してから呼ぶ前提)。
+    readonly addMember: (teamId: TeamId, userId: UserId) => Effect.Effect<void, RepoError>
     readonly listMembers: (teamId: TeamId) => Effect.Effect<ReadonlyArray<User>, RepoError>
+  }
+>() {}
+
+// team_invites テーブル(migration 0002)の CRUD。githubLogin が PK なので
+// 同一 login への再招待は team/email の上書き(create = upsert)でよい
+// (スペック §Invite「同一 login の再招待は team/email 更新でよい」)。
+export class InviteRepo extends Context.Tag("app/InviteRepo")<
+  InviteRepo,
+  {
+    readonly create: (invite: TeamInvite) => Effect.Effect<void, RepoError>
+    readonly findByGithubLogin: (githubLogin: string) => Effect.Effect<Option.Option<TeamInvite>, RepoError>
+    readonly delete: (githubLogin: string) => Effect.Effect<void, RepoError>
+    readonly listByTeam: (teamId: TeamId) => Effect.Effect<ReadonlyArray<TeamInvite>, RepoError>
   }
 >() {}
 

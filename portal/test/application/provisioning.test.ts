@@ -25,6 +25,7 @@ import {
   makeContestRepoTest,
   makeGithubKeysPortTest,
   makeInstanceRepoTest,
+  makeInviteRepoTest,
   makeProxmoxPortTest,
   makeTeamRepoTest,
   ProvisioningConfigTest,
@@ -91,6 +92,9 @@ const githubKeysLayer = makeGithubKeysPortTest({
   bob: ["ssh-rsa BBBB bob@host"],
   carol: ["ssh-ed25519 CCCC carol@host"]
 })
+
+// 招待ゼロ(team_invites 空)。collectTeamAccess はメンバーのみを集約する。
+const inviteRepoLayer = makeInviteRepoTest([])
 
 const contestLayer = (instanceQuota = 3) =>
   makeContestRepoTest(
@@ -397,7 +401,7 @@ describe("collectTeamAccess", () => {
       const access = yield* collectTeamAccess(team1Id)
       expect(access.emails).toStrictEqual(["alice@example.com"])
       expect([...access.sshKeys].sort()).toStrictEqual(["ssh-ed25519 AAAA alice@host", "ssh-rsa BBBB bob@host"])
-    }).pipe(Effect.provide(Layer.mergeAll(teamRepoLayer, githubKeysLayer)))
+    }).pipe(Effect.provide(Layer.mergeAll(teamRepoLayer, githubKeysLayer, inviteRepoLayer)))
   )
 
   it.effect("鍵未登録(GithubKeysError)のメンバーはスキップして続行する", () =>
@@ -406,7 +410,16 @@ describe("collectTeamAccess", () => {
       // carol は鍵未登録スタブ(下記)なので鍵は空だがメールは残る。
       expect(access.emails).toStrictEqual(["carol@example.com"])
       expect(access.sshKeys).toStrictEqual([])
-    }).pipe(Effect.provide(Layer.mergeAll(teamRepoLayer, makeGithubKeysPortTest({}))))
+    }).pipe(Effect.provide(Layer.mergeAll(teamRepoLayer, makeGithubKeysPortTest({}), inviteRepoLayer)))
+  )
+
+  it.effect("email 未登録メンバーは missingEmailLogins に載る(Access には含めない)", () =>
+    Effect.gen(function* () {
+      const access = yield* collectTeamAccess(team1Id)
+      // bob は email 未設定。emails には載らず、missingEmailLogins に github_login。
+      expect(access.emails).toStrictEqual(["alice@example.com"])
+      expect(access.missingEmailLogins).toStrictEqual(["bob"])
+    }).pipe(Effect.provide(Layer.mergeAll(teamRepoLayer, githubKeysLayer, inviteRepoLayer)))
   )
 })
 
@@ -421,6 +434,7 @@ describe("runProvisioning(払い出し saga)", () => {
         makeInstanceRepoTest([initial]),
         teamRepoLayer,
         githubKeysLayer,
+        inviteRepoLayer,
         proxmox.layer,
         cloudflare.layer,
         ProvisioningConfigTest()
@@ -444,6 +458,7 @@ describe("runProvisioning(払い出し saga)", () => {
         makeInstanceRepoTest([initial]),
         teamRepoLayer,
         githubKeysLayer,
+        inviteRepoLayer,
         proxmox.layer,
         cloudflare.layer,
         ProvisioningConfigTest()
@@ -542,6 +557,7 @@ describe("runProvisioning(払い出し saga)", () => {
         makeInstanceRepoTest([initial]),
         teamRepoLayer,
         githubKeysLayer,
+        inviteRepoLayer,
         proxmox.layer,
         cloudflare.layer,
         ProvisioningConfigTest()
@@ -575,6 +591,7 @@ describe("runProvisioning(払い出し saga)", () => {
           makeInstanceRepoTest([initial]),
           teamRepoLayer,
           githubKeysLayer,
+          inviteRepoLayer,
           proxmox.layer,
           cloudflare.layer,
           ProvisioningConfigTest()
@@ -598,6 +615,7 @@ describe("runProvisioning(払い出し saga)", () => {
         makeInstanceRepoTest([initial]),
         teamRepoLayer,
         githubKeysLayer,
+        inviteRepoLayer,
         proxmox.layer,
         cloudflare.layer,
         ProvisioningConfigTest({ minFreeMemBytes: 5_000_000_000 })
@@ -624,6 +642,7 @@ describe("runProvisioning(払い出し saga)", () => {
         makeInstanceRepoTest([initial]),
         teamRepoLayer,
         githubKeysLayer,
+        inviteRepoLayer,
         proxmox.layer,
         cloudflare.layer,
         ProvisioningConfigTest({ minFreeMemBytes: 5_000_000_000 })

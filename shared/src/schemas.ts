@@ -121,6 +121,49 @@ export const CreateInstanceRequest = Schema.Struct({
 })
 export type CreateInstanceRequest = typeof CreateInstanceRequest.Type
 
+// POST /api/admin/teams/:id/invites(admin。スペック §招待フロー)。email は
+// Access ログイン用(admin 入力。GitHub からは取得しない)。
+export const InviteRequest = Schema.Struct({
+  githubLogin: Schema.String,
+  email: Schema.String
+})
+export type InviteRequest = typeof InviteRequest.Type
+
+// GET /api/admin/teams/:id/invites: 招待中(未消費)の team_invites 行。
+export const TeamInvite = Schema.Struct({
+  githubLogin: Schema.String,
+  teamId: TeamId,
+  email: Schema.String,
+  invitedAt: Schema.Int
+})
+export type TeamInvite = typeof TeamInvite.Type
+
+// 招待 API の結果(スペック §招待フロー: 3 点の成否 + email 未登録 warning)。
+// portal は即所属("assigned")か事前招待("pending")か。access は Access
+// ポリシー更新の成否、sshKeys は各 running インスタンスへの鍵注入の成否。
+// warnings は email 未登録のため Access に載せられなかったメンバーの
+// githubLogin 一覧(黙って外さないための可視化)。
+export const InviteSshKeyResult = Schema.Struct({
+  instance: InstanceId,
+  ok: Schema.Boolean,
+  error: Schema.optional(Schema.String)
+})
+export type InviteSshKeyResult = typeof InviteSshKeyResult.Type
+
+export const InviteAccessResult = Schema.Struct({
+  ok: Schema.Boolean,
+  error: Schema.optional(Schema.String)
+})
+export type InviteAccessResult = typeof InviteAccessResult.Type
+
+export const InviteResult = Schema.Struct({
+  portal: Schema.Literal("assigned", "pending"),
+  access: InviteAccessResult,
+  sshKeys: Schema.Array(InviteSshKeyResult),
+  warnings: Schema.Array(Schema.String)
+})
+export type InviteResult = typeof InviteResult.Type
+
 export const BenchJobId = Schema.String.pipe(Schema.brand("BenchJobId"))
 export type BenchJobId = typeof BenchJobId.Type
 

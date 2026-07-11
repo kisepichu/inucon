@@ -19,6 +19,8 @@ import {
   EnqueueBenchRequest,
   Instance,
   InstanceId,
+  InviteRequest,
+  InviteResult,
   JobAction,
   Me,
   PollJobResponse,
@@ -28,6 +30,7 @@ import {
   SetTeamMembersRequest,
   Team,
   TeamId,
+  TeamInvite,
   TeamWithMembers,
   User
 } from "./schemas.js"
@@ -287,6 +290,23 @@ export const adminGroup = HttpApiGroup.make("admin")
       .addSuccess(Contest)
       .addError(NotFound)
       .addError(InvalidContestTransition)
+      .middleware(AdminOnly)
+  )
+  // 招待(admin。スペック §招待フロー): users にいれば即所属 + email 更新、
+  // いなければ team_invites 作成。全 running インスタンスの Access/鍵を
+  // 同期して 3 点の成否 + warning を返す。他チーム所属ユーザーは 409。
+  .add(
+    HttpApiEndpoint.post("inviteMember")`/api/admin/teams/${HttpApiSchema.param("id", TeamId)}/invites`
+      .setPayload(InviteRequest)
+      .addSuccess(InviteResult)
+      .addError(NotFound)
+      .addError(MemberConflict)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.get("listInvites")`/api/admin/teams/${HttpApiSchema.param("id", TeamId)}/invites`
+      .addSuccess(Schema.Array(TeamInvite))
+      .addError(NotFound)
       .middleware(AdminOnly)
   )
 

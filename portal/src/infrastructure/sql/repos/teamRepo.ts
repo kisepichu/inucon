@@ -93,6 +93,19 @@ export const TeamRepoLive: Layer.Layer<TeamRepo, never, SqlClient.SqlClient> = L
           )
         ),
 
+      // 単一メンバーの追加(Phase 3 招待フロー)。team_members.user_id は
+      // UNIQUE のため、既に(どのチームであれ)所属済みなら ON CONFLICT で
+      // 何もしない(冪等。他チームからの横取り防止は呼び出し元
+      // (application/usecases/invites.ts・auth.ts)が事前に findByUserId で
+      // 判定する責務)。
+      addMember: (teamId: TeamId, userId: UserId) =>
+        wrapSqlError(
+          sql`
+            INSERT INTO team_members (team_id, user_id) VALUES (${teamId}, ${userId})
+            ON CONFLICT (user_id) DO NOTHING
+          `
+        ).pipe(Effect.asVoid),
+
       listMembers: (teamId: TeamId) =>
         wrapSqlError(
           sql<UserRow>`

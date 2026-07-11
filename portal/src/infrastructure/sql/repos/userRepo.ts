@@ -69,7 +69,10 @@ export const UserRepoLive: Layer.Layer<UserRepo, never, SqlClient.SqlClient | Uu
                        display_name AS displayName, is_admin AS isAdmin, email
                 FROM users WHERE ${sql.in("github_login", logins)}
               `
-            ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeUser)))
+            ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeUser))),
+
+      setEmail: (id: UserId, email: string) =>
+        wrapSqlError(sql`UPDATE users SET email = ${email} WHERE id = ${id}`).pipe(Effect.asVoid)
     }
   })
 )
