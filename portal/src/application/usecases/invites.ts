@@ -108,6 +108,11 @@ const syncRunningInstances = (
 // 1. users に存在すれば即所属(team_members へ INSERT)+ email 更新。
 //    既に他チームに所属していれば MemberConflict(409)。同一チームに
 //    既に所属していれば email 更新のみ(冪等)。
+//    findByUserId で「未所属」と判定してから addMember するまでの間に別の
+//    招待が同一ユーザーを別チームへ追加する競合(TOCTOU)は、addMember 自体
+//    (TeamRepo.addMember)が原子的に「追加できたか」を返すことで検出する。
+//    追加できなかった場合は実際の所属先を再確認し、要求チームと同じなら
+//    冪等成功、異なれば MemberConflict とする。
 // 2. 存在しなければ team_invites に upsert(初ログイン時に auth.ts が消費)。
 // 3. どちらの場合も、そのチームの全 running インスタンスへ Access/鍵を
 //    同期する(syncRunningInstances、全ステップ冪等)。
@@ -138,7 +143,17 @@ export const inviteMember = (args: {
         return yield* Effect.fail(new MemberConflict({ logins: [args.githubLogin] }))
       }
       if (Option.isNone(currentTeam)) {
-        yield* teams.addMember(args.teamId, user.id).pipe(Effect.orDie)
+        const added = yield* teams.addMember(args.teamId, user.id).pipe(Effect.orDie)
+        if (!added) {
+          // TOCTOU: 上の findByUserId で「未所属」と見えた後、この addMember
+          // までの間に別の招待(または同時実行)がこのユーザーをどこかの
+          // チームへ追加した。実際の所属先を再確認し、要求チームと同じなら
+          // 冪等成功、異なれば横取りとして MemberConflict にする。
+          const actualTeam = yield* teams.findByUserId(user.id).pipe(Effect.orDie)
+          if (Option.isNone(actualTeam) || actualTeam.value.id !== args.teamId) {
+            return yield* Effect.fail(new MemberConflict({ logins: [args.githubLogin] }))
+          }
+        }
       }
       yield* users.setEmail(user.id, args.email).pipe(Effect.orDie)
       portal = "assigned"

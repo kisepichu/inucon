@@ -295,8 +295,12 @@ describe("inviteMember", () => {
     const { layer } = baseLayer()
 
     return Effect.gen(function* () {
-      yield* inviteMember({ teamId: team1Id, githubLogin: "alice", email: "alice-new@example.com" })
-      yield* inviteMember({ teamId: team1Id, githubLogin: "alice", email: "alice-new@example.com" })
+      const first = yield* inviteMember({ teamId: team1Id, githubLogin: "alice", email: "alice-new@example.com" })
+      const second = yield* inviteMember({ teamId: team1Id, githubLogin: "alice", email: "alice-new@example.com" })
+
+      // 同じチームへの再招待は例外にならず、両方とも assigned(冪等)。
+      expect(first.portal).toBe("assigned")
+      expect(second.portal).toBe("assigned")
 
       const teams = yield* TeamRepo
       const members = yield* teams.listMembers(team1Id)
@@ -307,4 +311,92 @@ describe("inviteMember", () => {
       expect(Option.getOrNull(Option.flatMap(updatedAlice, (u) => u.email))).toBe("alice-new@example.com")
     }).pipe(Effect.provide(layer))
   })
+
+  it.effect(
+    "TOCTOU: findByUserId 後に addMember が競合で失敗した場合、要求チームと同じ所属なら冪等 assigned",
+    () => {
+      // dave はどのチームにも未所属。addMember を「呼ばれたら要求どおり
+      // team1 へ追加した上で false(=このコールでは新規追加できなかった)を
+      // 返す」よう差し替え、findByUserId チェック後に別リクエストが先に
+      // 同じチームへ追加を終えていた、という競合状況を再現する。
+      const daveId = UserId.make("dddddddd-dddd-dddd-dddd-dddddddddddd")
+      const dave = new User({
+        id: daveId,
+        githubId: 4,
+        githubLogin: "dave",
+        displayName: "Dave",
+        isAdmin: false,
+        email: Option.none()
+      })
+      const { layer } = baseLayer({ users: [alice, bob, carol, dave] })
+      const racyTeamRepoLayer = Layer.effect(
+        TeamRepo,
+        Effect.gen(function* () {
+          const teams = yield* TeamRepo
+          return {
+            ...teams,
+            addMember: (teamId: TeamId, userId: UserId) =>
+              Effect.gen(function* () {
+                yield* teams.addMember(teamId, userId)
+                return false
+              })
+          }
+        })
+      ).pipe(Layer.provide(layer))
+
+      return Effect.gen(function* () {
+        const result = yield* inviteMember({ teamId: team1Id, githubLogin: "dave", email: "dave@example.com" })
+        expect(result.portal).toBe("assigned")
+
+        const teams = yield* TeamRepo
+        const daveTeam = yield* teams.findByUserId(daveId)
+        expect(daveTeam).toStrictEqual(Option.some(team1))
+      }).pipe(Effect.provide(Layer.mergeAll(layer, racyTeamRepoLayer)))
+    }
+  )
+
+  it.effect(
+    "TOCTOU: findByUserId 後に addMember が競合で失敗し、実際は別チームに追加されていた場合 MemberConflict",
+    () => {
+      // dave はどのチームにも未所属。addMember を「呼ばれたら要求とは異なる
+      // team2 へ追加した上で false を返す」よう差し替え、findByUserId
+      // チェック後に別リクエストが先に別チームへ横取りしていた、という
+      // 競合状況を再現する。
+      const daveId = UserId.make("dddddddd-dddd-dddd-dddd-dddddddddddd")
+      const dave = new User({
+        id: daveId,
+        githubId: 4,
+        githubLogin: "dave",
+        displayName: "Dave",
+        isAdmin: false,
+        email: Option.none()
+      })
+      const { layer } = baseLayer({ users: [alice, bob, carol, dave] })
+      const racyTeamRepoLayer = Layer.effect(
+        TeamRepo,
+        Effect.gen(function* () {
+          const teams = yield* TeamRepo
+          return {
+            ...teams,
+            addMember: (_teamId: TeamId, userId: UserId) =>
+              Effect.gen(function* () {
+                yield* teams.addMember(team2Id, userId)
+                return false
+              })
+          }
+        })
+      ).pipe(Layer.provide(layer))
+
+      return Effect.gen(function* () {
+        const exit = yield* Effect.exit(
+          inviteMember({ teamId: team1Id, githubLogin: "dave", email: "dave@example.com" })
+        )
+        expect(exit).toStrictEqual(Exit.fail(new MemberConflict({ logins: ["dave"] })))
+
+        const teams = yield* TeamRepo
+        const daveTeam = yield* teams.findByUserId(daveId)
+        expect(daveTeam).toStrictEqual(Option.some(team2))
+      }).pipe(Effect.provide(Layer.mergeAll(layer, racyTeamRepoLayer)))
+    }
+  )
 })

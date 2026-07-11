@@ -35,7 +35,11 @@ export const handleOAuthCallback = (args: {
     // 事前招待(未ログインユーザー宛)があれば、このログインで自動所属し、
     // Access ログイン用メール(users.email)を引き継ぎ、invite 行を削除する。
     // 冪等: 既にどこかのチームへ所属済みなら addMember はスキップし(横取り
-    // 防止)、invite 行の消費(削除)だけ行う。
+    // 防止)、invite 行の消費(削除)だけ行う。addMember は TeamRepo.addMember
+    // の原子的判定(TOCTOU 回避)により false(追加できなかった)を返し得るが、
+    // その場合も同じユーザー・同じ invite の team_id で呼んでいるため既に
+    // 目的のチームへ所属済みであり、以降の setEmail/delete のみで冪等に完了
+    // する(結果は使わず捨ててよい)。
     const user = yield* consumeInviteOnFirstLogin(upserted)
 
     const sessions = yield* SessionRepo

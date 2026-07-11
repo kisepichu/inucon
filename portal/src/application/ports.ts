@@ -94,10 +94,16 @@ export class TeamRepo extends Context.Tag("app/TeamRepo")<
     readonly create: (t: Team) => Effect.Effect<void, RepoError | TeamNumberConflict>
     readonly setMembers: (teamId: TeamId, userIds: ReadonlyArray<UserId>) => Effect.Effect<void, RepoError>
     // 単一メンバーの追加(全量置換の setMembers とは別に、Phase 3 の招待
-    // フローが使う)。冪等: 既に(どのチームであれ)所属済みの userId は
-    // 何もしない(team_members.user_id は UNIQUE のため、呼び出し元が
-    // 事前に「他チーム所属していないか」を確認してから呼ぶ前提)。
-    readonly addMember: (teamId: TeamId, userId: UserId) => Effect.Effect<void, RepoError>
+    // フローが使う)。TOCTOU 回避のため「INSERT ... WHERE NOT EXISTS
+    // (SELECT 1 FROM team_members WHERE user_id = ...) RETURNING」の単一
+    // 原子的操作で判定する(TeamRepo.create と同型)。戻り値は「実際にこの
+    // 呼び出しで追加できたか」: true = このチームへ新規追加した / false =
+    // (呼び出し元の findByUserId チェック後、この INSERT までの間に競合した
+    // 別の呼び出しなどで)既に何らかのチームに所属していて追加されなかった。
+    // 呼び出し元(application/usecases/invites.ts・auth.ts)は false の場合、
+    // 実際の所属チームを再確認して「要求チームと同じなら冪等成功」
+    // 「異なるなら MemberConflict」を判定する責務を持つ。
+    readonly addMember: (teamId: TeamId, userId: UserId) => Effect.Effect<boolean, RepoError>
     readonly listMembers: (teamId: TeamId) => Effect.Effect<ReadonlyArray<User>, RepoError>
   }
 >() {}

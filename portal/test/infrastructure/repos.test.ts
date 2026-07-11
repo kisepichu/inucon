@@ -236,6 +236,62 @@ layer("TeamRepo: setMembers 複数行 INSERT", (it) => {
   )
 })
 
+layer("TeamRepo: addMember", (it) => {
+  it.effect("未所属ユーザーへの addMember は true を返し、実際にそのチームへ追加する", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const users = yield* UserRepo
+      const team = new Team({ id: TeamId.make("team-addmember-1"), name: "Add Member 1", teamNumber: 221 })
+      yield* teams.create(team)
+
+      const user = yield* users.upsertByGithub({
+        githubId: 9101,
+        githubLogin: "addmemberuser1",
+        displayName: "Add Member User 1",
+        isAdmin: false
+      })
+
+      const added = yield* teams.addMember(team.id, user.id)
+      expect(added).toBe(true)
+
+      const found = yield* teams.findByUserId(user.id)
+      expect(found).toStrictEqual(Option.some(team))
+    })
+  )
+
+  it.effect("既に何らかのチームに所属済みのユーザーへの addMember は false を返し、所属を変えない(TOCTOU 回避)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const users = yield* UserRepo
+      const teamA = new Team({ id: TeamId.make("team-addmember-a"), name: "Add Member A", teamNumber: 222 })
+      const teamB = new Team({ id: TeamId.make("team-addmember-b"), name: "Add Member B", teamNumber: 223 })
+      yield* teams.create(teamA)
+      yield* teams.create(teamB)
+
+      const user = yield* users.upsertByGithub({
+        githubId: 9102,
+        githubLogin: "addmemberuser2",
+        displayName: "Add Member User 2",
+        isAdmin: false
+      })
+
+      const firstAdd = yield* teams.addMember(teamA.id, user.id)
+      expect(firstAdd).toBe(true)
+
+      // 既に teamA 所属。同じチームへの再追加も、別チームへの追加試行も
+      // false(=このコールでは追加できなかった)を返し、所属は変わらない。
+      const reAddSameTeam = yield* teams.addMember(teamA.id, user.id)
+      expect(reAddSameTeam).toBe(false)
+
+      const addDifferentTeam = yield* teams.addMember(teamB.id, user.id)
+      expect(addDifferentTeam).toBe(false)
+
+      const found = yield* teams.findByUserId(user.id)
+      expect(found).toStrictEqual(Option.some(teamA))
+    })
+  )
+})
+
 layer("InstanceRepo", (it) => {
   it.effect("create/listByTeam/remove", () =>
     Effect.gen(function* () {

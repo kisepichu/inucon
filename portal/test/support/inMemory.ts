@@ -89,10 +89,18 @@ export const makeTeamRepoTest = (args: {
             ...userIds.map((userId) => ({ userId, teamId }))
           ]),
         // 単一メンバー追加(招待フロー)。team_members.user_id は UNIQUE の
-        // ため、既に(どのチームであれ)所属済みの userId は無視する(冪等)。
+        // ため、既に(どのチームであれ)所属済みの userId は追加せず false を
+        // 返す(本番 SQLite 実装の「INSERT ... WHERE NOT EXISTS ... RETURNING」
+        // と同じ意味論。Ref.modify で読み取り+書き込みを単一 update に収め、
+        // 呼び出し元が事前に行った findByUserId チェックとの間の TOCTOU を
+        // ここでは起こさないようにする)。
         addMember: (teamId: TeamId, userId: UserId) =>
-          Ref.update(membersRef, (members) =>
-            members.some((m) => m.userId === userId) ? members : [...members, { userId, teamId }]
+          Ref.modify(
+            membersRef,
+            (members): readonly [boolean, ReadonlyArray<{ userId: UserId; teamId: TeamId }>] => {
+              if (members.some((m) => m.userId === userId)) return [false, members]
+              return [true, [...members, { userId, teamId }]]
+            }
           ),
         listMembers: (teamId: TeamId) =>
           Effect.gen(function* () {
@@ -228,8 +236,12 @@ export const makeInviteReposTest = (args: {
             ...userIds.map((userId) => ({ userId, teamId }))
           ]),
         addMember: (teamId, userId) =>
-          Ref.update(membersRef, (members) =>
-            members.some((m) => m.userId === userId) ? members : [...members, { userId, teamId }]
+          Ref.modify(
+            membersRef,
+            (members): readonly [boolean, ReadonlyArray<{ userId: UserId; teamId: TeamId }>] => {
+              if (members.some((m) => m.userId === userId)) return [false, members]
+              return [true, [...members, { userId, teamId }]]
+            }
           ),
         listMembers: (teamId) =>
           Effect.gen(function* () {
