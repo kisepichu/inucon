@@ -11,6 +11,7 @@ import {
   makeCloudflarePortTest,
   makeGithubKeysPortTest,
   makeInstanceRepoTest,
+  makeInviteRepoTest,
   makeProxmoxPortTest,
   makeTeamRepoTest,
   ProvisioningConfigTest
@@ -80,6 +81,7 @@ const workerWith = (instances: ReadonlyArray<Instance>) => {
     instanceRepo,
     teamRepoLayer,
     githubKeysLayer,
+    makeInviteRepoTest([]),
     makeProxmoxPortTest().layer,
     makeCloudflarePortTest().layer,
     ProvisioningConfigTest()

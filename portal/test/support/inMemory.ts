@@ -8,6 +8,7 @@ import { UserId } from "../../src/domain/ids.js"
 import type { Instance } from "../../src/domain/instance.js"
 import { User } from "../../src/domain/user.js"
 import type { Team } from "../../src/domain/team.js"
+import type { TeamInvite } from "../../src/domain/teamInvite.js"
 import { ProvisionInProgress, QuotaExceeded } from "../../src/application/errors.js"
 import {
   BenchJobRepo,
@@ -17,6 +18,7 @@ import {
   GithubKeysError,
   GithubKeysPort,
   InstanceRepo,
+  InviteRepo,
   ProvisioningConfig,
   ProvisionTimeout,
   ProxmoxError,
@@ -86,6 +88,20 @@ export const makeTeamRepoTest = (args: {
             ...members.filter((m) => m.teamId !== teamId),
             ...userIds.map((userId) => ({ userId, teamId }))
           ]),
+        // 単一メンバー追加(招待フロー)。team_members.user_id は UNIQUE の
+        // ため、既に(どのチームであれ)所属済みの userId は追加せず false を
+        // 返す(本番 SQLite 実装の「INSERT ... WHERE NOT EXISTS ... RETURNING」
+        // と同じ意味論。Ref.modify で読み取り+書き込みを単一 update に収め、
+        // 呼び出し元が事前に行った findByUserId チェックとの間の TOCTOU を
+        // ここでは起こさないようにする)。
+        addMember: (teamId: TeamId, userId: UserId) =>
+          Ref.modify(
+            membersRef,
+            (members): readonly [boolean, ReadonlyArray<{ userId: UserId; teamId: TeamId }>] => {
+              if (members.some((m) => m.userId === userId)) return [false, members]
+              return [true, [...members, { userId, teamId }]]
+            }
+          ),
         listMembers: (teamId: TeamId) =>
           Effect.gen(function* () {
             const members = yield* Ref.get(membersRef)
@@ -94,6 +110,167 @@ export const makeTeamRepoTest = (args: {
             return users.filter((u) => memberIds.has(u.id))
           })
       }
+    })
+  )
+
+// InviteRepo のインメモリ実装(team_invites)。create は本番 SQLite 実装
+// (github_login PK の ON CONFLICT upsert)と同じ意味論: 同一 githubLogin の
+// 再招待は team/email を上書きする。saga/provisioner のテストで空の InviteRepo
+// を差し込むためにも使う(招待ゼロ = collectTeamAccess はメンバーのみ集約)。
+export const makeInviteRepoTest = (initial: ReadonlyArray<TeamInvite> = []): Layer.Layer<InviteRepo> =>
+  Layer.effect(
+    InviteRepo,
+    Effect.gen(function* () {
+      const ref = yield* Ref.make(initial)
+      return {
+        create: (invite: TeamInvite) =>
+          Ref.update(ref, (invites) => [
+            ...invites.filter((i) => i.githubLogin !== invite.githubLogin),
+            invite
+          ]),
+        findByGithubLogin: (githubLogin: string) =>
+          Ref.get(ref).pipe(Effect.map((invites) => Option.fromNullable(invites.find((i) => i.githubLogin === githubLogin)))),
+        delete: (githubLogin: string) =>
+          Ref.update(ref, (invites) => invites.filter((i) => i.githubLogin !== githubLogin)),
+        listByTeam: (teamId: TeamId) =>
+          Ref.get(ref).pipe(Effect.map((invites) => invites.filter((i) => i.teamId === teamId)))
+      }
+    })
+  )
+
+// 招待フロー(Task 5)の application テスト用に、UserRepo / SessionRepo /
+// TeamRepo / InviteRepo を単一の共有ストアから提供する複合レイヤー。本番
+// SQLite は users テーブルを 1 つだけ持ち、TeamRepo.listMembers と
+// UserRepo.setEmail が同じ行を見る。makeTeamRepoTest(独自 usersRef)と
+// makeAuthReposTest(別の usersRef)を混ぜるとこの一貫性が崩れる(setEmail が
+// listMembers に反映されない)ため、招待テストではこの複合レイヤーで users を
+// 1 つに束ねる。
+export const makeInviteReposTest = (args: {
+  teams: ReadonlyArray<Team>
+  users?: ReadonlyArray<User>
+  memberships?: ReadonlyArray<{ userId: UserId; teamId: TeamId }>
+  invites?: ReadonlyArray<TeamInvite>
+}): Layer.Layer<UserRepo | SessionRepo | TeamRepo | InviteRepo> =>
+  Layer.effectContext(
+    Effect.gen(function* () {
+      const usersRef = yield* Ref.make<ReadonlyArray<User>>(args.users ?? [])
+      const membersRef = yield* Ref.make<ReadonlyArray<{ userId: UserId; teamId: TeamId }>>(args.memberships ?? [])
+      const teamsRef = yield* Ref.make<ReadonlyArray<Team>>(args.teams)
+      const invitesRef = yield* Ref.make<ReadonlyArray<TeamInvite>>(args.invites ?? [])
+      const sessionsRef = yield* Ref.make<
+        ReadonlyArray<{ sessionId: string; userId: UserId; expiresAt: number }>
+      >([])
+      const counter = yield* Ref.make(0)
+
+      const userRepo: Context.Tag.Service<UserRepo> = {
+        upsertByGithub: (u) =>
+          Effect.gen(function* () {
+            const n = yield* Ref.updateAndGet(counter, (c) => c + 1)
+            return yield* Ref.modify(usersRef, (users): readonly [User, ReadonlyArray<User>] => {
+              const existing = users.find((x) => x.githubId === u.githubId)
+              if (existing !== undefined) {
+                const updated = new User({
+                  ...existing,
+                  githubLogin: u.githubLogin,
+                  displayName: u.displayName,
+                  isAdmin: u.isAdmin
+                })
+                return [updated, users.map((x) => (x.githubId === u.githubId ? updated : x))]
+              }
+              const created = new User({
+                id: UserId.make(`test-user-${n}`),
+                githubId: u.githubId,
+                githubLogin: u.githubLogin,
+                displayName: u.displayName,
+                isAdmin: u.isAdmin,
+                email: Option.none()
+              })
+              return [created, [...users, created]]
+            })
+          }),
+        findById: (id) =>
+          Ref.get(usersRef).pipe(Effect.map((users) => Option.fromNullable(users.find((u) => u.id === id)))),
+        findManyByGithubLogins: (logins) =>
+          Ref.get(usersRef).pipe(Effect.map((users) => users.filter((u) => logins.includes(u.githubLogin)))),
+        setEmail: (id, email) =>
+          Ref.update(usersRef, (users) =>
+            users.map((u) => (u.id === id ? new User({ ...u, email: Option.some(email) }) : u))
+          )
+      }
+
+      const sessionRepo: Context.Tag.Service<SessionRepo> = {
+        create: (userId, expiresAt) =>
+          Effect.gen(function* () {
+            const n = yield* Ref.updateAndGet(counter, (c) => c + 1)
+            const sessionId = `test-session-${n}`
+            yield* Ref.update(sessionsRef, (sessions) => [...sessions, { sessionId, userId, expiresAt }])
+            return sessionId
+          }),
+        findValidUser: (sessionId, now) =>
+          Effect.gen(function* () {
+            const sessions = yield* Ref.get(sessionsRef)
+            const session = sessions.find((s) => s.sessionId === sessionId && s.expiresAt > now)
+            if (session === undefined) return Option.none<User>()
+            const users = yield* Ref.get(usersRef)
+            return Option.fromNullable(users.find((u) => u.id === session.userId))
+          }),
+        delete: (sessionId) => Ref.update(sessionsRef, (sessions) => sessions.filter((s) => s.sessionId !== sessionId))
+      }
+
+      const teamRepo: Context.Tag.Service<TeamRepo> = {
+        list: Ref.get(teamsRef),
+        findById: (id) =>
+          Ref.get(teamsRef).pipe(Effect.map((teams) => Option.fromNullable(teams.find((t) => t.id === id)))),
+        findByUserId: (userId) =>
+          Effect.gen(function* () {
+            const members = yield* Ref.get(membersRef)
+            const teams = yield* Ref.get(teamsRef)
+            const membership = members.find((m) => m.userId === userId)
+            if (membership === undefined) return Option.none<Team>()
+            return Option.fromNullable(teams.find((t) => t.id === membership.teamId))
+          }),
+        create: (t) => Ref.update(teamsRef, (teams) => [...teams, t]),
+        setMembers: (teamId, userIds) =>
+          Ref.update(membersRef, (members) => [
+            ...members.filter((m) => m.teamId !== teamId),
+            ...userIds.map((userId) => ({ userId, teamId }))
+          ]),
+        addMember: (teamId, userId) =>
+          Ref.modify(
+            membersRef,
+            (members): readonly [boolean, ReadonlyArray<{ userId: UserId; teamId: TeamId }>] => {
+              if (members.some((m) => m.userId === userId)) return [false, members]
+              return [true, [...members, { userId, teamId }]]
+            }
+          ),
+        listMembers: (teamId) =>
+          Effect.gen(function* () {
+            const members = yield* Ref.get(membersRef)
+            const users = yield* Ref.get(usersRef)
+            const memberIds = new Set(members.filter((m) => m.teamId === teamId).map((m) => m.userId))
+            return users.filter((u) => memberIds.has(u.id))
+          })
+      }
+
+      const inviteRepo: Context.Tag.Service<InviteRepo> = {
+        create: (invite) =>
+          Ref.update(invitesRef, (invites) => [
+            ...invites.filter((i) => i.githubLogin !== invite.githubLogin),
+            invite
+          ]),
+        findByGithubLogin: (githubLogin) =>
+          Ref.get(invitesRef).pipe(
+            Effect.map((invites) => Option.fromNullable(invites.find((i) => i.githubLogin === githubLogin)))
+          ),
+        delete: (githubLogin) => Ref.update(invitesRef, (invites) => invites.filter((i) => i.githubLogin !== githubLogin)),
+        listByTeam: (teamId) => Ref.get(invitesRef).pipe(Effect.map((invites) => invites.filter((i) => i.teamId === teamId)))
+      }
+
+      return Context.make(UserRepo, userRepo).pipe(
+        Context.add(SessionRepo, sessionRepo),
+        Context.add(TeamRepo, teamRepo),
+        Context.add(InviteRepo, inviteRepo)
+      )
     })
   )
 
@@ -358,7 +535,11 @@ export const makeAuthReposTest = (): Layer.Layer<UserRepo | SessionRepo> =>
         findById: (id) =>
           Ref.get(usersRef).pipe(Effect.map((users) => Option.fromNullable(users.find((u) => u.id === id)))),
         findManyByGithubLogins: (logins) =>
-          Ref.get(usersRef).pipe(Effect.map((users) => users.filter((u) => logins.includes(u.githubLogin))))
+          Ref.get(usersRef).pipe(Effect.map((users) => users.filter((u) => logins.includes(u.githubLogin)))),
+        setEmail: (id, email) =>
+          Ref.update(usersRef, (users) =>
+            users.map((u) => (u.id === id ? new User({ ...u, email: Option.some(email) }) : u))
+          )
       }
 
       const sessionRepo: Context.Tag.Service<SessionRepo> = {

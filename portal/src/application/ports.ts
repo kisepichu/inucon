@@ -11,6 +11,7 @@ import {
 import type { BenchJobId, InstanceId, TeamId, UserId } from "../domain/ids.js"
 import type { Instance } from "../domain/instance.js"
 import type { Team } from "../domain/team.js"
+import type { TeamInvite } from "../domain/teamInvite.js"
 import type { User } from "../domain/user.js"
 import { ProvisionInProgress, QuotaExceeded } from "./errors.js"
 
@@ -64,6 +65,10 @@ export class UserRepo extends Context.Tag("app/UserRepo")<
     readonly findManyByGithubLogins: (
       logins: ReadonlyArray<string>
     ) => Effect.Effect<ReadonlyArray<User>, RepoError>
+    // POST /api/admin/teams/:id/invites(Phase 3、Task 5): Access ログイン用
+    // メールを更新する。既ログインユーザーへの即時招待、および初ログイン時の
+    // team_invites 消費(auth.ts)の両方から呼ばれる。
+    readonly setEmail: (id: UserId, email: string) => Effect.Effect<void, RepoError>
   }
 >() {}
 
@@ -88,7 +93,31 @@ export class TeamRepo extends Context.Tag("app/TeamRepo")<
     // RETURNING」の単一原子的操作で TOCTOU を回避する、SQLite 実装)。
     readonly create: (t: Team) => Effect.Effect<void, RepoError | TeamNumberConflict>
     readonly setMembers: (teamId: TeamId, userIds: ReadonlyArray<UserId>) => Effect.Effect<void, RepoError>
+    // 単一メンバーの追加(全量置換の setMembers とは別に、Phase 3 の招待
+    // フローが使う)。TOCTOU 回避のため「INSERT ... WHERE NOT EXISTS
+    // (SELECT 1 FROM team_members WHERE user_id = ...) RETURNING」の単一
+    // 原子的操作で判定する(TeamRepo.create と同型)。戻り値は「実際にこの
+    // 呼び出しで追加できたか」: true = このチームへ新規追加した / false =
+    // (呼び出し元の findByUserId チェック後、この INSERT までの間に競合した
+    // 別の呼び出しなどで)既に何らかのチームに所属していて追加されなかった。
+    // 呼び出し元(application/usecases/invites.ts・auth.ts)は false の場合、
+    // 実際の所属チームを再確認して「要求チームと同じなら冪等成功」
+    // 「異なるなら MemberConflict」を判定する責務を持つ。
+    readonly addMember: (teamId: TeamId, userId: UserId) => Effect.Effect<boolean, RepoError>
     readonly listMembers: (teamId: TeamId) => Effect.Effect<ReadonlyArray<User>, RepoError>
+  }
+>() {}
+
+// team_invites テーブル(migration 0002)の CRUD。githubLogin が PK なので
+// 同一 login への再招待は team/email の上書き(create = upsert)でよい
+// (スペック §Invite「同一 login の再招待は team/email 更新でよい」)。
+export class InviteRepo extends Context.Tag("app/InviteRepo")<
+  InviteRepo,
+  {
+    readonly create: (invite: TeamInvite) => Effect.Effect<void, RepoError>
+    readonly findByGithubLogin: (githubLogin: string) => Effect.Effect<Option.Option<TeamInvite>, RepoError>
+    readonly delete: (githubLogin: string) => Effect.Effect<void, RepoError>
+    readonly listByTeam: (teamId: TeamId) => Effect.Effect<ReadonlyArray<TeamInvite>, RepoError>
   }
 >() {}
 

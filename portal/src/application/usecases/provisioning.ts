@@ -9,6 +9,7 @@ import {
   GithubKeysError,
   GithubKeysPort,
   InstanceRepo,
+  InviteRepo,
   ProvisioningConfig,
   ProxmoxError,
   ProxmoxPort,
@@ -28,9 +29,14 @@ const bridgeFor = (teamNumber: number): string => `team${teamNumber}`
 const gatewayFor = (teamNumber: number): string => `10.100.${teamNumber}.1`
 
 // スペック §セキュリティ: ホスト名は既存規則 inucon-team{N}-{M}.kisen.one を踏襲。
-const hostnameFor = (teamNumber: number, index: number): string => `inucon-team${teamNumber}-${index}.kisen.one`
+// invites.ts(Task 5)も同じ規則でチームの running インスタンスのホスト名を
+// 求める必要があるため export する。
+export const hostnameFor = (teamNumber: number, index: number): string => `inucon-team${teamNumber}-${index}.kisen.one`
 
-const describeError = (e: unknown): string => {
+// saga のエラー(ProxmoxError/CloudflareError 等)を人間可読な文字列に畳む。
+// invites.ts(Task 5)も guestExec/ensureAccessApp の失敗をユーザー向けの
+// error 文字列にする際に同じ表現を使うため export する。
+export const describeError = (e: unknown): string => {
   if (typeof e === "object" && e !== null && "_tag" in e) {
     try {
       return JSON.stringify(e)
@@ -42,40 +48,62 @@ const describeError = (e: unknown): string => {
 }
 
 // 招待メンバーのメール/鍵集約(スペック §招待フロー「インスタンス新規作成時は
-// その時点のチームメンバー+招待中のメール/鍵で構成する」)。Task 5 の
-// invites.ts と共有する共通関数になる想定だが、Task 4 では team_invites
-// (未ログインユーザーの事前招待)テーブルがまだユースケース経路から
-// 参照されていないため、「チームの現メンバー」から集める最小実装にする
-// (Task 5 が team_invites を合流させて精緻化する)。
+// その時点のチームメンバー+招待中のメール/鍵で構成する」)。Task 5 で
+// team_invites(未ログインユーザーの事前招待)を合流させ、invites.ts と
+// 共有する共通関数にした(Task 4 は「チームの現メンバー」のみの最小実装
+// だった)。
 //
+// - emails/sshKeys とも「現メンバー ∪ 招待中(team_invites)」の和集合
+//   (スペック §招待フロー「インスタンス新規作成時は...招待中のメール/鍵で
+//   構成する」「Access ポリシーの更新は...和集合」)。重複は排除する。
 // - 鍵は GithubKeysPort.fetchKeys(githubLogin)。未登録(GithubKeysError)の
-//   メンバーは黒魔術的にサガ全体を失敗させず、鍵無しとしてスキップする
+//   メンバー/招待中は saga 全体を失敗させず、鍵無しとしてスキップする
 //   (スペック §招待フロー「email 未登録メンバーの扱い」と同じ「部分的な
 //   欠落を許容しつつ処理は続行する」方針を鍵にも適用)。
-// - メールは users.email(Option)。未設定(None)のメンバーはスキップする。
+// - メールは users.email(Option)。未設定(None)のメンバーは emails には
+//   載せず、missingEmailLogins(招待 API の warnings 用)に githubLogin を
+//   積む(スペック §招待フロー「email 未登録メンバーの扱い」: 黙って外す
+//   のではなく warning として可視化する)。招待中(team_invites)は admin が
+//   email を必須入力しているため、この意味での欠落は起こらない。
 export const collectTeamAccess = (
   teamId: TeamId
 ): Effect.Effect<
-  { emails: ReadonlyArray<string>; sshKeys: ReadonlyArray<string> },
+  {
+    emails: ReadonlyArray<string>
+    sshKeys: ReadonlyArray<string>
+    missingEmailLogins: ReadonlyArray<string>
+  },
   RepoError,
-  TeamRepo | GithubKeysPort
+  TeamRepo | GithubKeysPort | InviteRepo
 > =>
   Effect.gen(function* () {
     const teams = yield* TeamRepo
     const githubKeys = yield* GithubKeysPort
+    const invites = yield* InviteRepo
     const members = yield* teams.listMembers(teamId)
+    const pending = yield* invites.listByTeam(teamId)
 
-    const emails = members.flatMap((m) =>
+    const fetchKeysOrEmpty = (login: string) =>
+      githubKeys
+        .fetchKeys(login)
+        .pipe(Effect.catchTag("GithubKeysError", () => Effect.succeed([] as ReadonlyArray<string>)))
+
+    const memberEmails = members.flatMap((m) =>
       Option.match(m.email, { onNone: () => [] as ReadonlyArray<string>, onSome: (e) => [e] })
     )
-
-    const keysPerMember = yield* Effect.forEach(members, (m) =>
-      githubKeys.fetchKeys(m.githubLogin).pipe(
-        Effect.catchTag("GithubKeysError", () => Effect.succeed([] as ReadonlyArray<string>))
-      )
+    const missingEmailLogins = members.flatMap((m) =>
+      Option.match(m.email, { onNone: () => [m.githubLogin], onSome: () => [] as ReadonlyArray<string> })
     )
+    const pendingEmails = pending.map((p) => p.email)
 
-    return { emails, sshKeys: keysPerMember.flat() }
+    const memberKeys = yield* Effect.forEach(members, (m) => fetchKeysOrEmpty(m.githubLogin))
+    const pendingKeys = yield* Effect.forEach(pending, (p) => fetchKeysOrEmpty(p.githubLogin))
+
+    return {
+      emails: Array.from(new Set([...memberEmails, ...pendingEmails])),
+      sshKeys: Array.from(new Set([...memberKeys.flat(), ...pendingKeys.flat()])),
+      missingEmailLogins
+    }
   })
 
 // 払い出し saga(スペック §アーキテクチャ「オーケストレーションの実行・補償
@@ -87,7 +115,11 @@ export const collectTeamAccess = (
 // markFailed に畳み込んで返す)。
 export const runProvisioning = (
   initial: Instance
-): Effect.Effect<Instance, never, InstanceRepo | ProxmoxPort | CloudflarePort | GithubKeysPort | TeamRepo | ProvisioningConfig> =>
+): Effect.Effect<
+  Instance,
+  never,
+  InstanceRepo | ProxmoxPort | CloudflarePort | GithubKeysPort | TeamRepo | InviteRepo | ProvisioningConfig
+> =>
   Effect.gen(function* () {
     const repo = yield* InstanceRepo
     const teams = yield* TeamRepo
@@ -308,7 +340,7 @@ export const runTeardown = (
 export const runNextOrchestrationStep: Effect.Effect<
   Option.Option<Instance>,
   never,
-  InstanceRepo | ProxmoxPort | CloudflarePort | GithubKeysPort | TeamRepo | ProvisioningConfig
+  InstanceRepo | ProxmoxPort | CloudflarePort | GithubKeysPort | TeamRepo | InviteRepo | ProvisioningConfig
 > = Effect.gen(function* () {
   const repo = yield* InstanceRepo
   const next = yield* repo.findNextForOrchestration.pipe(

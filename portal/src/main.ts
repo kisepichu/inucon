@@ -20,11 +20,13 @@ import { TeamsLive } from "./infrastructure/http/handlers/teams.js"
 import { AdminOnlyLive, AuthenticationLive, RunnerAuthLive } from "./infrastructure/http/middleware.js"
 import { makeStaticMiddleware } from "./infrastructure/http/static.js"
 import { ProxmoxHttpClientLive, ProxmoxLive } from "./infrastructure/proxmox/client.js"
+import { InstancePortsStubLive } from "./infrastructure/stubPorts.js"
 import { MigratorLive, SqlLive } from "./infrastructure/sql/client.js"
 import { SeedLive } from "./infrastructure/sql/seed.js"
 import { BenchJobRepoLive } from "./infrastructure/sql/repos/benchJobRepo.js"
 import { ContestRepoLive } from "./infrastructure/sql/repos/contestRepo.js"
 import { InstanceRepoLive } from "./infrastructure/sql/repos/instanceRepo.js"
+import { InviteRepoLive } from "./infrastructure/sql/repos/inviteRepo.js"
 import { SessionRepoLive } from "./infrastructure/sql/repos/sessionRepo.js"
 import { TeamRepoLive } from "./infrastructure/sql/repos/teamRepo.js"
 import { UserRepoLive } from "./infrastructure/sql/repos/userRepo.js"
@@ -55,7 +57,8 @@ const ReposLive = Layer.mergeAll(
   TeamRepoLive,
   ContestRepoLive,
   InstanceRepoLive,
-  BenchJobRepoLive
+  BenchJobRepoLive,
+  InviteRepoLive
 ).pipe(
   Layer.provideMerge(UuidGenLive),
   Layer.provide(SqlLive)
@@ -103,6 +106,42 @@ export const ProvisioningConfigLive = Layer.effect(
   })
 )
 
+// Proxmox/Cloudflare/GithubKeys の 3 port(Task 5 レビュー): AdminLive の
+// inviteMember ハンドラ(invites.ts 経由)が admin.ts:28 で要求するのと同じ
+// 3 port を ApiLive にも配線する必要がある。ProvisionerConditionalLive の
+// 実 Layer 一式(下記)と同一の組み立てを 1 つの Layer にまとめ、ApiLive と
+// ProvisionerConditionalLive の両方から同じ参照(InstancePortsLive)を
+// provide することで、
+// - 実装(env 有無での実 Live/スタブの切替)を 1 箇所にする
+// - Layer メモ化(同一参照は 1 度だけ構築)により二重構築しない
+// を両立する。
+//
+// env(PROXMOX_API_URL)が無い場合は InstancePortsStubLive(stubPorts.ts)に
+// フォールバックする: 各メソッドが「PROXMOX_API_URL 未設定のため
+// インスタンス操作は無効」という ProxmoxError/CloudflareError/GithubKeysError
+// を返すだけの no-op 実装。これにより招待エンドポイント(POST
+// /api/admin/teams/:id/invites)は env 未設定でもポータル割当
+// (team_members/team_invites への反映)自体は成功し、Access/鍵注入だけが
+// 結果の error フィールドに degrade する(invites.ts の syncRunningInstances
+// が Effect.either で拾う設計)。
+//
+// TLS の HttpClient 分離(Task 3 レビュー指摘、下記 ProvisionerConditionalLive
+// の注記と同じ理由): ProxmoxHttpClientLive は ProxmoxLive にだけ provide し、
+// Cloudflare/GitHub 向けの通常の NodeHttpClient.layer とは混ぜない。
+const InstancePortsLive = Layer.unwrapEffect(
+  Config.option(Config.string("PROXMOX_API_URL")).pipe(
+    Effect.map((proxmoxApiUrl) =>
+      Option.isSome(proxmoxApiUrl)
+        ? Layer.mergeAll(
+            ProxmoxLive.pipe(Layer.provide(ProxmoxHttpClientLive)),
+            CloudflareLive.pipe(Layer.provide(NodeHttpClient.layer)),
+            GithubKeysLive.pipe(Layer.provide(NodeHttpClient.layer))
+          )
+        : InstancePortsStubLive
+    )
+  )
+)
+
 const ApiLive = HttpApiBuilder.api(api).pipe(
   Layer.provide(
     Layer.mergeAll(
@@ -123,6 +162,7 @@ const ApiLive = HttpApiBuilder.api(api).pipe(
   Layer.provide(RunnerConfigLive),
   Layer.provide(GithubOAuthLive.pipe(Layer.provide(NodeHttpClient.layer))),
   Layer.provide(AuthConfigLive),
+  Layer.provide(InstancePortsLive),
   Layer.provide(ReposLive)
 )
 
@@ -180,23 +220,13 @@ const WorkerLive = TimeoutSweeperLive.pipe(
 
 // 払い出し/撤収オーケストレーションのワーカー(Task 4 レビュー I3)。
 // ProvisionerLive の実行には実 port Live(ProxmoxLive / CloudflareLive /
-// GithubKeysLive)が必要で、ProxmoxLive/CloudflareLive は PROXMOX_*/CF_* 系の
-// env を Layer 構築時に必須とする(未設定だと Layer 構築自体が ConfigError で
-// 失敗する)。dev/test や env 未設定の現行本番でも起動を壊さないよう、
-// PROXMOX_API_URL の有無を Config.option で確認し、
-// - 設定されていれば実 Layer 一式(下記)を組み立てて配線する
-// - 設定されていなければワーカーを起動しない no-op Layer(Layer.empty)に
-//   フォールバックする
-// という条件分岐を Layer.unwrapEffect で行う(Layer 構築そのものを Effect
-// として遅延させ、Config を読んでから分岐する)。
-//
-// TLS の HttpClient 分離(Task 3 レビュー指摘): ProxmoxHttpClientLive は
-// PROXMOX_TLS_INSECURE/PROXMOX_TLS_FINGERPRINT に基づく Proxmox 専用の
-// checkServerIdentity 上書き(自己署名証明書のピン留め、または insecure 時の
-// 接続先ホスト限定)を行うため、Cloudflare/GitHub 向けの通常の
-// NodeHttpClient.layer とは別の HttpClient として ProxmoxLive にだけ
-// provide する(誤って同じ HttpClient を Cloudflare/GitHub 呼び出しにも
-// 使うと、TLS 検証がホスト非限定でスキップ/ピン留めされてしまう)。
+// GithubKeysLive)が必要だが、その配線は上記 InstancePortsLive に共通化した
+// (env 有無での実 Live/スタブの切替も含めて 1 箇所にまとめ、ApiLive と
+// 二重構築しない)。ここではワーカー自体を起動するかどうかだけを
+// PROXMOX_API_URL の有無で切り替える: 未設定ならスタブ port 越しに
+// 空振りさせるのではなく、そもそもワーカーを起動しない no-op
+// Layer(Layer.empty)にフォールバックする(dev/test や env 未設定の現行
+// 本番でも HTTP サーバー自体の起動は壊さない)。
 const ProvisionerConditionalLive = Layer.unwrapEffect(
   Config.option(Config.string("PROXMOX_API_URL")).pipe(
     Effect.map((proxmoxApiUrl) =>
@@ -204,9 +234,7 @@ const ProvisionerConditionalLive = Layer.unwrapEffect(
         ? ProvisionerLive.pipe(
             Layer.provide(ProvisioningConfigLive),
             Layer.provide(ReposLive), // InstanceRepo / TeamRepo
-            Layer.provide(ProxmoxLive.pipe(Layer.provide(ProxmoxHttpClientLive))),
-            Layer.provide(CloudflareLive.pipe(Layer.provide(NodeHttpClient.layer))),
-            Layer.provide(GithubKeysLive.pipe(Layer.provide(NodeHttpClient.layer))),
+            Layer.provide(InstancePortsLive),
             Layer.provide(MigratorLive)
           )
         : Layer.empty

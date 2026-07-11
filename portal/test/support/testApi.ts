@@ -17,12 +17,14 @@ import { AdminOnlyLive, AuthenticationLive, RunnerAuthLive } from "../../src/inf
 import { BenchJobRepoLive } from "../../src/infrastructure/sql/repos/benchJobRepo.js"
 import { ContestRepoLive } from "../../src/infrastructure/sql/repos/contestRepo.js"
 import { InstanceRepoLive } from "../../src/infrastructure/sql/repos/instanceRepo.js"
+import { InviteRepoLive } from "../../src/infrastructure/sql/repos/inviteRepo.js"
 import { SessionRepoLive } from "../../src/infrastructure/sql/repos/sessionRepo.js"
 import { TeamRepoLive } from "../../src/infrastructure/sql/repos/teamRepo.js"
 import { UserRepoLive } from "../../src/infrastructure/sql/repos/userRepo.js"
 import { UuidGenLive } from "../../src/infrastructure/sql/uuid.js"
 import type { StubGithubUser } from "./githubOAuthStub.js"
 import { makeGithubOAuthStub } from "./githubOAuthStub.js"
+import { makeCloudflarePortTest, makeGithubKeysPortTest, makeProxmoxPortTest } from "./inMemory.js"
 import { MigratorTest, SqlTest } from "./sqlTest.js"
 
 // `:memory:` SQLite + 本番マイグレーション + 本番リポジトリ実装。
@@ -34,7 +36,8 @@ export const ReposTestLive = Layer.mergeAll(
   TeamRepoLive,
   ContestRepoLive,
   InstanceRepoLive,
-  BenchJobRepoLive
+  BenchJobRepoLive,
+  InviteRepoLive
 ).pipe(
   Layer.provideMerge(UuidGenLive),
   Layer.provideMerge(MigratorTest),
@@ -56,6 +59,24 @@ const baseTestConfigProvider = CP.fromMap(new Map([["RUNNER_TOKEN", RUNNER_TOKEN
 
 const RunnerConfigTestLive = Layer.succeed(RunnerConfig, { jobTimeoutMillis: 600_000 })
 
+// Proxmox/Cloudflare/GithubKeys の 3 port(Task 5): AdminLive の inviteMember/
+// listInvites ハンドラ(invites.ts 経由)がこれらを要求するため、テスト用
+// ApiLive にも配線する(本番 main.ts の InstancePortsLive と同じ理由。未配線
+// だと R が unknown のまま漏れ、auth/bench/... 等 invites と無関係な http
+// テストまで TS2322 で連鎖的に壊れる)。招待の Access/鍵同期を深く検証する
+// テストは application 層(test/application/invites.test.ts)が
+// makeProxmoxPortTest 等を直接使うので、ここでは http テスト全般が壊れない
+// ための既定のインメモリ実装を提供するだけでよい。githubKeysByLogin だけ
+// オプションで個別テストから上書きできるようにする。
+const makeInstancePortsTestLive = (
+  githubKeysByLogin: Record<string, ReadonlyArray<string>> = {}
+) =>
+  Layer.mergeAll(
+    makeProxmoxPortTest().layer,
+    makeCloudflarePortTest().layer,
+    makeGithubKeysPortTest(githubKeysByLogin)
+  )
+
 // 本物の api(shared)を GithubOAuthPort だけスタブして起動するテスト Layer。
 // テスト本体からは repos(login ヘルパー等)と HttpClient(layerTest)が見える。
 export const makeAppTestLayer = (options?: {
@@ -64,6 +85,8 @@ export const makeAppTestLayer = (options?: {
   // COOKIE_SECURE 等の Config を読むテスト(空文字検証、Secure 属性の切替)用に
   // ConfigProvider を差し替え可能にする。未指定時は既定(process.env + RUNNER_TOKEN)のまま。
   readonly configProvider?: ConfigProvider.ConfigProvider
+  // 招待の鍵注入を検証するテスト用に GithubKeysPort のスタブ対応表を上書きできる。
+  readonly githubKeysByLogin?: Record<string, ReadonlyArray<string>>
 }) =>
   HttpApiBuilder.serve().pipe(
     Layer.provideMerge(
@@ -89,6 +112,7 @@ export const makeAppTestLayer = (options?: {
         Layer.provide(
           Layer.succeed(AuthConfig, { adminGithubLogins: options?.adminGithubLogins ?? [] })
         ),
+        Layer.provide(makeInstancePortsTestLive(options?.githubKeysByLogin)),
         Layer.provide(
           Layer.setConfigProvider(
             options?.configProvider !== undefined

@@ -93,6 +93,23 @@ export const TeamRepoLive: Layer.Layer<TeamRepo, never, SqlClient.SqlClient> = L
           )
         ),
 
+      // 単一メンバーの追加(Phase 3 招待フロー)。team_members.user_id は
+      // UNIQUE。TOCTOU 回避のため「INSERT ... SELECT ... WHERE NOT EXISTS
+      // ... RETURNING」の単一原子的操作で判定する(TeamRepo.create /
+      // benchJobRepo.insertIfAllowed と同型)。0 行挿入(= 既に何らかのチーム
+      // に所属済み)なら false を返す。他チームからの横取り防止・冪等判定
+      // (要求チームと同じか異なるか)は呼び出し元
+      // (application/usecases/invites.ts・auth.ts)が false を見て行う責務。
+      addMember: (teamId: TeamId, userId: UserId) =>
+        wrapSqlError(
+          sql<{ userId: string }>`
+            INSERT INTO team_members (team_id, user_id)
+            SELECT ${teamId}, ${userId}
+            WHERE NOT EXISTS (SELECT 1 FROM team_members WHERE user_id = ${userId})
+            RETURNING user_id AS "userId"
+          `
+        ).pipe(Effect.map((rows) => rows.length > 0)),
+
       listMembers: (teamId: TeamId) =>
         wrapSqlError(
           sql<UserRow>`

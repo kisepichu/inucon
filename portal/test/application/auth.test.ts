@@ -11,7 +11,7 @@ import {
   SESSION_TTL_MILLIS
 } from "../../src/application/usecases/auth.js"
 import { makeGithubOAuthStub } from "../support/githubOAuthStub.js"
-import { makeAuthReposTest, makeTeamRepoTest } from "../support/inMemory.js"
+import { makeAuthReposTest, makeInviteRepoTest, makeTeamRepoTest } from "../support/inMemory.js"
 
 const stubCodes = {
   "code-taro": { githubId: 100, githubLogin: "taro", displayName: "Taro" },
@@ -26,7 +26,8 @@ const testLayer = Layer.mergeAll(
   makeAuthReposTest(),
   makeGithubOAuthStub(stubCodes),
   Layer.succeed(AuthConfig, { adminGithubLogins: ["admin-user"] }),
-  makeTeamRepoTest({ teams: [team], memberships: [{ userId: memberId, teamId }] })
+  makeTeamRepoTest({ teams: [team], memberships: [{ userId: memberId, teamId }] }),
+  makeInviteRepoTest([])
 )
 
 describe("handleOAuthCallback", () => {
