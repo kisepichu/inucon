@@ -2,9 +2,11 @@ import { createServer } from "node:http"
 import { fileURLToPath } from "node:url"
 import { HttpApiBuilder, HttpMiddleware } from "@effect/platform"
 import { NodeHttpClient, NodeHttpServer, NodeRuntime } from "@effect/platform-node"
-import { Config, Effect, Layer } from "effect"
+import { Config, Effect, Layer, Option } from "effect"
 import { api } from "shared"
-import { AuthConfig, RunnerConfig } from "./application/ports.js"
+import { AuthConfig, ProvisioningConfig, RunnerConfig } from "./application/ports.js"
+import { CloudflareLive } from "./infrastructure/cloudflare/client.js"
+import { GithubKeysLive } from "./infrastructure/github/keys.js"
 import { GithubOAuthLive } from "./infrastructure/github/oauth.js"
 import { AdminLive } from "./infrastructure/http/handlers/admin.js"
 import { AuthLive } from "./infrastructure/http/handlers/auth.js"
@@ -17,6 +19,7 @@ import { ScoreboardLive } from "./infrastructure/http/handlers/scoreboard.js"
 import { TeamsLive } from "./infrastructure/http/handlers/teams.js"
 import { AdminOnlyLive, AuthenticationLive, RunnerAuthLive } from "./infrastructure/http/middleware.js"
 import { makeStaticMiddleware } from "./infrastructure/http/static.js"
+import { ProxmoxHttpClientLive, ProxmoxLive } from "./infrastructure/proxmox/client.js"
 import { MigratorLive, SqlLive } from "./infrastructure/sql/client.js"
 import { SeedLive } from "./infrastructure/sql/seed.js"
 import { BenchJobRepoLive } from "./infrastructure/sql/repos/benchJobRepo.js"
@@ -26,6 +29,7 @@ import { SessionRepoLive } from "./infrastructure/sql/repos/sessionRepo.js"
 import { TeamRepoLive } from "./infrastructure/sql/repos/teamRepo.js"
 import { UserRepoLive } from "./infrastructure/sql/repos/userRepo.js"
 import { UuidGenLive } from "./infrastructure/sql/uuid.js"
+import { ProvisionerLive } from "./infrastructure/worker/provisioner.js"
 import { TimeoutSweeperLive } from "./infrastructure/worker/timeoutSweeper.js"
 
 // ADMIN_GITHUB_LOGINS(カンマ区切り)に載っている githubLogin はログイン時に
@@ -69,6 +73,34 @@ const RunnerConfigLive = Layer.effect(
     }),
     Effect.map((jobTimeoutMillis) => ({ jobTimeoutMillis }))
   )
+)
+
+// 払い出しガードの閾値・タイムアウト(Phase 3、Task 4)。既定は spike メモ
+// §リスク4 の RAM 閾値 5GiB(= 1 インスタンス 4GiB + 予備 1GiB)と、guest agent
+// 待機 120 秒。RunnerConfigLive と同じく Config から組み立て、値は正の整数に
+// バリデートする(不正値でも Layer 構築を失敗させて早期に気付ける)。この
+// Layer は env 依存が既定値ありのため単体では起動を壊さないが、消費者である
+// ProvisionerLive は実 port Live(Proxmox/Cloudflare/Github)を要し、それらは
+// env 必須のため MainLive への配線は Task 7 に委ねる(下記 WorkerLive の注記)。
+export const ProvisioningConfigLive = Layer.effect(
+  ProvisioningConfig,
+  Effect.gen(function* () {
+    const minFreeMemBytes = yield* Config.integer("PROVISION_MIN_FREE_MEM_BYTES").pipe(
+      Config.withDefault(5_000_000_000),
+      Config.validate({
+        message: "PROVISION_MIN_FREE_MEM_BYTES must be a positive integer",
+        validation: (n) => n > 0
+      })
+    )
+    const guestAgentTimeoutMillis = yield* Config.integer("PROVISION_GUEST_AGENT_TIMEOUT_MILLIS").pipe(
+      Config.withDefault(120_000),
+      Config.validate({
+        message: "PROVISION_GUEST_AGENT_TIMEOUT_MILLIS must be a positive integer",
+        validation: (n) => n > 0
+      })
+    )
+    return { minFreeMemBytes, guestAgentTimeoutMillis }
+  })
 )
 
 const ApiLive = HttpApiBuilder.api(api).pipe(
@@ -146,9 +178,45 @@ const WorkerLive = TimeoutSweeperLive.pipe(
   Layer.provide(MigratorLive)
 )
 
+// 払い出し/撤収オーケストレーションのワーカー(Task 4 レビュー I3)。
+// ProvisionerLive の実行には実 port Live(ProxmoxLive / CloudflareLive /
+// GithubKeysLive)が必要で、ProxmoxLive/CloudflareLive は PROXMOX_*/CF_* 系の
+// env を Layer 構築時に必須とする(未設定だと Layer 構築自体が ConfigError で
+// 失敗する)。dev/test や env 未設定の現行本番でも起動を壊さないよう、
+// PROXMOX_API_URL の有無を Config.option で確認し、
+// - 設定されていれば実 Layer 一式(下記)を組み立てて配線する
+// - 設定されていなければワーカーを起動しない no-op Layer(Layer.empty)に
+//   フォールバックする
+// という条件分岐を Layer.unwrapEffect で行う(Layer 構築そのものを Effect
+// として遅延させ、Config を読んでから分岐する)。
+//
+// TLS の HttpClient 分離(Task 3 レビュー指摘): ProxmoxHttpClientLive は
+// PROXMOX_TLS_INSECURE/PROXMOX_TLS_FINGERPRINT に基づく Proxmox 専用の
+// checkServerIdentity 上書き(自己署名証明書のピン留め、または insecure 時の
+// 接続先ホスト限定)を行うため、Cloudflare/GitHub 向けの通常の
+// NodeHttpClient.layer とは別の HttpClient として ProxmoxLive にだけ
+// provide する(誤って同じ HttpClient を Cloudflare/GitHub 呼び出しにも
+// 使うと、TLS 検証がホスト非限定でスキップ/ピン留めされてしまう)。
+const ProvisionerConditionalLive = Layer.unwrapEffect(
+  Config.option(Config.string("PROXMOX_API_URL")).pipe(
+    Effect.map((proxmoxApiUrl) =>
+      Option.isSome(proxmoxApiUrl)
+        ? ProvisionerLive.pipe(
+            Layer.provide(ProvisioningConfigLive),
+            Layer.provide(ReposLive), // InstanceRepo / TeamRepo
+            Layer.provide(ProxmoxLive.pipe(Layer.provide(ProxmoxHttpClientLive))),
+            Layer.provide(CloudflareLive.pipe(Layer.provide(NodeHttpClient.layer))),
+            Layer.provide(GithubKeysLive.pipe(Layer.provide(NodeHttpClient.layer))),
+            Layer.provide(MigratorLive)
+          )
+        : Layer.empty
+    )
+  )
+)
+
 // migration/seed は HttpLive・WorkerLive の依存(Layer.provide)経由で実行される
 // (メモ化により 1 回だけ)。トップレベルにはそれらを消費するコンポーネント
 // だけを並べ、順序は依存グラフに任せる。
-const MainLive = Layer.mergeAll(HttpLive, WorkerLive)
+const MainLive = Layer.mergeAll(HttpLive, WorkerLive, ProvisionerConditionalLive)
 
 Layer.launch(MainLive).pipe(NodeRuntime.runMain)

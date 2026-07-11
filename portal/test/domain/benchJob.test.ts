@@ -26,7 +26,7 @@ const teamId = TeamId.make("22222222-2222-2222-2222-222222222222")
 const jobId = BenchJobId.make("33333333-3333-3333-3333-333333333333")
 
 const makeContest = (status: Contest["status"]) =>
-  new Contest({ id: contestId, name: "INUCON", problemKey: "problem-1", status })
+  new Contest({ id: contestId, name: "INUCON", problemKey: "problem-1", status, instanceQuota: 3 })
 
 const baseEnqueueArgs = {
   contest: makeContest("running"),

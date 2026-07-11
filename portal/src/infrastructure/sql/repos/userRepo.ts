@@ -11,6 +11,7 @@ interface UserRow {
   readonly githubLogin: string
   readonly displayName: string
   readonly isAdmin: number
+  readonly email: string | null
 }
 
 const decodeUser = (row: UserRow) => decodeRow(User, { ...row, isAdmin: nullableIntToBool(row.isAdmin) })
@@ -38,7 +39,7 @@ export const UserRepoLive: Layer.Layer<UserRepo, never, SqlClient.SqlClient | Uu
                 display_name = excluded.display_name,
                 is_admin = excluded.is_admin
               RETURNING id, github_id AS githubId, github_login AS githubLogin,
-                        display_name AS displayName, is_admin AS isAdmin
+                        display_name AS displayName, is_admin AS isAdmin, email
             `
           )
           return yield* decodeUser(rows[0])
@@ -48,7 +49,7 @@ export const UserRepoLive: Layer.Layer<UserRepo, never, SqlClient.SqlClient | Uu
         wrapSqlError(
           sql<UserRow>`
             SELECT id, github_id AS githubId, github_login AS githubLogin,
-                   display_name AS displayName, is_admin AS isAdmin
+                   display_name AS displayName, is_admin AS isAdmin, email
             FROM users WHERE id = ${id}
           `
         ).pipe(
@@ -65,7 +66,7 @@ export const UserRepoLive: Layer.Layer<UserRepo, never, SqlClient.SqlClient | Uu
           : wrapSqlError(
               sql<UserRow>`
                 SELECT id, github_id AS githubId, github_login AS githubLogin,
-                       display_name AS displayName, is_admin AS isAdmin
+                       display_name AS displayName, is_admin AS isAdmin, email
                 FROM users WHERE ${sql.in("github_login", logins)}
               `
             ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeUser)))

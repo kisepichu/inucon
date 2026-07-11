@@ -153,6 +153,24 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         Effect.scoped
       )
 
+    // 存在確認専用(vmExists)。404 を「存在しない」として吸収し、それ以外の
+    // 非 2xx は復旧不能な ProxmoxError にする(requestUpidOrNotFound と同じ
+    // 404 の扱いだが、こちらはボディをデコードせず有無だけを boolean で返す)。
+    const requestExistsOrNotFound = (
+      req: HttpClientRequest.HttpClientRequest
+    ): Effect.Effect<boolean, ProxmoxError> =>
+      client.execute(req).pipe(
+        Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) })),
+        Effect.flatMap((response) => {
+          if (response.status === 404) return Effect.succeed(false)
+          if (response.status >= 200 && response.status < 300) return Effect.succeed(true)
+          return Effect.fail(
+            new ProxmoxError({ cause: `Proxmox API ${req.method} ${requestPath(req)} → ${response.status}` })
+          )
+        }),
+        Effect.scoped
+      )
+
     const requestConfig = (req: HttpClientRequest.HttpClientRequest): Effect.Effect<void, ProxmoxError> =>
       client.execute(req).pipe(
         Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) })),
@@ -245,6 +263,10 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
           )
           if (Option.isSome(deleteUpid)) yield* waitForTask(deleteUpid.value)
         }),
+
+      // clone 再入可能性チェック用(Task 4 レビュー C1)。status/current は
+      // 対象 VM が存在しない場合 404 を返す(Proxmox VE API の一般的な挙動)。
+      vmExists: (vmid) => requestExistsOrNotFound(HttpClientRequest.get(`${nodeUrl}/qemu/${vmid}/status/current`)),
 
       // guest agent 未起動時、Proxmox は agent/ping に 500(QEMU guest agent is not
       // running)を返す。これは「まだ ready でない」= リトライすべきケース。

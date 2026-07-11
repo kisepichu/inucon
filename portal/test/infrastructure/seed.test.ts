@@ -46,7 +46,8 @@ layer("seedIfEmpty", (it) => {
         id: ContestId.make("contest-existing"),
         name: "既存コンテスト",
         problemKey: "existing-problem",
-        status: "running"
+        status: "running",
+        instanceQuota: 3
       })
       yield* repo.save(existing)
 

@@ -12,6 +12,7 @@ interface UserRow {
   readonly githubLogin: string
   readonly displayName: string
   readonly isAdmin: number
+  readonly email: string | null
 }
 
 const decodeUser = (row: UserRow) => decodeRow(User, { ...row, isAdmin: nullableIntToBool(row.isAdmin) })
@@ -36,7 +37,7 @@ export const SessionRepoLive: Layer.Layer<SessionRepo, never, SqlClient.SqlClien
         wrapSqlError(
           sql<UserRow>`
             SELECT users.id AS id, users.github_id AS githubId, users.github_login AS githubLogin,
-                   users.display_name AS displayName, users.is_admin AS isAdmin
+                   users.display_name AS displayName, users.is_admin AS isAdmin, users.email AS email
             FROM sessions
             JOIN users ON users.id = sessions.user_id
             WHERE sessions.id = ${sessionId} AND sessions.expires_at > ${now}

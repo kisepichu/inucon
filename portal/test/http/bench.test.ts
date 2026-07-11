@@ -30,7 +30,8 @@ const setup = (options?: { teamNumber?: number }) =>
       id: ContestId.make(`contest-bench-${contestSeq}`),
       name: "INUCON",
       problemKey: "private-isu",
-      status: "running"
+      status: "running",
+      instanceQuota: 3
     })
     yield* contests.save(contest)
 

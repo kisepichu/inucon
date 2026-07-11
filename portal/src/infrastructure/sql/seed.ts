@@ -23,7 +23,8 @@ export const seedIfEmpty = Effect.gen(function* () {
       id: ContestId.make(id),
       name: "INUCON",
       problemKey: "private-isu",
-      status: "preparing"
+      status: "preparing",
+      instanceQuota: 3
     })
   )
 })

@@ -14,8 +14,8 @@ export const ContestRepoLive: Layer.Layer<ContestRepo, never, SqlClient.SqlClien
 
     return {
       getCurrent: wrapSqlError(
-        sql<{ id: string; name: string; problemKey: string; status: string }>`
-          SELECT id, name, problem_key AS problemKey, status FROM contests LIMIT 1
+        sql<{ id: string; name: string; problemKey: string; status: string; instanceQuota: number }>`
+          SELECT id, name, problem_key AS problemKey, status, instance_quota AS instanceQuota FROM contests LIMIT 1
         `
       ).pipe(
         Effect.flatMap((rows) =>
@@ -31,8 +31,8 @@ export const ContestRepoLive: Layer.Layer<ContestRepo, never, SqlClient.SqlClien
             Effect.gen(function* () {
               yield* sql`DELETE FROM contests`
               yield* sql`
-                INSERT INTO contests (id, name, problem_key, status)
-                VALUES (${c.id}, ${c.name}, ${c.problemKey}, ${c.status})
+                INSERT INTO contests (id, name, problem_key, status, instance_quota)
+                VALUES (${c.id}, ${c.name}, ${c.problemKey}, ${c.status}, ${c.instanceQuota})
               `
             })
           )

@@ -40,17 +40,25 @@ const noTeamUserId = UserId.make("66666666-6666-6666-6666-666666666666")
 
 const team1 = new Team({ id: team1Id, name: "team1", teamNumber: 1 })
 const team2 = new Team({ id: team2Id, name: "team2", teamNumber: 2 })
-const user1 = new User({ id: user1Id, githubId: 1, githubLogin: "u1", displayName: "User 1", isAdmin: false })
+const user1 = new User({
+  id: user1Id,
+  githubId: 1,
+  githubLogin: "u1",
+  displayName: "User 1",
+  isAdmin: false,
+  email: Option.none()
+})
 const noTeamUser = new User({
   id: noTeamUserId,
   githubId: 3,
   githubLogin: "u3",
   displayName: "User 3",
-  isAdmin: false
+  isAdmin: false,
+  email: Option.none()
 })
 
 const makeContest = (status: Contest["status"]) =>
-  new Contest({ id: contestId, name: "INUCON", problemKey: "problem-1", status })
+  new Contest({ id: contestId, name: "INUCON", problemKey: "problem-1", status, instanceQuota: 3 })
 
 // startJob は queued な BenchJob からのみ成功するので、テストデータ作りは
 // 常に newJob() から作った queued ジョブを起点にする。

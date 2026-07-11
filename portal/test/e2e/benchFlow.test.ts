@@ -24,7 +24,8 @@ describe("E2E: チーム作成からベンチ実行・スコアボード反映�
           id: ContestId.make("contest-e2e-1"),
           name: "INUCON",
           problemKey: "private-isu",
-          status: "preparing"
+          status: "preparing",
+          instanceQuota: 3
         })
       )
 
