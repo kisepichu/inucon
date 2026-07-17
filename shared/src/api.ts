@@ -15,10 +15,12 @@ import {
   Contest,
   ContestStatus,
   CreateInstanceRequest,
+  CreateTeamInstanceRequest,
   CreateTeamRequest,
   EnqueueBenchRequest,
   Instance,
   InstanceId,
+  InstanceStatus,
   InviteRequest,
   InviteResult,
   JobAction,
@@ -110,6 +112,51 @@ export class TargetIpOutOfSubnet extends Schema.TaggedError<TargetIpOutOfSubnet>
 export class DuplicateInstanceIndex extends Schema.TaggedError<DuplicateInstanceIndex>()(
   "DuplicateInstanceIndex",
   { teamId: TeamId, index: Schema.Int.pipe(Schema.positive()) },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// POST /api/teams/:id/instances(追加ボタン): 該当チームの creating+running 数
+// が既に Contest.instanceQuota 以上(スペック §Instance 集約 不変条件1。
+// portal/src/application/errors.ts の QuotaExceeded をマップ)。
+export class QuotaExceeded extends Schema.TaggedError<QuotaExceeded>()(
+  "QuotaExceeded",
+  { teamId: TeamId, quota: Schema.Int },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// POST /api/teams/:id/instances: 該当チームに進行中(creating/deleting)の
+// オーケストレーションが既にある(スペック §Instance 集約 不変条件2、連打・
+// 競合防止。application の ProvisionInProgress をマップ)。
+export class ProvisionInProgress extends Schema.TaggedError<ProvisionInProgress>()(
+  "ProvisionInProgress",
+  { teamId: TeamId },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// POST /api/teams/:id/instances: eevee の空き RAM が閾値未満(spike メモ
+// §リスク4。application の InsufficientMemory をマップ)。DuplicateInstanceIndex
+// 等の DB 競合系(409)とは異なり、外部リソース制約による処理不能なので
+// TargetIpOutOfSubnet と同様 422 にする。
+export class InsufficientMemory extends Schema.TaggedError<InsufficientMemory>()(
+  "InsufficientMemory",
+  { freeBytes: Schema.Int, requiredBytes: Schema.Int },
+  HttpApiSchema.annotations({ status: 422 })
+) {}
+
+// DELETE /api/teams/:id/instances/:instanceId: 削除対象の privateIp を
+// targetIp とする BenchJob が queued/running(スペック §Instance 集約
+// 不変条件4、ベンチ対象の消失防止。application の InstanceInUse をマップ)。
+export class InstanceInUse extends Schema.TaggedError<InstanceInUse>()(
+  "InstanceInUse",
+  { instanceId: InstanceId },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// DELETE /api/teams/:id/instances/:instanceId: running/failed 以外からの削除
+// 要求(domain の beginDeleting をマップ。InvalidJobTransition と同じ形)。
+export class InvalidInstanceTransition extends Schema.TaggedError<InvalidInstanceTransition>()(
+  "InvalidInstanceTransition",
+  { instanceId: InstanceId, from: InstanceStatus, to: InstanceStatus },
   HttpApiSchema.annotations({ status: 409 })
 ) {}
 
@@ -269,10 +316,43 @@ export const instancesGroup = HttpApiGroup.make("instances")
       .middleware(AdminOnly)
   )
   // 削除は admin のみ。logout と同様に冪等(存在しない id でも 204)。
+  // これは Terraform 製 VM の台帳取り込み(POST /api/instances)と対になる
+  // admin 専用の台帳操作経路であり、セルフサービス削除(deleteTeamInstance)
+  // とは意味論が異なる(こちらは無条件・冪等、セルフサービスは状態ガード付き)。
   .add(
     HttpApiEndpoint.del("deleteInstance")`/api/instances/${HttpApiSchema.param("id", InstanceId)}`
       .addSuccess(HttpApiSchema.NoContent)
       .middleware(AdminOnly)
+  )
+  // 追加ボタン(当該チームメンバー or admin。スペック §HTTP API 差分)。
+  // ガード(quota/進行中/RAM)通過で creating 行を返す(202 相当、以後は
+  // ポーリングで反映)。
+  .add(
+    HttpApiEndpoint.post("createTeamInstance")`/api/teams/${HttpApiSchema.param("id", TeamId)}/instances`
+      .setPayload(CreateTeamInstanceRequest)
+      .addSuccess(Instance)
+      .addError(NotFound)
+      .addError(Forbidden)
+      .addError(QuotaExceeded)
+      .addError(ProvisionInProgress)
+      .addError(InsufficientMemory)
+      .addError(DuplicateInstanceIndex)
+      .middleware(Authentication)
+  )
+  // 削除ボタン(当該チームメンバー or admin)。running/failed のみ受理し
+  // deleting へ遷移させる(実処理はワーカーが引き継ぐ)。path の teamId は
+  // URL 構造上の入れ子(GET/POST と同じ /api/teams/:id/instances 配下)の
+  // ためだけに存在し、認可判定は instanceId から解決した実際の所属チームで
+  // 行う(requestDeleteInstance が内部で解決するため teamId 自体は使わない)。
+  .add(
+    HttpApiEndpoint.del(
+      "deleteTeamInstance"
+    )`/api/teams/${HttpApiSchema.param("teamId", TeamId)}/instances/${HttpApiSchema.param("instanceId", InstanceId)}`
+      .addSuccess(HttpApiSchema.NoContent)
+      .addError(Forbidden)
+      .addError(InstanceInUse)
+      .addError(InvalidInstanceTransition)
+      .middleware(Authentication)
   )
 
 // コンテスト状態遷移(admin のみ)。不正遷移は domain の

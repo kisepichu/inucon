@@ -48,11 +48,14 @@ export type Me = typeof Me.Type
 export const ContestStatus = Schema.Literal("preparing", "running", "finished")
 export type ContestStatus = typeof ContestStatus.Type
 
+// Phase 3: チームごとのインスタンス上限(domain/contest.ts の instanceQuota と
+// 同形。Team ページの追加ボタン活性判定に使う)。
 export const Contest = Schema.Struct({
   id: ContestId,
   name: Schema.String,
   problemKey: Schema.String,
-  status: ContestStatus
+  status: ContestStatus,
+  instanceQuota: Schema.Int.pipe(Schema.positive())
 })
 export type Contest = typeof Contest.Type
 
@@ -120,6 +123,15 @@ export const CreateInstanceRequest = Schema.Struct({
   vmid: Schema.optional(Schema.Int)
 })
 export type CreateInstanceRequest = typeof CreateInstanceRequest.Type
+
+// POST /api/teams/:id/instances(追加ボタン、セルフサービス。スペック §HTTP
+// API 差分)。privateIp/vmid はサーバー側で teamNumber/index から算出するため
+// (スペック §Instance 集約 不変条件3・5、公平性のためユーザー入力を受けない)、
+// admin 専用の CreateInstanceRequest と異なり index のみを受け取る。
+export const CreateTeamInstanceRequest = Schema.Struct({
+  index: Schema.Int.pipe(Schema.positive())
+})
+export type CreateTeamInstanceRequest = typeof CreateTeamInstanceRequest.Type
 
 // POST /api/admin/teams/:id/invites(admin。スペック §招待フロー)。email は
 // Access ログイン用(admin 入力。GitHub からは取得しない)。

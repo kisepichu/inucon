@@ -38,7 +38,13 @@ describe("GET /api/contest", () => {
       const res = yield* client.get("/api/contest", { headers: { cookie: cookieHeader } })
       expect(res.status).toBe(200)
       const body = yield* res.json
-      expect(body).toStrictEqual({ id: "contest-1", name: "INUCON", problemKey: "private-isu", status: "preparing" })
+      expect(body).toStrictEqual({
+        id: "contest-1",
+        name: "INUCON",
+        problemKey: "private-isu",
+        status: "preparing",
+        instanceQuota: 3
+      })
     }).pipe(Effect.provide(TestLayer))
   )
 })

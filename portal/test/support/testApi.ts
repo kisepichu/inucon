@@ -3,7 +3,7 @@ import { NodeHttpServer } from "@effect/platform-node"
 import type { ConfigProvider } from "effect"
 import { ConfigProvider as CP, Layer } from "effect"
 import { api } from "shared"
-import { AuthConfig, RunnerConfig } from "../../src/application/ports.js"
+import { AuthConfig, ProvisioningConfig, RunnerConfig } from "../../src/application/ports.js"
 import { AdminLive } from "../../src/infrastructure/http/handlers/admin.js"
 import { AuthLive } from "../../src/infrastructure/http/handlers/auth.js"
 import { BenchLive } from "../../src/infrastructure/http/handlers/bench.js"
@@ -24,7 +24,12 @@ import { UserRepoLive } from "../../src/infrastructure/sql/repos/userRepo.js"
 import { UuidGenLive } from "../../src/infrastructure/sql/uuid.js"
 import type { StubGithubUser } from "./githubOAuthStub.js"
 import { makeGithubOAuthStub } from "./githubOAuthStub.js"
-import { makeCloudflarePortTest, makeGithubKeysPortTest, makeProxmoxPortTest } from "./inMemory.js"
+import {
+  makeCloudflarePortTest,
+  makeGithubKeysPortTest,
+  makeProxmoxPortTest,
+  ProvisioningConfigTest
+} from "./inMemory.js"
 import { MigratorTest, SqlTest } from "./sqlTest.js"
 
 // `:memory:` SQLite + 本番マイグレーション + 本番リポジトリ実装。
@@ -113,6 +118,10 @@ export const makeAppTestLayer = (options?: {
           Layer.succeed(AuthConfig, { adminGithubLogins: options?.adminGithubLogins ?? [] })
         ),
         Layer.provide(makeInstancePortsTestLive(options?.githubKeysByLogin)),
+        // createTeamInstance(自チーム追加ボタン)ハンドラが RAM ガード閾値を
+        // 要求するため、http テスト全般が壊れないよう既定値を配線する
+        // (makeInstancePortsTestLive と同じ理由)。
+        Layer.provide(ProvisioningConfigTest()),
         Layer.provide(
           Layer.setConfigProvider(
             options?.configProvider !== undefined
