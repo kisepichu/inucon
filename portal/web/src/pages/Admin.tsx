@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from "react"
-import type { Contest, Instance, TeamId, TeamWithMembers } from "shared/schemas"
+import type { Contest, Instance, InviteResult, TeamId, TeamInvite, TeamWithMembers } from "shared/schemas"
 import { ApiError, api } from "../api.ts"
+
+const formatDate = (millis: number) => new Date(millis).toLocaleString()
 
 export function Admin() {
   const [teams, setTeams] = useState<Array<TeamWithMembers>>([])
@@ -19,6 +21,15 @@ export function Admin() {
   const [instanceTeamId, setInstanceTeamId] = useState("")
   const [instanceIndex, setInstanceIndex] = useState("")
   const [instancePrivateIp, setInstancePrivateIp] = useState("")
+
+  // 招待(チーム選択 + githubLogin/email フォーム、Phase 3)。
+  const [inviteTeamId, setInviteTeamId] = useState("")
+  const [inviteLogin, setInviteLogin] = useState("")
+  const [inviteEmail, setInviteEmail] = useState("")
+  const [inviteSubmitting, setInviteSubmitting] = useState(false)
+  const [inviteError, setInviteError] = useState<string | null>(null)
+  const [inviteResult, setInviteResult] = useState<InviteResult | null>(null)
+  const [invites, setInvites] = useState<Array<TeamInvite>>([])
 
   const loadTeams = useCallback(async () => {
     const data = await api.listTeams()
@@ -47,6 +58,23 @@ export function Admin() {
     })()
     loadContest()
   }, [loadTeams, loadContest])
+
+  const loadInvites = useCallback(async (teamId: string) => {
+    if (teamId === "") {
+      setInvites([])
+      return
+    }
+    try {
+      setInvites(await api.listInvites(teamId))
+    } catch {
+      setInvites([])
+    }
+  }, [])
+
+  // 招待対象チームを切り替えたら招待中一覧を取り直す。
+  useEffect(() => {
+    loadInvites(inviteTeamId)
+  }, [inviteTeamId, loadInvites])
 
   const runAction = async (fn: () => Promise<void>) => {
     setError(null)
@@ -108,6 +136,26 @@ export function Admin() {
   const handleStartContest = () => runAction(async () => setContest(await api.startContest()))
   const handleFinishContest = () => runAction(async () => setContest(await api.finishContest()))
 
+  const handleInvite = (event: React.FormEvent) => {
+    event.preventDefault()
+    setInviteError(null)
+    setInviteResult(null)
+    setInviteSubmitting(true)
+    ;(async () => {
+      try {
+        const result = await api.inviteMember(inviteTeamId, { githubLogin: inviteLogin, email: inviteEmail })
+        setInviteResult(result)
+        setInviteLogin("")
+        setInviteEmail("")
+        await loadInvites(inviteTeamId)
+      } catch (err) {
+        setInviteError(err instanceof ApiError ? err.tag : "招待に失敗しました")
+      } finally {
+        setInviteSubmitting(false)
+      }
+    })()
+  }
+
   return (
     <div>
       <h1>Admin</h1>
@@ -163,6 +211,84 @@ export function Admin() {
           />
           <button type="submit">割当</button>
         </form>
+      </section>
+
+      <section>
+        <h2>招待</h2>
+        <select value={inviteTeamId} onChange={(event) => setInviteTeamId(event.target.value)}>
+          <option value="" disabled>
+            チームを選択
+          </option>
+          {teams.map((team) => (
+            <option key={team.id} value={team.id}>
+              {team.name}
+            </option>
+          ))}
+        </select>
+
+        <form className="invite-form" onSubmit={handleInvite}>
+          <input
+            placeholder="githubLogin"
+            value={inviteLogin}
+            onChange={(event) => setInviteLogin(event.target.value)}
+            required
+          />
+          <input
+            type="email"
+            placeholder="email(Access ログイン用)"
+            value={inviteEmail}
+            onChange={(event) => setInviteEmail(event.target.value)}
+            required
+          />
+          <button type="submit" disabled={inviteSubmitting || inviteTeamId === ""}>
+            招待
+          </button>
+        </form>
+        {inviteError !== null && (
+          <p role="alert" className="error">
+            {inviteError}
+          </p>
+        )}
+        {inviteResult !== null && (
+          <div className="invite-result">
+            <p>ポータル: {inviteResult.portal === "assigned" ? "即時割当(既にログイン済み)" : "招待作成(未ログイン)"}</p>
+            <p>Access: {inviteResult.access.ok ? "OK" : `失敗(${inviteResult.access.error ?? "-"})`}</p>
+            <ul>
+              {inviteResult.sshKeys.map((sshKey) => (
+                <li key={sshKey.instance}>
+                  {sshKey.instance}: {sshKey.ok ? "OK" : `失敗(${sshKey.error ?? "-"})`}
+                </li>
+              ))}
+            </ul>
+            {inviteResult.warnings.length > 0 && (
+              <ul className="warnings">
+                {inviteResult.warnings.map((warning) => (
+                  <li key={warning}>{warning}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
+        <h3>招待中一覧</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>githubLogin</th>
+              <th>email</th>
+              <th>招待日時</th>
+            </tr>
+          </thead>
+          <tbody>
+            {invites.map((invite) => (
+              <tr key={invite.githubLogin}>
+                <td>{invite.githubLogin}</td>
+                <td>{invite.email}</td>
+                <td>{formatDate(invite.invitedAt)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </section>
 
       <section>

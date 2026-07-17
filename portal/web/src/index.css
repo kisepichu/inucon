@@ -92,6 +92,62 @@ section {
   color: #b00020;
 }
 
+/* Phase 3: インスタンス状態バッジ(色分けのみ、装飾は Phase B)。 */
+.status-badge {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 0.25rem;
+  font-size: 0.85em;
+  background: #e0e0e0;
+  color: #333;
+}
+
+.status-creating {
+  background: #fff3cd;
+  color: #7a5b00;
+}
+
+.status-running {
+  background: #d4edda;
+  color: #155724;
+}
+
+.status-deleting {
+  background: #fff3cd;
+  color: #7a5b00;
+}
+
+.status-deleted {
+  background: #e0e0e0;
+  color: #555;
+}
+
+.status-failed {
+  background: #f8d7da;
+  color: #721c24;
+}
+
+.instance-error {
+  margin: 0.25rem 0 0;
+  font-size: 0.85em;
+}
+
+.invite-form {
+  margin-top: 0.5rem;
+}
+
+.invite-result {
+  border: 1px solid #ddd;
+  border-radius: 0.25rem;
+  padding: 0.5rem 0.75rem;
+  margin-bottom: 1rem;
+  max-width: 420px;
+}
+
+.invite-result .warnings {
+  color: #7a5b00;
+}
+
 .login-page {
   display: flex;
   flex-direction: column;
