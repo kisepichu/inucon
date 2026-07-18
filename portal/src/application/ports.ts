@@ -186,12 +186,20 @@ export class BenchJobRepo extends Context.Tag("app/BenchJobRepo")<
     // あり)なら TeamJobAlreadyQueued を返す。
     // requireRunningInstance(Task 6 レビュー #D): enqueueBenchJob の instanceId
     // 起点の enqueue(bench.ts)だけが渡す省略可能な追加ガード。渡された場合、
-    // 上記 INSERT の WHERE に「対象 instance が今も running であること」を
-    // 単一原子操作の一部として追加する(手動 IP:port 指定の enqueue は
-    // instance 行に対応しないため渡さない = 挙動不変)。この追加ガードで
-    // 0 行になった場合、team のキュー不変条件(NOT EXISTS 側)が原因でなければ
-    // InstanceNotRunning を返す(削除 UPDATE 側の bench_jobs チェックと対に
-    // なる、TOCTOU 回避)。
+    // 上記 INSERT の WHERE に「対象 instance が id で今も running であること」を
+    // 単一原子操作の一部として追加する(instanceId パス限定のより厳しい追加条件)。
+    // 【Task 6 レビュー #I】これとは別に、フォームを問わず常に効く universal な
+    // ガードも同じ INSERT の WHERE に入る: 「job の targetIp と private_ip が
+    // 一致し、team_id も一致する instances 行の中に creating/deleting のもの
+    // が無いこと」。手動 IP:port 指定(instance 行に対応しない/対応しても
+    // running)の enqueue はこれで従来どおり通るが、targetIp がたまたま
+    // 自チームの managed instance の private_ip と一致し、かつそれが
+    // creating/deleting(削除・払い出しの途中)なら、フォームに関わらず弾かれる
+    // (削除 UPDATE 側の bench_jobs チェックと対になる、TOCTOU 回避)。
+    // 0 行挿入時の分類は team のキュー不変条件 → universal ガード
+    // (creating/deleting な managed instance)→ instanceId パスの by-id running
+    // 失敗、の優先順位でいずれも InstanceNotRunning/TeamJobAlreadyQueued に
+    // 落とす(benchJobRepo.ts 実装のコメント参照)。
     readonly insertIfAllowed: (
       job: BenchJob,
       requireRunningInstance?: { instanceId: InstanceId; teamId: TeamId }

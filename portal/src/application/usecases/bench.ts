@@ -17,10 +17,20 @@ import { BenchJobRepo, ContestRepo, InstanceRepo, RunnerConfig, TeamRepo, UuidGe
 
 // requireRunningInstance(Task 6 レビュー #D): instanceId 起点の enqueue
 // (enqueueBenchJob)だけが渡す。BenchJobRepo.insertIfAllowed のアトミック
-// INSERT に「対象 instance が今も running であること」を追加ガードさせる
-// ためのフィールドで、渡された場合は 0 行挿入時(team のキュー不変条件が
-// 原因でない場合)に InstanceNotRunning を返す。手動 IP:port 指定の enqueue
-// は対応する instance 行が無いため渡さない(挙動不変)。
+// INSERT に「対象 instance が id で今も running であること」を追加ガードさせる
+// ためのフィールドで、渡された場合は 0 行挿入時(team のキュー不変条件・
+// 下記 universal ガードのどちらも原因でない場合)に InstanceNotRunning を返す。
+// 手動 IP:port 指定の enqueue は対応する instance 行が無いのが通常なので
+// 渡さない(挙動不変)。
+//
+// 【Task 6 レビュー #I】ただし手動 IP:port 指定でも targetIp が自チームの
+// managed instance の private_ip と一致することはあり得る(スペックはこの
+// フォームを禁止していない)。その場合に備え、insertIfAllowed 側は
+// requireRunningInstance の有無に関わらず常に「targetIp が
+// creating/deleting な自チームの managed instance を指していないこと」を
+// 同じ原子的 INSERT で検証する(instanceId パス専用の instanceGuard とは別の
+// 独立したガード)。これにより、削除中/払い出し中の VM への直接 IP enqueue も
+// フォームを問わず一貫して弾かれる。
 export const enqueueBench = (args: {
   user: User
   targetIp: string

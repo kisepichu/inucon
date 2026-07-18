@@ -1006,6 +1006,107 @@ layer("BenchJobRepo: insertIfAllowed requireRunningInstance", (it) => {
   )
 })
 
+// Task 6 レビュー #I: 直接 IP:port 指定(requireRunningInstance 未指定)の
+// enqueue でも、targetIp が自チームの managed instance の private_ip と
+// 一致し、かつその instance が creating/deleting(払い出し中/削除中)なら
+// フォームに関わらず弾かれることを確認する universal ガードの回帰テスト。
+layer("BenchJobRepo: insertIfAllowed 直接 IP 指定でも creating/deleting な managed instance を弾く(#I)", (it) => {
+  for (const status of ["creating", "deleting"] as const) {
+    it.effect(`targetIp が ${status} な managed instance の private_ip と一致すると InstanceNotRunning(挿入されない)`, () =>
+      Effect.gen(function* () {
+        const teams = yield* TeamRepo
+        const instances = yield* InstanceRepo
+        const jobs = yield* BenchJobRepo
+        const team = new Team({
+          id: TeamId.make(`team-bj-directip-${status}`),
+          name: `BJ DirectIp ${status}`,
+          teamNumber: status === "creating" ? 231 : 232
+        })
+        yield* teams.create(team)
+        const instance = new Instance({
+          id: InstanceId.make(`instance-bj-directip-${status}`),
+          teamId: team.id,
+          index: 1,
+          vmid: 1301,
+          privateIp: `10.100.${status === "creating" ? 231 : 232}.11`,
+          status,
+          progress: [],
+          errorMessage: Option.none(),
+          createdAt: 0,
+          updatedAt: 0
+        })
+        yield* instances.create(instance)
+
+        // instanceId は渡さない = 手動 IP:port 指定の直接フォーム。
+        const job = newJob({
+          id: BenchJobId.make(`bj-directip-${status}`),
+          teamId: team.id,
+          targetIp: instance.privateIp,
+          targetPort: 80,
+          now: 1000
+        })
+        const exit = yield* Effect.exit(jobs.insertIfAllowed(job))
+        expect(exit).toStrictEqual(Exit.fail(new InstanceNotRunning({ instanceId: instance.id })))
+
+        const listed = yield* jobs.listByTeam(team.id, 50)
+        expect(listed).toHaveLength(0)
+      })
+    )
+  }
+
+  it.effect("targetIp が running な managed instance の private_ip と一致すれば直接 IP 指定でも成功する", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const jobs = yield* BenchJobRepo
+      const team = new Team({ id: TeamId.make("team-bj-directip-running"), name: "BJ DirectIp Running", teamNumber: 233 })
+      yield* teams.create(team)
+      const instance = new Instance({
+        id: InstanceId.make("instance-bj-directip-running"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1303,
+        privateIp: "10.100.233.11",
+        status: "running",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(instance)
+
+      const job = newJob({
+        id: BenchJobId.make("bj-directip-running"),
+        teamId: team.id,
+        targetIp: instance.privateIp,
+        targetPort: 80,
+        now: 1000
+      })
+      const inserted = yield* jobs.insertIfAllowed(job)
+      expect(inserted).toStrictEqual(job)
+    })
+  )
+
+  it.effect("targetIp に対応する instance 行が無い(unmanaged)なら直接 IP 指定は従来どおり成功する", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+      const team = new Team({ id: TeamId.make("team-bj-directip-unmanaged"), name: "BJ DirectIp Unmanaged", teamNumber: 234 })
+      yield* teams.create(team)
+
+      const job = newJob({
+        id: BenchJobId.make("bj-directip-unmanaged"),
+        teamId: team.id,
+        targetIp: "10.100.234.55",
+        targetPort: 80,
+        now: 1000
+      })
+      const inserted = yield* jobs.insertIfAllowed(job)
+      expect(inserted).toStrictEqual(job)
+    })
+  )
+})
+
 layer("BenchJobRepo: appendLog", (it) => {
   it.effect("追記になる", () =>
     Effect.gen(function* () {
