@@ -4,7 +4,8 @@ import type { BenchJobStatus } from "../../../domain/benchJob.js"
 import { BenchJob } from "../../../domain/benchJob.js"
 import { CannotCancelRunning, InvalidJobTransition, TeamJobAlreadyQueued } from "../../../domain/errors.js"
 import type { BenchJobId } from "../../../domain/ids.js"
-import { TeamId } from "../../../domain/ids.js"
+import { InstanceId, TeamId } from "../../../domain/ids.js"
+import { InstanceNotRunning } from "../../../application/errors.js"
 import { BenchJobRepo } from "../../../application/ports.js"
 import { boolToInt, decodeRow, nullableIntToBool, optionBoolToNullableInt, optionToNull, wrapSqlError } from "./support.js"
 
@@ -61,10 +62,76 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
       // が、1 文の INSERT...SELECT なら DB のロックにより直列化される。
       // 0 行挿入(= 既に queued/running あり)なら TeamJobAlreadyQueued。
       // bench_job_logs の空行 INSERT は同一トランザクション内の別文のまま。
-      insertIfAllowed: (job: BenchJob) =>
+      //
+      // requireRunningInstance(Task 6 レビュー #D、id 照合は #H): enqueueBenchJob の
+      // instanceId 起点の enqueue だけが渡す。渡された場合、この INSERT の
+      // WHERE に「対象 instance が今も running であること」を
+      // `AND EXISTS (SELECT 1 FROM instances WHERE ...)` として同一原子操作に
+      // 追加する(instanceId パス専用の追加ガード)。
+      // 【Task 6 レビュー #H】この EXISTS は id で対象行を一意に特定する
+      // (`id = requireRunningInstance.instanceId`)。team_id + private_ip だけの
+      // 照合では、対象 instance 自体は running でなくなっていても、スロット
+      // 再利用や admin 台帳取り込みの重複 IP によって「同じ team・同じ IP の
+      // 別の running 行」がたまたま存在すると誤って通ってしまう。id が
+      // 対象行を一意に決める権威であり、team_id は defensive な追加条件として
+      // 残す(他チームの instance id を誤って渡すような呼び出し側のバグを
+      // 二重に防ぐだけで、判定自体は id で完結する)。
+      //
+      // 【Task 6 レビュー #I】上の instanceGuard は instanceId 経由の enqueue
+      // にしか付かない。手動 IP:port 指定(直接 targetIp/targetPort を渡す)の
+      // enqueue でも、targetIp がたまたま自チームの managed instance の
+      // private_ip と一致していれば同じ VM を狙える(スペックはこの直接指定
+      // フォームを禁止していない)。そのため削除(instanceRepo.
+      // beginDeletingIfAllowed が status を deleting へ)と enqueue のレースは
+      // instanceId パスだけでなく直接 IP パスでも起こりうるが、直接 IP パスは
+      // instanceGuard が付かないため、削除 UPDATE が先に確定していても素通り
+      // して「削除中の VM に対するジョブ」を作れてしまっていた(フォームの
+      // 選び方でクロス集約不変条件が守られたり守られなかったりする不整合)。
+      //
+      // 対策: フォームを問わない universalInstanceGuard を追加する。
+      // 「job.targetIp と private_ip が一致し、かつ team_id が一致する
+      // instances 行の中に creating/deleting のものが無いこと」を常に(id
+      // 指定の有無に関わらず)同一原子的 INSERT の WHERE に含める。
+      //   - running な managed instance(意図した対象)は対象外(許可され続ける)。
+      //   - instance 行が無い(unmanaged)targetIp も対象外(許可され続ける、
+      //     手動 IP:port の主要ユースケース)。
+      //   - failed/deleted な instance がその IP にあっても対象外(スコープ外
+      //     — instanceId パスの by-id running チェックが別途それを見る)。
+      // instanceGuard(by-id running)は instanceId パス限定のより厳しい
+      // 追加条件として、universalInstanceGuard とは独立に両方 WHERE に乗る。
+      //
+      // instanceRepo.beginDeletingIfAllowed 側も対称に「対象 IP を
+      // targetIp とする queued/running な bench_jobs が無いこと」を UPDATE の
+      // WHERE に含めているため、削除 UPDATE とこの INSERT のどちらが先に
+      // 確定してもレースなく相手を検出できる(SQLite が書き込みを直列化する
+      // ため、後に実行された側が必ず先に確定した側の結果を見る)。
+      //
+      // 0 行挿入時の原因切り分け(優先順位、いずれも呼び出し元へ返す型付き
+      // エラーを選ぶためだけの読み直しで、許可判定自体は上の単一原子的 INSERT
+      // が行っている、createIfAllowed と同じ方針):
+      //   1. team のキュー不変条件(NOT EXISTS 側)が原因なら TeamJobAlreadyQueued。
+      //   2. そうでなく、universalInstanceGuard に該当する creating/deleting な
+      //      managed instance が targetIp にあれば InstanceNotRunning(その
+      //      instance の id を team_id+private_ip で引き直して載せる。
+      //      instanceId パス・直接 IP パスの両方でここに落ちる)。
+      //   3. そうでなく instanceId パス(requireRunningInstance あり)なら、
+      //      by-id running チェックが原因(#H)なので requireRunningInstance の
+      //      instanceId で InstanceNotRunning。
+      insertIfAllowed: (
+        job: BenchJob,
+        requireRunningInstance?: { instanceId: InstanceId; teamId: TeamId }
+      ) =>
         wrapSqlError(
           sql.withTransaction(
             Effect.gen(function* () {
+              const instanceGuard = requireRunningInstance
+                ? sql`AND EXISTS (
+                    SELECT 1 FROM instances
+                    WHERE id = ${requireRunningInstance.instanceId}
+                      AND team_id = ${requireRunningInstance.teamId}
+                      AND status = 'running'
+                  )`
+                : sql.literal("")
               const rows = yield* sql<BenchJobRow>`
                 INSERT INTO bench_jobs
                   (id, team_id, target_ip, target_port, status, score, passed, error_message,
@@ -77,9 +144,44 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
                 WHERE NOT EXISTS (
                   SELECT 1 FROM bench_jobs WHERE team_id = ${job.teamId} AND status IN ('queued', 'running')
                 )
+                AND NOT EXISTS (
+                  SELECT 1 FROM instances
+                  WHERE team_id = ${job.teamId} AND private_ip = ${job.targetIp}
+                    AND status IN ('creating', 'deleting')
+                )
+                ${instanceGuard}
                 RETURNING ${columns}
               `
               if (rows.length === 0) {
+                const teamQueueRows = yield* sql<{ id: string }>`
+                  SELECT id FROM bench_jobs
+                  WHERE team_id = ${job.teamId} AND status IN ('queued', 'running')
+                `
+                if (teamQueueRows.length > 0) {
+                  return yield* Effect.fail(new TeamJobAlreadyQueued({ teamId: job.teamId }))
+                }
+                const blockingInstanceRows = yield* sql<{ id: string }>`
+                  SELECT id FROM instances
+                  WHERE team_id = ${job.teamId} AND private_ip = ${job.targetIp}
+                    AND status IN ('creating', 'deleting')
+                `
+                if (blockingInstanceRows.length > 0) {
+                  return yield* Effect.fail(
+                    new InstanceNotRunning({ instanceId: InstanceId.make(blockingInstanceRows[0].id) })
+                  )
+                }
+                if (requireRunningInstance) {
+                  return yield* Effect.fail(
+                    new InstanceNotRunning({ instanceId: requireRunningInstance.instanceId })
+                  )
+                }
+                // 防御的フォールバック: 上の3条件のいずれにも該当しないのに
+                // 0 行挿入になるケースは想定していない(team のキュー不変条件
+                // でも universalInstanceGuard でもなく、instanceId パスでも
+                // ないなら instanceGuard は空フラグメントで WHERE に影響しない
+                // ため、他に挿入を阻む条件が無いはず)。万一到達した場合も
+                // 誤って InstanceNotRunning と誤報しないよう、既存の
+                // TeamJobAlreadyQueued 判定にフォールバックする。
                 return yield* Effect.fail(new TeamJobAlreadyQueued({ teamId: job.teamId }))
               }
               yield* sql`INSERT INTO bench_job_logs (job_id, log) VALUES (${job.id}, '')`

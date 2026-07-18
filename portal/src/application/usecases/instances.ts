@@ -213,25 +213,29 @@ export const requestCreateInstance = (args: { user: User; teamId: TeamId }) =>
 // (cancelBench と同様、ID の存在有無を漏らさない)。
 //
 // ガード順序: authz → 対象自身の状態ガード(InvalidInstanceTransition、
-// 事前チェック) → bench 使用中ガード(InstanceInUse) → 原子的な
-// beginDeletingIfAllowed(チーム全体の進行中1本ガード込み)、の順。authz を
-// 最初に置くのは他エンドポイントと同じく「他チームの情報の有無を漏らさない」
-// ため。対象自身の状態ガードを次に置くのは、それ自体が
-// creating/deleting/deleted であれば以降のチェックをするまでもなく 409 が
-// 確定するため(無駄な listByTeam/UPDATE を避ける fail-fast)。bench
-// 使用中ガードはその後(対象 IP の実利用状況の局所的な確認)。
+// 事前チェック) → bench 使用中ガード(InstanceInUse、事前チェック) → 原子的な
+// beginDeletingIfAllowed(チーム全体の進行中1本ガード + bench 使用中ガード
+// 込み)、の順。authz を最初に置くのは他エンドポイントと同じく「他チームの
+// 情報の有無を漏らさない」ため。対象自身の状態ガードを次に置くのは、それ
+// 自体が creating/deleting/deleted であれば以降のチェックをするまでもなく
+// 409 が確定するため(無駄な listByTeam/UPDATE を避ける fail-fast)。bench
+// 使用中ガードはその後(対象 IP の実利用状況の局所的な確認、共通ケースの
+// fail-fast)。
 //
-// 原子性(Task 6 レビュー #B、TOCTOU 修正): スペック §Instance 集約
+// 原子性(Task 6 レビュー #B、#D、TOCTOU 修正): スペック §Instance 集約
 // 不変条件2(チームにつき進行中の creating/deleting は高々1件)を守るための
-// 「対象以外に creating/deleting が無いこと」チェックは、旧実装では
-// listByTeam で読んでから update する二段階で行っていた(Task 6 レビュー
-// #4)。これだと二つの並行削除リクエスト(または作成と削除の競合)が両方とも
-// 読み取りを通過し、両方が deleting へ書き込めてしまう(不変条件違反)。
-// InstanceRepo.beginDeletingIfAllowed が「対象行が running/failed」「チーム
-// に対象以外の creating/deleting が無い」を単一の原子的 UPDATE 文で検証する
-// ため、ここではその結果だけを見る。0 行更新(None)の場合は再読み込みして
-// 原因を優先順位(対象不在 → 対象の状態が running/failed でなくなった →
-// 他の進行中に競り負けた)で判定し、対応する型付きエラーを返す。
+// 「対象以外に creating/deleting が無いこと」チェック、および不変条件4
+// (ベンチ対象の消失防止)を守るための「bench 使用中でないこと」チェックは、
+// どちらも上の事前チェックだけでは TOCTOU が残る(旧実装は listByTeam で
+// 読んでから update する二段階で、二つの並行リクエスト — または削除と
+// bench enqueue の競合 — が両方とも読み取りを通過して両方書き込めてしまう、
+// Task 6 レビュー #4/#D)。InstanceRepo.beginDeletingIfAllowed が「対象行が
+// running/failed」「チームに対象以外の creating/deleting が無い」「対象の
+// privateIp を targetIp とする queued/running な bench_jobs が無い」を単一の
+// 原子的 UPDATE 文で検証するため、ここではその結果だけを見る。0 行更新
+// (None)の場合は再読み込みして原因を優先順位(対象不在 → 対象の状態が
+// running/failed でなくなった → bench 対象中になった → 他の進行中に
+// 競り負けた)で判定し、対応する型付きエラーを返す。
 export const requestDeleteInstance = (args: { user: User; instanceId: InstanceId }) =>
   Effect.gen(function* () {
     const instances = yield* InstanceRepo
@@ -276,5 +280,20 @@ export const requestDeleteInstance = (args: { user: User; instanceId: InstanceId
         new InvalidInstanceTransition({ instanceId: recheck.value.id, from: recheck.value.status, to: "deleting" })
       )
     }
+
+    // Task 6 レビュー #D: 上の事前チェック(teamJobs)は非アトミックなので、
+    // その読み取りから beginDeletingIfAllowed の UPDATE までの間に bench
+    // enqueue が割り込んで queued/running ジョブを挿入した可能性がある。
+    // ここで読み直して「bench 対象中になったこと」を「他インスタンスの
+    // 進行中」より先に判定する(UPDATE の WHERE 句自体もこの順で NOT EXISTS を
+    // 並べており、対称に揃える)。
+    const recheckJobs = yield* jobs.listByTeam(recheck.value.teamId, 50)
+    const stillInUse = recheckJobs.some(
+      (j) => j.targetIp === recheck.value.privateIp && (j.status === "queued" || j.status === "running")
+    )
+    if (stillInUse) {
+      return yield* Effect.fail(new InstanceInUse({ instanceId: recheck.value.id }))
+    }
+
     return yield* Effect.fail(new ProvisionInProgress({ teamId: instance.teamId }))
   })

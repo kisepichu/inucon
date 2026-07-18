@@ -13,6 +13,7 @@ import {
   TeamJobAlreadyQueued
 } from "../../src/domain/errors.js"
 import { BenchJobId, ContestId, InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
+import { InstanceNotRunning } from "../../src/application/errors.js"
 import {
   BenchJobRepo,
   ContestRepo,
@@ -408,6 +409,58 @@ layer("InstanceRepo: create 重複拒否", (it) => {
       expect(created.id).toStrictEqual(fresh.id)
     })
   )
+
+  // Task 6 レビュー #E: migration 0003 で部分ユニークインデックスの述語を
+  // 「status != 'deleted'」に締め直した(failed も対象)。以前は failed 行が
+  // あっても同じ idx へ新規 create できてしまい(#A のアプリ層 allocator の
+  // 意図と食い違っていた)、vmid/IP 衝突や後述の 500 エラーの温床だった。
+  it.effect("failed 行がある idx への新規 create は DuplicateInstanceIndex(Task 6 レビュー #E)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const team = new Team({
+        id: TeamId.make("team-repo-idx-failed-dup"),
+        name: "Idx Failed Dup",
+        teamNumber: 105
+      })
+      yield* teams.create(team)
+
+      // idx=1 が failed のまま(未掃除、VM/vmid をまだ握っている想定)
+      const failed = new Instance({
+        id: InstanceId.make("instance-failed-dup-old"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1105,
+        privateIp: "10.100.105.11",
+        status: "failed",
+        progress: [],
+        errorMessage: Option.some("boom"),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(failed)
+
+      // 同 idx=1 への新規 create は許されない(以前は成功していた #A バグ)
+      const colliding = new Instance({
+        id: InstanceId.make("instance-failed-dup-new"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1105,
+        privateIp: "10.100.105.11",
+        status: "running",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 1,
+        updatedAt: 1
+      })
+      const exit = yield* Effect.exit(instances.create(colliding))
+      expect(exit).toStrictEqual(Exit.fail(new DuplicateInstanceIndex({ teamId: team.id, index: 1 })))
+
+      // 拒否された行は挿入されていない(failed 行のみ残る)
+      const listed = yield* instances.listByTeam(team.id)
+      expect(listed).toStrictEqual([failed])
+    })
+  )
 })
 
 layer("InstanceRepo: beginDeletingIfAllowed", (it) => {
@@ -557,6 +610,11 @@ layer("InstanceRepo: beginDeletingIfAllowed", (it) => {
     })
   )
 
+  // Task 6 レビュー #E 確認: この UPDATE は自分自身(同一 id)の行を書き換える
+  // だけで新しい行を挿入するわけではないため、migration 0003 で failed も
+  // 部分ユニークインデックスの対象(status != 'deleted')に含めても、他に
+  // 同じ idx を持つ行が無ければこの遷移は問題なく成功し続ける
+  // (「failed 行の通常の自己サービス削除」経路は壊れない)。
   it.effect("failed からも deleting へ遷移できる(Task 4 レビュー I4)", () =>
     Effect.gen(function* () {
       const teams = yield* TeamRepo
@@ -577,6 +635,89 @@ layer("InstanceRepo: beginDeletingIfAllowed", (it) => {
         updatedAt: 0
       })
       yield* instances.create(target)
+
+      const result = yield* instances.beginDeletingIfAllowed(target.id, 500)
+      expect(Option.isSome(result)).toBe(true)
+      if (Option.isSome(result)) {
+        expect(result.value.status).toBe("deleting")
+      }
+    })
+  )
+
+  // Task 6 レビュー #D: 削除とベンチ enqueue のクロス集約 TOCTOU 修正。対象の
+  // private_ip を targetIp とする queued/running な bench_jobs があれば、
+  // 事前チェックを経ずにこのアトミック UPDATE 自体が拒否する(呼び出し元の
+  // 事前 listByTeam チェックが無くても不変条件4を守れることを直接確認する)。
+  it.effect("対象 IP を targetIp とする queued な bench_job があれば None(状態を変えない)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const jobs = yield* BenchJobRepo
+      const team = new Team({ id: TeamId.make("team-begindel-benchinuse"), name: "BeginDel BenchInUse", teamNumber: 215 })
+      yield* teams.create(team)
+
+      const target = new Instance({
+        id: InstanceId.make("instance-begindel-benchinuse"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1217,
+        privateIp: "10.100.215.11",
+        status: "running",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(target)
+      yield* jobs.insertIfAllowed(
+        newJob({
+          id: BenchJobId.make("job-begindel-benchinuse"),
+          teamId: team.id,
+          targetIp: target.privateIp,
+          targetPort: 80,
+          now: 0
+        })
+      )
+
+      const result = yield* instances.beginDeletingIfAllowed(target.id, 500)
+      expect(result).toStrictEqual(Option.none())
+
+      const listed = yield* instances.listByTeam(team.id)
+      expect(listed.find((i) => i.id === target.id)?.status).toBe("running")
+    })
+  )
+
+  it.effect("対象 IP を targetIp とする bench_job が無ければ Some(従来どおり成功する)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const jobs = yield* BenchJobRepo
+      const team = new Team({ id: TeamId.make("team-begindel-benchfree"), name: "BeginDel BenchFree", teamNumber: 216 })
+      yield* teams.create(team)
+
+      const target = new Instance({
+        id: InstanceId.make("instance-begindel-benchfree"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1218,
+        privateIp: "10.100.216.11",
+        status: "running",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(target)
+      // 別インスタンスの IP を対象にした job は無関係(混入しないことも確認)。
+      yield* jobs.insertIfAllowed(
+        newJob({
+          id: BenchJobId.make("job-begindel-benchfree-other"),
+          teamId: team.id,
+          targetIp: "10.100.216.99",
+          targetPort: 80,
+          now: 0
+        })
+      )
 
       const result = yield* instances.beginDeletingIfAllowed(target.id, 500)
       expect(Option.isSome(result)).toBe(true)
@@ -618,6 +759,350 @@ layer("BenchJobRepo: insertIfAllowed 重複拒否", (it) => {
       })
       const exit = yield* Effect.exit(jobs.insertIfAllowed(job2))
       expect(exit).toStrictEqual(Exit.fail(new TeamJobAlreadyQueued({ teamId: team.id })))
+    })
+  )
+})
+
+// Task 6 レビュー #D: instanceId 起点の enqueue が渡す requireRunningInstance
+// ガード。BenchJobRepo は「全体で running は同時に 1 本まで」という
+// テーブル全体不変条件を持つため、他のシナリオと DB を共有しないよう
+// 1 シナリオ = 1 個の layer(...) 呼び出しに分ける(既存の方針どおり)。
+layer("BenchJobRepo: insertIfAllowed requireRunningInstance", (it) => {
+  it.effect("対象 instance が running なら requireRunningInstance 付きでも挿入できる", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const jobs = yield* BenchJobRepo
+      const team = new Team({ id: TeamId.make("team-bj-reqrun-ok"), name: "BJ ReqRun OK", teamNumber: 120 })
+      yield* teams.create(team)
+      const instance = new Instance({
+        id: InstanceId.make("instance-bj-reqrun-ok"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1120,
+        privateIp: "10.100.120.11",
+        status: "running",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(instance)
+
+      const job = newJob({
+        id: BenchJobId.make("bj-reqrun-ok"),
+        teamId: team.id,
+        targetIp: instance.privateIp,
+        targetPort: 80,
+        now: 1000
+      })
+      const inserted = yield* jobs.insertIfAllowed(job, {
+        instanceId: instance.id,
+        teamId: team.id
+      })
+      expect(inserted).toStrictEqual(job)
+    })
+  )
+
+  // Task 6 レビュー #H: team_id + private_ip だけの照合は緩すぎる。対象
+  // instance 自身は running でなくなっていても、同じ team・同じ private_ip を
+  // 持つ「別の」running 行がたまたま存在すると誤って通ってしまうバグの回帰
+  // テスト。ここでは対象(deleting)とは別の instance を同じ team・同じ
+  // private_ip で running のまま作り、id 照合であれば対象行の状態だけで
+  // 判定されて拒否される(team+IP 照合だと誤って通ってしまう)ことを示す。
+  it.effect(
+    "同じ team+private_ip の別 instance が running でも、対象 instance 自身が running でなければ拒否される(id 照合)",
+    () =>
+      Effect.gen(function* () {
+        const teams = yield* TeamRepo
+        const instances = yield* InstanceRepo
+        const jobs = yield* BenchJobRepo
+        const team = new Team({
+          id: TeamId.make("team-bj-reqrun-idmatch"),
+          name: "BJ ReqRun IdMatch",
+          teamNumber: 126
+        })
+        yield* teams.create(team)
+
+        // 対象 instance: deleting(running ではない)。
+        const target = new Instance({
+          id: InstanceId.make("instance-bj-reqrun-idmatch-target"),
+          teamId: team.id,
+          index: 1,
+          vmid: 1126,
+          privateIp: "10.100.126.11",
+          status: "deleting",
+          progress: [],
+          errorMessage: Option.none(),
+          createdAt: 0,
+          updatedAt: 0
+        })
+        yield* instances.create(target)
+
+        // 同じ team・同じ private_ip を持つ別の running instance(スロット
+        // 再利用や admin 台帳取り込みの重複 IP を模した defensive なケース、
+        // (team_id, idx) の一意性は idx が異なるので破らない)。
+        const other = new Instance({
+          id: InstanceId.make("instance-bj-reqrun-idmatch-other"),
+          teamId: team.id,
+          index: 2,
+          vmid: 1127,
+          privateIp: target.privateIp,
+          status: "running",
+          progress: [],
+          errorMessage: Option.none(),
+          createdAt: 0,
+          updatedAt: 0
+        })
+        yield* instances.create(other)
+
+        const job = newJob({
+          id: BenchJobId.make("bj-reqrun-idmatch"),
+          teamId: team.id,
+          targetIp: target.privateIp,
+          targetPort: 80,
+          now: 1000
+        })
+        const exit = yield* Effect.exit(
+          jobs.insertIfAllowed(job, { instanceId: target.id, teamId: team.id })
+        )
+        expect(exit).toStrictEqual(Exit.fail(new InstanceNotRunning({ instanceId: target.id })))
+
+        const listed = yield* jobs.listByTeam(team.id, 50)
+        expect(listed).toHaveLength(0)
+      })
+  )
+
+  // テーブル駆動: running 以外の状態(削除進行中・削除済み・失敗)のいずれでも
+  // requireRunningInstance ガードが 0 行挿入にし、team のキュー不変条件が
+  // 原因でない(= 他に queued/running が無い)ため InstanceNotRunning に
+  // 分類されることを確認する。
+  const REQRUN_STATUS_TEAM_NUMBERS = { deleting: 121, deleted: 122, failed: 123 } as const
+  for (const status of ["deleting", "deleted", "failed"] as const) {
+    it.effect(`対象 instance が ${status} なら InstanceNotRunning(挿入されない)`, () =>
+      Effect.gen(function* () {
+        const teams = yield* TeamRepo
+        const instances = yield* InstanceRepo
+        const jobs = yield* BenchJobRepo
+        const team = new Team({
+          id: TeamId.make(`team-bj-reqrun-${status}`),
+          name: `BJ ReqRun ${status}`,
+          teamNumber: REQRUN_STATUS_TEAM_NUMBERS[status]
+        })
+        yield* teams.create(team)
+        const instance = new Instance({
+          id: InstanceId.make(`instance-bj-reqrun-${status}`),
+          teamId: team.id,
+          index: 1,
+          vmid: 1121,
+          privateIp: "10.100.121.11",
+          status,
+          progress: [],
+          errorMessage: status === "failed" ? Option.some("boom") : Option.none(),
+          createdAt: 0,
+          updatedAt: 0
+        })
+        yield* instances.create(instance)
+
+        const job = newJob({
+          id: BenchJobId.make(`bj-reqrun-${status}`),
+          teamId: team.id,
+          targetIp: instance.privateIp,
+          targetPort: 80,
+          now: 1000
+        })
+        const exit = yield* Effect.exit(
+          jobs.insertIfAllowed(job, { instanceId: instance.id, teamId: team.id })
+        )
+        expect(exit).toStrictEqual(Exit.fail(new InstanceNotRunning({ instanceId: instance.id })))
+
+        // 挿入されていないことも確認する(ジョブ枠を浪費しない)。
+        const listed = yield* jobs.listByTeam(team.id, 50)
+        expect(listed).toHaveLength(0)
+      })
+    )
+  }
+
+  it.effect(
+    "team に既に queued/running があれば instance が running でも TeamJobAlreadyQueued が優先される",
+    () =>
+      Effect.gen(function* () {
+        const teams = yield* TeamRepo
+        const instances = yield* InstanceRepo
+        const jobs = yield* BenchJobRepo
+        const team = new Team({ id: TeamId.make("team-bj-reqrun-priority"), name: "BJ ReqRun Priority", teamNumber: 124 })
+        yield* teams.create(team)
+        const instance = new Instance({
+          id: InstanceId.make("instance-bj-reqrun-priority"),
+          teamId: team.id,
+          index: 1,
+          vmid: 1122,
+          privateIp: "10.100.122.11",
+          status: "running",
+          progress: [],
+          errorMessage: Option.none(),
+          createdAt: 0,
+          updatedAt: 0
+        })
+        yield* instances.create(instance)
+
+        const first = newJob({
+          id: BenchJobId.make("bj-reqrun-priority-first"),
+          teamId: team.id,
+          targetIp: instance.privateIp,
+          targetPort: 80,
+          now: 1000
+        })
+        yield* jobs.insertIfAllowed(first)
+
+        const second = newJob({
+          id: BenchJobId.make("bj-reqrun-priority-second"),
+          teamId: team.id,
+          targetIp: instance.privateIp,
+          targetPort: 80,
+          now: 2000
+        })
+        const exit = yield* Effect.exit(
+          jobs.insertIfAllowed(second, { instanceId: instance.id, teamId: team.id })
+        )
+        expect(exit).toStrictEqual(Exit.fail(new TeamJobAlreadyQueued({ teamId: team.id })))
+      })
+  )
+
+  it.effect("requireRunningInstance 未指定(手動 IP:port)なら instance の状態に関係なく挿入できる", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const jobs = yield* BenchJobRepo
+      const team = new Team({ id: TeamId.make("team-bj-reqrun-manual"), name: "BJ ReqRun Manual", teamNumber: 125 })
+      yield* teams.create(team)
+      // instance 行はあるが deleted(= 手動ターゲットが偶然同じ IP を指す
+      // ケース)。requireRunningInstance を渡さないので instanceGuard は
+      // WHERE に影響せず、team のキュー不変条件だけで判定される。
+      const instance = new Instance({
+        id: InstanceId.make("instance-bj-reqrun-manual"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1123,
+        privateIp: "10.100.123.11",
+        status: "deleted",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(instance)
+
+      const job = newJob({
+        id: BenchJobId.make("bj-reqrun-manual"),
+        teamId: team.id,
+        targetIp: instance.privateIp,
+        targetPort: 8080,
+        now: 1000
+      })
+      const inserted = yield* jobs.insertIfAllowed(job)
+      expect(inserted).toStrictEqual(job)
+    })
+  )
+})
+
+// Task 6 レビュー #I: 直接 IP:port 指定(requireRunningInstance 未指定)の
+// enqueue でも、targetIp が自チームの managed instance の private_ip と
+// 一致し、かつその instance が creating/deleting(払い出し中/削除中)なら
+// フォームに関わらず弾かれることを確認する universal ガードの回帰テスト。
+layer("BenchJobRepo: insertIfAllowed 直接 IP 指定でも creating/deleting な managed instance を弾く(#I)", (it) => {
+  for (const status of ["creating", "deleting"] as const) {
+    it.effect(`targetIp が ${status} な managed instance の private_ip と一致すると InstanceNotRunning(挿入されない)`, () =>
+      Effect.gen(function* () {
+        const teams = yield* TeamRepo
+        const instances = yield* InstanceRepo
+        const jobs = yield* BenchJobRepo
+        const team = new Team({
+          id: TeamId.make(`team-bj-directip-${status}`),
+          name: `BJ DirectIp ${status}`,
+          teamNumber: status === "creating" ? 231 : 232
+        })
+        yield* teams.create(team)
+        const instance = new Instance({
+          id: InstanceId.make(`instance-bj-directip-${status}`),
+          teamId: team.id,
+          index: 1,
+          vmid: 1301,
+          privateIp: `10.100.${status === "creating" ? 231 : 232}.11`,
+          status,
+          progress: [],
+          errorMessage: Option.none(),
+          createdAt: 0,
+          updatedAt: 0
+        })
+        yield* instances.create(instance)
+
+        // instanceId は渡さない = 手動 IP:port 指定の直接フォーム。
+        const job = newJob({
+          id: BenchJobId.make(`bj-directip-${status}`),
+          teamId: team.id,
+          targetIp: instance.privateIp,
+          targetPort: 80,
+          now: 1000
+        })
+        const exit = yield* Effect.exit(jobs.insertIfAllowed(job))
+        expect(exit).toStrictEqual(Exit.fail(new InstanceNotRunning({ instanceId: instance.id })))
+
+        const listed = yield* jobs.listByTeam(team.id, 50)
+        expect(listed).toHaveLength(0)
+      })
+    )
+  }
+
+  it.effect("targetIp が running な managed instance の private_ip と一致すれば直接 IP 指定でも成功する", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const jobs = yield* BenchJobRepo
+      const team = new Team({ id: TeamId.make("team-bj-directip-running"), name: "BJ DirectIp Running", teamNumber: 233 })
+      yield* teams.create(team)
+      const instance = new Instance({
+        id: InstanceId.make("instance-bj-directip-running"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1303,
+        privateIp: "10.100.233.11",
+        status: "running",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(instance)
+
+      const job = newJob({
+        id: BenchJobId.make("bj-directip-running"),
+        teamId: team.id,
+        targetIp: instance.privateIp,
+        targetPort: 80,
+        now: 1000
+      })
+      const inserted = yield* jobs.insertIfAllowed(job)
+      expect(inserted).toStrictEqual(job)
+    })
+  )
+
+  it.effect("targetIp に対応する instance 行が無い(unmanaged)なら直接 IP 指定は従来どおり成功する", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+      const team = new Team({ id: TeamId.make("team-bj-directip-unmanaged"), name: "BJ DirectIp Unmanaged", teamNumber: 234 })
+      yield* teams.create(team)
+
+      const job = newJob({
+        id: BenchJobId.make("bj-directip-unmanaged"),
+        teamId: team.id,
+        targetIp: "10.100.234.55",
+        targetPort: 80,
+        now: 1000
+      })
+      const inserted = yield* jobs.insertIfAllowed(job)
+      expect(inserted).toStrictEqual(job)
     })
   )
 })

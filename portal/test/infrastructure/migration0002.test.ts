@@ -4,6 +4,7 @@ import { Cause, Effect, Option } from "effect"
 import { expect } from "vitest"
 import migration0001 from "../../src/infrastructure/sql/migrations/0001_initial.js"
 import migration0002 from "../../src/infrastructure/sql/migrations/0002_selfservice.js"
+import migration0003 from "../../src/infrastructure/sql/migrations/0003_failed_reserves_slot.js"
 import { SqlTest } from "../support/sqlTest.js"
 
 // このファイルは(sqlTest.ts の MigratorTest とは別に)0001 と 0002 を個別に
@@ -232,8 +233,19 @@ layer("migration 0002: 部分ユニークインデックス(進行中の重複�
   )
 })
 
-layer("migration 0002: 部分ユニークインデックス(failed 行があっても再作成可)", (it) => {
-  it.effect("failed 行がある idx にも creating を新規作成できる", () =>
+// 【2026-07 追記・Task 6 レビュー #E】このブロックは元々「failed 行がある idx
+// にも creating を新規作成できる(= 0002 の部分ユニークインデックスは failed
+// を対象外にしている)」ことを検証していたが、これはアプリ層の allocator
+// (requestCreateInstance の occupiedIndices、Task 6 レビュー #A)と矛盾する
+// バグだった: failed 行はまだ vmid/VM を握っているため、同じ idx への新規
+// 作成を許すと vmid/IP 衝突や、failed 行を後で自己サービス削除した際の
+// UNIQUE 制約違反(500)を招く。0002 自体は本番適用済みで forward-only の
+// ため書き換えないが、0003(下記 migration0003.test.ts)でインデックス述語を
+// 「status != 'deleted'」に締め直した。ここでは「0002 単体では(0003 適用前は)
+// この reuse が可能だった」という移行史実だけを残し、0003 を追加適用した
+// 最終状態での正しい挙動(拒否される)を検証するよう更新する。
+layer("migration 0002+0003: 部分ユニークインデックス(failed 行は 0003 適用後は再作成不可)", (it) => {
+  it.effect("0002 単体では failed 行がある idx にも creating を新規作成できるが、0003 適用後は拒否される", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient
       yield* migration0001
@@ -245,13 +257,17 @@ layer("migration 0002: 部分ユニークインデックス(failed 行があっ�
         VALUES ('inst-failed', 'team-failed-reuse', 1, 2201, '10.100.22.11', 'failed', 0, 0)
       `
 
+      yield* migration0003
+
       const exit = yield* Effect.exit(
         sql`
           INSERT INTO instances (id, team_id, idx, vmid, private_ip, status, created_at, updated_at)
           VALUES ('inst-retry', 'team-failed-reuse', 1, 2201, '10.100.22.11', 'creating', 100, 100)
         `
       )
-      expect(exit._tag).toBe("Success")
+      // #A/#E 修正後の正しい挙動: failed 行が同じ (team_id, idx) スロットを
+      // 予約しているため UNIQUE 制約違反で拒否される。
+      expect(exit._tag).toBe("Failure")
     })
   )
 })

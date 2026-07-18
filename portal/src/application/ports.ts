@@ -13,7 +13,7 @@ import type { Instance } from "../domain/instance.js"
 import type { Team } from "../domain/team.js"
 import type { TeamInvite } from "../domain/teamInvite.js"
 import type { User } from "../domain/user.js"
-import { ProvisionInProgress, QuotaExceeded } from "./errors.js"
+import { InstanceNotRunning, ProvisionInProgress, QuotaExceeded } from "./errors.js"
 
 // リポジトリ層(infrastructure、Task 4 が実装)の失敗はすべてこれに包む。
 export class RepoError extends Data.TaggedError("RepoError")<{ cause: unknown }> {}
@@ -146,14 +146,17 @@ export class InstanceRepo extends Context.Tag("app/InstanceRepo")<
       quota: number
     ) => Effect.Effect<Instance, RepoError | QuotaExceeded | ProvisionInProgress | DuplicateInstanceIndex>
     // requestDeleteInstance(削除ボタン)専用の原子的 guard 付き UPDATE(Task 6
-    // レビュー #B)。単一の UPDATE ... WHERE ... RETURNING 文で (1) 対象行が
+    // レビュー #B、#D)。単一の UPDATE ... WHERE ... RETURNING 文で (1) 対象行が
     // running/failed であること、(2) 同じチームに(対象以外で)creating/deleting
-    // の行が無いこと、を検証してから status を deleting に更新する(TOCTOU
-    // 回避、createIfAllowed と同型)。listByTeam で読んでから update する
-    // 二段階実装だと、二つの並行リクエストが両方読み取りを通過して両方
+    // の行が無いこと、(3) 対象の private_ip を targetIp とする queued/running な
+    // bench_jobs が無いこと、を検証してから status を deleting に更新する
+    // (TOCTOU 回避、createIfAllowed と同型)。listByTeam で読んでから update
+    // する二段階実装だと、二つの並行リクエストが両方読み取りを通過して両方
     // deleting へ書き込めてしまう(チームにつき進行中は高々1件という不変条件
-    // 違反)。0 行更新なら Option.none()(呼び出し元が再読み込みしてエラー種別
-    // を判定する)。
+    // 違反)し、(3) が無いと削除と bench enqueue(insertIfAllowed の
+    // requireRunningInstance ガード)が両方とも相手の書き込み前の状態を読んで
+    // 両方成功し得る(Task 6 レビュー #D、ベンチ対象 VM の消失)。0 行更新なら
+    // Option.none()(呼び出し元が再読み込みしてエラー種別を判定する)。
     readonly beginDeletingIfAllowed: (
       instanceId: InstanceId,
       now: number
@@ -181,7 +184,26 @@ export class BenchJobRepo extends Context.Tag("app/BenchJobRepo")<
     // `INSERT ... SELECT ... WHERE NOT EXISTS (SELECT 1 FROM bench_jobs WHERE team_id=? AND status IN ('queued','running')) RETURNING ...`
     // の 1 文で判定と挿入をアトミックに行い、0 行挿入(= 既に queued/running
     // あり)なら TeamJobAlreadyQueued を返す。
-    readonly insertIfAllowed: (job: BenchJob) => Effect.Effect<BenchJob, RepoError | TeamJobAlreadyQueued>
+    // requireRunningInstance(Task 6 レビュー #D): enqueueBenchJob の instanceId
+    // 起点の enqueue(bench.ts)だけが渡す省略可能な追加ガード。渡された場合、
+    // 上記 INSERT の WHERE に「対象 instance が id で今も running であること」を
+    // 単一原子操作の一部として追加する(instanceId パス限定のより厳しい追加条件)。
+    // 【Task 6 レビュー #I】これとは別に、フォームを問わず常に効く universal な
+    // ガードも同じ INSERT の WHERE に入る: 「job の targetIp と private_ip が
+    // 一致し、team_id も一致する instances 行の中に creating/deleting のもの
+    // が無いこと」。手動 IP:port 指定(instance 行に対応しない/対応しても
+    // running)の enqueue はこれで従来どおり通るが、targetIp がたまたま
+    // 自チームの managed instance の private_ip と一致し、かつそれが
+    // creating/deleting(削除・払い出しの途中)なら、フォームに関わらず弾かれる
+    // (削除 UPDATE 側の bench_jobs チェックと対になる、TOCTOU 回避)。
+    // 0 行挿入時の分類は team のキュー不変条件 → universal ガード
+    // (creating/deleting な managed instance)→ instanceId パスの by-id running
+    // 失敗、の優先順位でいずれも InstanceNotRunning/TeamJobAlreadyQueued に
+    // 落とす(benchJobRepo.ts 実装のコメント参照)。
+    readonly insertIfAllowed: (
+      job: BenchJob,
+      requireRunningInstance?: { instanceId: InstanceId; teamId: TeamId }
+    ) => Effect.Effect<BenchJob, RepoError | TeamJobAlreadyQueued | InstanceNotRunning>
     readonly findById: (id: BenchJobId) => Effect.Effect<Option.Option<BenchJob>, RepoError>
     readonly listByTeam: (teamId: TeamId, limit: number) => Effect.Effect<ReadonlyArray<BenchJob>, RepoError>
     // 全体 running=0 のときだけ先頭 queued を running 化(アトミック)

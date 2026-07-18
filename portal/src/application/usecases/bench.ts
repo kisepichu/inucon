@@ -15,7 +15,28 @@ import { BenchJobRepo, ContestRepo, InstanceRepo, RunnerConfig, TeamRepo, UuidGe
 // Context.Tag(ContestRepo/TeamRepo/BenchJobRepo/UuidGen/RunnerConfig)と
 // Clock を環境として要求する(Layer 合成は main.ts の 1 箇所に集約する)。
 
-export const enqueueBench = (args: { user: User; targetIp: string; targetPort: number }) =>
+// requireRunningInstance(Task 6 レビュー #D): instanceId 起点の enqueue
+// (enqueueBenchJob)だけが渡す。BenchJobRepo.insertIfAllowed のアトミック
+// INSERT に「対象 instance が id で今も running であること」を追加ガードさせる
+// ためのフィールドで、渡された場合は 0 行挿入時(team のキュー不変条件・
+// 下記 universal ガードのどちらも原因でない場合)に InstanceNotRunning を返す。
+// 手動 IP:port 指定の enqueue は対応する instance 行が無いのが通常なので
+// 渡さない(挙動不変)。
+//
+// 【Task 6 レビュー #I】ただし手動 IP:port 指定でも targetIp が自チームの
+// managed instance の private_ip と一致することはあり得る(スペックはこの
+// フォームを禁止していない)。その場合に備え、insertIfAllowed 側は
+// requireRunningInstance の有無に関わらず常に「targetIp が
+// creating/deleting な自チームの managed instance を指していないこと」を
+// 同じ原子的 INSERT で検証する(instanceId パス専用の instanceGuard とは別の
+// 独立したガード)。これにより、削除中/払い出し中の VM への直接 IP enqueue も
+// フォームを問わず一貫して弾かれる。
+export const enqueueBench = (args: {
+  user: User
+  targetIp: string
+  targetPort: number
+  requireRunningInstance?: { instanceId: InstanceId }
+}) =>
   Effect.gen(function* () {
     // Contest が未作成(getCurrent = None)の場合も「準備中」として扱う。
     const contest = yield* ContestRepo.pipe(
@@ -52,7 +73,13 @@ export const enqueueBench = (args: { user: User; targetIp: string; targetPort: n
     const id = BenchJobId.make(yield* uuidGen.next)
     const now = yield* Clock.currentTimeMillis
     return yield* jobs.insertIfAllowed(
-      newJob({ id, teamId: team.id, targetIp: args.targetIp, targetPort: args.targetPort, now })
+      newJob({ id, teamId: team.id, targetIp: args.targetIp, targetPort: args.targetPort, now }),
+      args.requireRunningInstance === undefined
+        ? undefined
+        : {
+            instanceId: args.requireRunningInstance.instanceId,
+            teamId: team.id
+          }
     )
   })
 
@@ -156,12 +183,24 @@ export const enqueueBenchJob = (args: {
       }
       // running でない(creating/deleting/deleted/failed)VM へは enqueue しない
       // (Task 6 レビュー #3)。deleted/failed な対象へ投げても接続失敗で
-      // ジョブ枠を浪費するだけなので事前に明示エラーで弾く。所有権確認の
-      // 「後」に判定することで privateIp 漏洩防止の順序は変えない。
+      // ジョブ枠を浪費するだけなので事前に明示エラーで弾く(共通ケースの
+      // fail-fast)。所有権確認の「後」に判定することで privateIp 漏洩防止の
+      // 順序は変えない。
       if (instance.status !== "running") {
         return yield* Effect.fail(new InstanceNotRunning({ instanceId: instance.id }))
       }
-      return yield* enqueueBench({ user: args.user, targetIp: instance.privateIp, targetPort: 80 })
+      // Task 6 レビュー #D: 上の事前チェックは非アトミック(TOCTOU あり)。
+      // ここから enqueueBench→insertIfAllowed までの間に対象 instance が
+      // 削除され得るため、requireRunningInstance を渡して「INSERT の瞬間も
+      // running であること」を単一原子操作(instanceRepo.beginDeletingIfAllowed
+      // と対称)で再検証させる。team のキュー不変条件が原因でなければ
+      // InstanceNotRunning が返る(insertIfAllowed 側で切り分け済み)。
+      return yield* enqueueBench({
+        user: args.user,
+        targetIp: instance.privateIp,
+        targetPort: 80,
+        requireRunningInstance: { instanceId: instance.id }
+      })
     }
     return yield* enqueueBench({
       user: args.user,
