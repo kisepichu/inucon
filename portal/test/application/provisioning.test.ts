@@ -336,6 +336,74 @@ describe("requestCreateInstance(index のサーバー採番)", () => {
       )
     )
   )
+
+  const failedIndex2 = new Instance({
+    id: InstanceId.make("failed-idx-2"),
+    teamId: team1Id,
+    index: 2,
+    vmid: vmidFor(1, 2),
+    privateIp: ipFor(1, 2),
+    status: "failed",
+    progress: ["clone_done"],
+    errorMessage: Option.some("boom"),
+    createdAt: 0,
+    updatedAt: 0
+  })
+
+  // Task 6 レビュー #A: quota は creating+running の「数」だけを見ているため、
+  // failed/deleting の行がある場合 activeCount < quota でもその index は
+  // まだ「非 deleted」として占有されている。旧実装(active=creating/running
+  // のみ除外)だと failed の index=2 を新規作成が再利用し、後でその failed 行
+  // を削除すると新インスタンスの vmid/IP を共有する VM ごと壊れてしまう。
+  it.effect("failed 行の index は再利用しない(vmid/IP 衝突・VM 破壊の防止)", () =>
+    Effect.gen(function* () {
+      const instance = yield* requestCreateInstance({ user: alice, teamId: team1Id })
+      // index=1(running)と index=2(failed)はどちらも占有中なので、
+      // 新規作成は index=3 を採番する(1 や 2 を再利用しない)。
+      expect(instance.index).toBe(3)
+      expect(instance.vmid).toBe(vmidFor(1, 3))
+      expect(instance.privateIp).toBe(ipFor(1, 3))
+    }).pipe(
+      Effect.provide(
+        indexLayer({
+          quota: 3,
+          instances: [runningInstance({ id: "r1", teamId: team1Id, index: 1, teamNumber: 1 }), failedIndex2]
+        })
+      )
+    )
+  )
+
+  const deletedIndex2 = new Instance({
+    id: InstanceId.make("deleted-idx-2"),
+    teamId: team1Id,
+    index: 2,
+    vmid: vmidFor(1, 2),
+    privateIp: ipFor(1, 2),
+    status: "deleted",
+    progress: ["clone_done", "configured", "started", "route_done", "access_done"],
+    errorMessage: Option.none(),
+    createdAt: 0,
+    updatedAt: 0
+  })
+
+  // deleted になった index はもう占有していないので再利用してよい(上の
+  // 「index=1 が解放されていれば再利用する」テストと同趣旨だが、deleting/
+  // failed とは異なり deleted だけが「空き」として扱われることを明示する)。
+  it.effect("deleted 行の index は再利用できる", () =>
+    Effect.gen(function* () {
+      const instance = yield* requestCreateInstance({ user: alice, teamId: team1Id })
+      expect(instance.index).toBe(2)
+      expect(instance.vmid).toBe(vmidFor(1, 2))
+      expect(instance.privateIp).toBe(ipFor(1, 2))
+    }).pipe(
+      Effect.provide(
+        indexLayer({
+          quota: 3,
+          instances: [runningInstance({ id: "r1", teamId: team1Id, index: 1, teamNumber: 1 }), deletedIndex2]
+        })
+      )
+    )
+  )
 })
 
 describe("requestDeleteInstance(ガード)", () => {

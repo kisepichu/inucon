@@ -145,20 +145,37 @@ export const requestCreateInstance = (args: { user: User; teamId: TeamId }) =>
       return yield* Effect.fail(new ProvisionInProgress({ teamId: team.id }))
     }
 
-    // index はサーバー側で採番する(Task 6 レビュー #1): vmid = 1000 +
+    // index はサーバー側で採番する(Task 6 レビュー #1、#A): vmid = 1000 +
     // teamNumber*100 + index / ipFor = 10.100.<tn>.1<index> という不変条件は
     // index が小さい(概ね < 100)ことを前提にしており、クライアント指定の
-    // index を無検証で使うと衝突・不正 IP に到達しうる。直上の quota チェックで
-    // activeCount < instanceQuota が保証されているため、1..instanceQuota の
-    // 範囲には必ず未使用の index が存在する(defensive に quota+1 へ
-    // フォールバックするが理論上到達しない)。
-    const activeIndices = new Set(
-      existing.filter((x) => x.status === "creating" || x.status === "running").map((x) => x.index)
-    )
-    const freeIndices = Array.from({ length: contest.instanceQuota }, (_, i) => i + 1).filter(
-      (i) => !activeIndices.has(i)
-    )
-    const index = freeIndices[0] ?? contest.instanceQuota + 1
+    // index を無検証で使うと衝突・不正 IP に到達しうる。
+    //
+    // 注意(Task 6 レビュー #A): quota チェックは creating+running の「数」しか
+    // 見ていないため、「1..instanceQuota の範囲には必ず未使用の index がある」
+    // とは言えない。failed/deleting の行も同じ index を(削除されるまで)
+    // 占有し続けるため、除外対象は creating/running だけでなく deleted 以外の
+    // 全ステータス(creating/running/deleting/failed)にする必要がある。
+    // そうしないと failed 行の index が新規作成に再利用され、後でその failed
+    // 行を削除した際に新しいインスタンスの vmid/IP を共有する VM ごと壊してし
+    // まう(vmid/IP 衝突・意図しない VM 破壊)。
+    const occupiedIndices = new Set(existing.filter((x) => x.status !== "deleted").map((x) => x.index))
+    // vmid = 1000 + teamNumber*100 + index / IP 末尾 = 1<index> という不変条件を
+    // 保つため、index はチーム間で 100 を跨がない(< 100)範囲に収める。IP の
+    // 末尾オクテット 1<index> も index ≤ 99 なら 11..199 の範囲に収まり有効。
+    const MAX_INSTANCE_INDEX = 99
+    let index: number | undefined
+    for (let i = 1; i <= MAX_INSTANCE_INDEX; i++) {
+      if (!occupiedIndices.has(i)) {
+        index = i
+        break
+      }
+    }
+    if (index === undefined) {
+      // スロット枯渇の安全弁(実運用では ~99 件の非 deleted インスタンスが
+      // 同時に存在する必要があり、事実上到達不能)。最も近い既存エラーである
+      // QuotaExceeded を流用する。
+      return yield* Effect.fail(new QuotaExceeded({ teamId: team.id, quota: contest.instanceQuota }))
+    }
 
     const config = yield* ProvisioningConfig
     const proxmox = yield* ProxmoxPort
