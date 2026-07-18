@@ -1,0 +1,496 @@
+/* ============================================================
+   INUCON Portal — index.css
+   単一グローバルスタイルシート(プレーン CSS / className ベース)
+   ============================================================ */
+
+/* ---------- Design tokens ---------- */
+:root {
+  /* Color — surfaces */
+  --header-bg: #20232a;
+  --header-text: #ffffff;
+  --header-muted: rgba(255, 255, 255, 0.60);
+  --header-line: rgba(255, 255, 255, 0.10);
+  --bg: #fafafa;
+  --surface: #ffffff;
+  --surface-subtle: #f6f8fa;
+
+  /* Color — text */
+  --text: #23272f;
+  --text-muted: #636c76;
+  --text-faint: #8b949e;
+
+  /* Color — accent / link */
+  --accent: #0969da;
+  --accent-hover: #0550ae;
+  --accent-wash: #ddf4ff;
+
+  /* Color — semantic */
+  --green-text: #1a7f37;  --green-bg: #dafbe1;  --green-border: #aceebb;
+  --amber-text: #9a6700;  --amber-bg: #fff8c5;  --amber-border: #eed888;
+  --red-text:   #cf222e;  --red-bg:   #ffebe9;  --red-border:   #ffc1c0;
+  --gray-text:  #57606a;  --gray-bg:  #eff1f3;  --gray-border:  #d6dae0;
+  --blue-text:  #0969da;  --blue-bg:  #ddf4ff;  --blue-border:  #b6e3ff;
+
+  /* Borders */
+  --border: #e3e6ea;
+  --border-strong: #cfd4da;
+
+  /* Focus */
+  --focus-ring: 0 0 0 3px rgba(9, 105, 218, 0.28);
+
+  /* Type */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP",
+    Meiryo, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+    Consolas, "Noto Sans Mono", monospace;
+  --fs-body: 14px;
+  --fs-small: 13px;
+  --fs-caption: 12px;
+  --fs-h1: 24px;
+  --fs-h2: 17px;
+  --fs-h3: 15px;
+
+  /* Spacing scale */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+
+  /* Radius scale */
+  --radius-s: 4px;
+  --radius-m: 6px;
+  --radius-l: 8px;
+
+  /* Shadow */
+  --shadow-card: 0 1px 2px rgba(31, 35, 40, 0.04);
+}
+
+/* ---------- Base ---------- */
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: var(--fs-body);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1 { font-size: var(--fs-h1); font-weight: 700; line-height: 1.4; letter-spacing: 0.01em; margin: 0 0 var(--sp-5); }
+h2 { font-size: var(--fs-h2); font-weight: 650; line-height: 1.45; margin: 0 0 var(--sp-3); }
+h3 { font-size: var(--fs-h3); font-weight: 650; line-height: 1.5;  margin: 0 0 var(--sp-2); }
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { color: var(--accent-hover); text-decoration: underline; }
+
+code, .mono { font-family: var(--font-mono); font-size: 0.93em; }
+
+/* ---------- App shell ---------- */
+.app-header {
+  background: var(--header-bg);
+  color: var(--header-text);
+  padding: 0 var(--sp-5);
+}
+.app-header-inner {
+  max-width: 1200px;
+  margin: 0 auto;
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-5);
+  padding: var(--sp-2) 0;
+}
+.app-brand {
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.app-contest-status {
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+  font-weight: 400;
+  color: var(--header-muted);
+  margin-left: var(--sp-1);
+}
+.app-nav { display: flex; gap: var(--sp-1); flex-wrap: wrap; }
+.nav-link {
+  color: var(--header-muted);
+  font-size: var(--fs-small);
+  font-weight: 500;
+  padding: 5px 10px;
+  border-radius: var(--radius-m);
+  text-decoration: none;
+  transition: color 0.12s ease, background-color 0.12s ease;
+}
+.nav-link:hover { color: #ffffff; text-decoration: none; background: rgba(255, 255, 255, 0.06); }
+.nav-link:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.nav-link.active { color: #ffffff; background: rgba(255, 255, 255, 0.11); }
+.app-user {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  font-size: var(--fs-small);
+}
+.app-user-name { color: rgba(255, 255, 255, 0.85); }
+
+.app-main {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: var(--sp-6) var(--sp-5) var(--sp-7);
+}
+
+/* Top-level loading */
+.loading {
+  color: var(--text-faint);
+  padding: var(--sp-7) 0;
+  text-align: center;
+  font-size: var(--fs-small);
+}
+
+/* ---------- Buttons ---------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-family: var(--font-sans);
+  font-size: var(--fs-small);
+  font-weight: 600;
+  line-height: 1;
+  padding: 8px 14px;
+  border-radius: var(--radius-m);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background-color 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.btn:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #ffffff; }
+.btn-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+
+.btn-secondary { background: var(--surface); border-color: var(--border-strong); color: var(--text); }
+.btn-secondary:hover:not(:disabled) { background: var(--surface-subtle); border-color: var(--text-faint); }
+
+.btn-danger { background: var(--surface); border-color: var(--border-strong); color: var(--red-text); }
+.btn-danger:hover:not(:disabled) { background: var(--red-text); border-color: var(--red-text); color: #ffffff; }
+
+/* small (table-row) size */
+.btn-sm { padding: 4px 10px; font-size: var(--fs-caption); }
+
+/* on dark header (logout) */
+.btn-ghost-dark { background: transparent; border-color: rgba(255, 255, 255, 0.28); color: rgba(255, 255, 255, 0.85); }
+.btn-ghost-dark:hover:not(:disabled) { border-color: rgba(255, 255, 255, 0.55); color: #ffffff; }
+
+/* Busy/submitting state (aria-busy="true") */
+.btn[aria-busy="true"] { opacity: 0.7; cursor: progress; }
+
+/* 無効理由キャプション — disabled ボタン直下の中立的な説明 */
+.disabled-reason {
+  margin: var(--sp-1) 0 0;
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+}
+
+/* ---------- Status badge ---------- */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-caption);
+  font-weight: 500;
+  line-height: 1;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid;
+  white-space: nowrap;
+}
+.status-badge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* instance vocabulary */
+.status-creating,
+.status-deleting  { color: var(--amber-text); background: var(--amber-bg); border-color: var(--amber-border); }
+.status-running   { color: var(--green-text); background: var(--green-bg); border-color: var(--green-border); }
+.status-deleted   { color: var(--gray-text);  background: var(--gray-bg);  border-color: var(--gray-border); }
+.status-failed    { color: var(--red-text);   background: var(--red-bg);   border-color: var(--red-border); }
+
+/* job vocabulary(共通の .status-failed を再利用) */
+.status-queued    { color: var(--amber-text); background: var(--amber-bg); border-color: var(--amber-border); }
+.status-finished  { color: var(--green-text); background: var(--green-bg); border-color: var(--green-border); }
+.status-canceled  { color: var(--gray-text);  background: var(--gray-bg);  border-color: var(--gray-border); }
+/* ジョブの running は「進行中」= 青(インスタンスの running=緑と区別)。
+   バッジ要素に .job-status を併記: class="status-badge job-status status-running" */
+.job-status.status-running { color: var(--blue-text); background: var(--blue-bg); border-color: var(--blue-border); }
+
+/* in-progress states get a pulsing dot */
+.status-creating::before,
+.status-deleting::before,
+.job-status.status-running::before { animation: badge-pulse 1.6s ease-in-out infinite; }
+@keyframes badge-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) {
+  .status-creating::before, .status-deleting::before,
+  .job-status.status-running::before { animation: none; }
+}
+
+/* ---------- Data table ---------- */
+.table-wrap {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  box-shadow: var(--shadow-card);
+  overflow-x: auto;
+}
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-small);
+}
+.data-table th {
+  text-align: left;
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--surface-subtle);
+  border-bottom: 1px solid var(--border);
+  padding: var(--sp-2) var(--sp-3);
+  white-space: nowrap;
+}
+.data-table td {
+  padding: 10px var(--sp-3);
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.data-table tbody tr:last-child td { border-bottom: none; }
+.data-table td.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.data-table td.empty-cell { color: var(--text-faint); }
+
+/* clickable rows (job history) */
+.data-table tr.clickable { cursor: pointer; transition: background-color 0.1s ease; }
+.data-table tr.clickable:hover td { background: var(--surface-subtle); }
+.data-table tr.clickable:focus-visible { outline: none; box-shadow: inset var(--focus-ring); }
+
+/* インスタンスの状態セル内エラー行 */
+.cell-error {
+  display: block;
+  margin-top: var(--sp-1);
+  font-size: var(--fs-caption);
+  color: var(--red-text);
+}
+
+/* ---------- Forms ---------- */
+.form {
+  max-width: 420px;
+  display: grid;
+  gap: var(--sp-3);
+}
+.form-field { display: grid; gap: var(--sp-1); }
+.form-field > label {
+  font-size: var(--fs-caption);
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.form input:not([type="checkbox"]):not([type="radio"]),
+.form select,
+input.input, select.input {
+  font-family: var(--font-sans);
+  font-size: var(--fs-small);
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-m);
+  padding: 7px 10px;
+  width: 100%;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+.form input:focus,
+.form select:focus,
+input.input:focus, select.input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
+}
+.form input::placeholder { color: var(--text-faint); }
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-small);
+}
+.checkbox-row input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px; }
+
+/* ---------- Alerts / errors ---------- */
+.error {
+  color: var(--red-text);
+  font-size: var(--fs-small);
+  margin: var(--sp-2) 0 0;
+}
+/* ページ全体を置き換えるエラー */
+.error-page {
+  color: var(--red-text);
+  background: var(--red-bg);
+  border: 1px solid var(--red-border);
+  border-radius: var(--radius-l);
+  padding: var(--sp-4) var(--sp-4);
+  font-size: var(--fs-small);
+  margin: var(--sp-4) 0;
+}
+/* Admin 上部の成功メッセージ */
+.notice-ok {
+  color: var(--green-text);
+  font-size: var(--fs-small);
+  font-weight: 600;
+}
+/* 空/ブロック状態(エラーではない) */
+.empty-state {
+  color: var(--text-muted);
+  background: var(--surface);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-l);
+  padding: var(--sp-5);
+  text-align: center;
+  font-size: var(--fs-small);
+}
+
+/* ---------- Sections ---------- */
+.section { margin-bottom: var(--sp-6); }
+.section-actions { margin-top: var(--sp-3); }
+.admin-section {
+  padding-top: var(--sp-5);
+  margin-top: var(--sp-5);
+  border-top: 1px solid var(--border);
+}
+
+/* ---------- Invite result card ---------- */
+.invite-result {
+  max-width: 420px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  box-shadow: var(--shadow-card);
+  padding: var(--sp-4);
+  margin-top: var(--sp-3);
+  font-size: var(--fs-small);
+}
+.invite-result p { margin: 0 0 var(--sp-1); }
+.invite-result ul { margin: var(--sp-1) 0 0; padding-left: 1.3em; }
+.invite-result li { font-family: var(--font-mono); font-size: var(--fs-caption); margin: 2px 0; }
+.invite-result .warnings { margin-top: var(--sp-2); }
+.invite-result .warnings li { color: var(--amber-text); font-family: var(--font-sans); font-size: var(--fs-caption); }
+
+/* ---------- Definition list (Job detail) ---------- */
+.detail-dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--sp-2) var(--sp-5);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  box-shadow: var(--shadow-card);
+  padding: var(--sp-4);
+  margin: 0 0 var(--sp-5);
+  font-size: var(--fs-small);
+}
+.detail-dl dt { color: var(--text-muted); font-weight: 600; }
+.detail-dl dd { margin: 0; }
+
+/* ---------- Log block ---------- */
+.log-block {
+  background: #16181d;
+  color: #e6e8eb;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.7;
+  border-radius: var(--radius-l);
+  padding: var(--sp-4);
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-x: auto;
+}
+.log-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+.log-header h2 { margin: 0; }
+.live-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--blue-text);
+  background: var(--blue-bg);
+  border: 1px solid var(--blue-border);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+.live-indicator::before {
+  content: "";
+  width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor;
+  animation: badge-pulse 1.6s ease-in-out infinite;
+}
+/* live-indicator の既定アニメーションはこの規則より前(status バッジ用)の
+   reduced-motion ブロックでは後勝ちで上書きできないため、定義直後に置く。 */
+@media (prefers-reduced-motion: reduce) {
+  .live-indicator::before { animation: none; }
+}
+
+/* ---------- Login ---------- */
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-3);
+  background: var(--bg);
+  padding: var(--sp-5);
+  text-align: center;
+}
+.login-page h1 {
+  font-size: 32px;
+  letter-spacing: 0.06em;
+  margin: 0;
+}
+.login-page p { margin: 0 0 var(--sp-3); color: var(--text-muted); }
+.btn-github {
+  background: var(--header-bg);
+  border-color: var(--header-bg);
+  color: #ffffff;
+  padding: 10px 20px;
+  font-size: var(--fs-body);
+}
+.btn-github:hover:not(:disabled) { background: #2d323c; border-color: #2d323c; }
+
+/* ---------- Admin team list ---------- */
+.team-block {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  box-shadow: var(--shadow-card);
+  padding: var(--sp-4);
+  margin-bottom: var(--sp-3);
+}
+.team-block h3 { margin-bottom: var(--sp-1); }
+.team-block .members { color: var(--text-muted); font-size: var(--fs-small); margin: 0 0 var(--sp-2); }
+.team-block ul { margin: 0; padding-left: 1.3em; font-size: var(--fs-small); }
+.team-block li { margin: 4px 0; display: flex; align-items: center; gap: var(--sp-2); }
