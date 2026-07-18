@@ -209,8 +209,9 @@ export function Admin() {
         <h2>チーム作成</h2>
         <form className="form" onSubmit={handleCreateTeam}>
           <div className="form-field">
-            <label>チーム名</label>
+            <label htmlFor="admin-team-name">チーム名</label>
             <input
+              id="admin-team-name"
               placeholder="チーム名"
               value={teamName}
               onChange={(event) => setTeamName(event.target.value)}
@@ -218,8 +219,9 @@ export function Admin() {
             />
           </div>
           <div className="form-field">
-            <label>チーム番号(1-254)</label>
+            <label htmlFor="admin-team-number">チーム番号(1-254)</label>
             <input
+              id="admin-team-number"
               placeholder="チーム番号(1-254)"
               value={teamNumber}
               onChange={(event) => setTeamNumber(event.target.value)}
@@ -238,8 +240,8 @@ export function Admin() {
         <h2>メンバー割当</h2>
         <form className="form" onSubmit={handleSetMembers}>
           <div className="form-field">
-            <label>チームを選択</label>
-            <select value={memberTeamId} onChange={(event) => setMemberTeamId(event.target.value)} required>
+            <label htmlFor="admin-member-team">チームを選択</label>
+            <select id="admin-member-team" value={memberTeamId} onChange={(event) => setMemberTeamId(event.target.value)} required>
               <option value="" disabled>
                 チームを選択
               </option>
@@ -251,8 +253,9 @@ export function Admin() {
             </select>
           </div>
           <div className="form-field">
-            <label>githubLogin</label>
+            <label htmlFor="admin-member-logins">githubLogin</label>
             <input
+              id="admin-member-logins"
               placeholder="githubLogin をカンマ区切りで入力"
               value={memberLogins}
               onChange={(event) => setMemberLogins(event.target.value)}
@@ -271,8 +274,8 @@ export function Admin() {
         <h2>招待</h2>
         <div className="form">
           <div className="form-field">
-            <label>チームを選択</label>
-            <select value={inviteTeamId} onChange={(event) => setInviteTeamId(event.target.value)}>
+            <label htmlFor="admin-invite-team">チームを選択</label>
+            <select id="admin-invite-team" value={inviteTeamId} onChange={(event) => setInviteTeamId(event.target.value)}>
               <option value="" disabled>
                 チームを選択
               </option>
@@ -287,8 +290,9 @@ export function Admin() {
 
         <form className="form invite-form" style={{ marginTop: 12 }} onSubmit={handleInvite}>
           <div className="form-field">
-            <label>githubLogin</label>
+            <label htmlFor="invite-github-login">githubLogin</label>
             <input
+              id="invite-github-login"
               placeholder="githubLogin"
               value={inviteLogin}
               onChange={(event) => setInviteLogin(event.target.value)}
@@ -296,8 +300,9 @@ export function Admin() {
             />
           </div>
           <div className="form-field">
-            <label>email(Access ログイン用)</label>
+            <label htmlFor="invite-email">email(Access ログイン用)</label>
             <input
+              id="invite-email"
               type="email"
               placeholder="email(Access ログイン用)"
               value={inviteEmail}
@@ -364,8 +369,8 @@ export function Admin() {
         <h2>インスタンス登録</h2>
         <form className="form" onSubmit={handleCreateInstance}>
           <div className="form-field">
-            <label>チームを選択</label>
-            <select value={instanceTeamId} onChange={(event) => setInstanceTeamId(event.target.value)} required>
+            <label htmlFor="admin-instance-team">チームを選択</label>
+            <select id="admin-instance-team" value={instanceTeamId} onChange={(event) => setInstanceTeamId(event.target.value)} required>
               <option value="" disabled>
                 チームを選択
               </option>
@@ -377,12 +382,19 @@ export function Admin() {
             </select>
           </div>
           <div className="form-field">
-            <label>index</label>
-            <input placeholder="index" value={instanceIndex} onChange={(event) => setInstanceIndex(event.target.value)} required />
+            <label htmlFor="admin-instance-index">index</label>
+            <input
+              id="admin-instance-index"
+              placeholder="index"
+              value={instanceIndex}
+              onChange={(event) => setInstanceIndex(event.target.value)}
+              required
+            />
           </div>
           <div className="form-field">
-            <label>privateIp</label>
+            <label htmlFor="admin-instance-private-ip">privateIp</label>
             <input
+              id="admin-instance-private-ip"
               placeholder="privateIp"
               value={instancePrivateIp}
               onChange={(event) => setInstancePrivateIp(event.target.value)}
