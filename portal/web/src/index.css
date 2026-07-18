@@ -246,6 +246,7 @@ code, .mono { font-family: var(--font-mono); font-size: 0.93em; }
 @media (prefers-reduced-motion: reduce) {
   .status-creating::before, .status-deleting::before,
   .job-status.status-running::before { animation: none; }
+  .live-indicator::before { animation: none; }
 }
 
 /* ---------- Data table ---------- */
@@ -305,9 +306,7 @@ code, .mono { font-family: var(--font-mono); font-size: 0.93em; }
   font-weight: 600;
   color: var(--text-muted);
 }
-.form input[type="text"],
-.form input[type="email"],
-.form input[type="number"],
+.form input:not([type="checkbox"]):not([type="radio"]),
 .form select,
 input.input, select.input {
   font-family: var(--font-sans);
