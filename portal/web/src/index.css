@@ -246,7 +246,6 @@ code, .mono { font-family: var(--font-mono); font-size: 0.93em; }
 @media (prefers-reduced-motion: reduce) {
   .status-creating::before, .status-deleting::before,
   .job-status.status-running::before { animation: none; }
-  .live-indicator::before { animation: none; }
 }
 
 /* ---------- Data table ---------- */
@@ -448,6 +447,11 @@ input.input:focus, select.input:focus {
   width: 6px; height: 6px; border-radius: 50%;
   background: currentColor;
   animation: badge-pulse 1.6s ease-in-out infinite;
+}
+/* live-indicator の既定アニメーションはこの規則より前(status バッジ用)の
+   reduced-motion ブロックでは後勝ちで上書きできないため、定義直後に置く。 */
+@media (prefers-reduced-motion: reduce) {
+  .live-indicator::before { animation: none; }
 }
 
 /* ---------- Login ---------- */
