@@ -146,3 +146,27 @@ bench 使用中ガード(`InstanceInUse`)→ `beginDeleting` 遷移、の順で�
 - **対応予定**: admin 作成パスの index 検証(failed と衝突する index を弾く)
   か、`beginDeletingIfAllowed` でユニーク違反を検出して制御されたエラーに
   マップする。今後対応。
+
+## 解決記録: #D / #E は Task 7 前に対応済み(PR #37)
+
+上記 #D / #E は「今後対応」と記録していたが、Task 7(本番検証)前に別ブランチ
+`phase3/concurrency-hardening`(PR #37)で対応した。付随して codex 差分レビューで
+挙がった #G〜#J も同 PR で解決。
+
+- **#E** → `7cb7909`: 部分ユニークインデックスの述語を `status != 'deleted'` に変更
+  (migration 0003)。failed も slot を予約するため failed×running 併存が起きず、
+  failed→deleting の 500 が根本解消。`create`/`createIfAllowed` も同述語に追随。
+- **#D** → `e0434a9`: 削除(`beginDeletingIfAllowed`)に「対象 IP を狙う
+  queued/running ジョブ無し」条件を、enqueue(`insertIfAllowed`)に「対象
+  インスタンスが running」条件を、それぞれ単一文の条件付き書き込みとして畳み込み、
+  SQLite の単一ライタ直列化で原子化。
+- **#G/#J** → `40c2560`→`ea18c75`: migration 0003 は既存重複を silent 削除すると
+  実 VM を孤児化しうるため、削除ではなく重複検出時に `MigrationDataError` で
+  中断(手動整理を促す)に変更。0003 は Migrator の動的 import 制約により
+  `MigrationDataError` をローカル定義(cross-migration import 不可)。
+- **#H** → `cd878ed`: enqueue の running ガードを team+IP ではなく `instanceId` で照合。
+- **#I** → `c1eeb93`: direct-IP 経路のベンチ enqueue にも「(team,target_ip) の
+  managed インスタンスが creating/deleting でない」原子ガードを追加し、不変条件を
+  リクエスト形式に依らず対称化。
+
+codex 差分レビュー3ラウンドで「本番コードに actionable な correctness 問題なし」を確認。
