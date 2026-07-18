@@ -1,8 +1,69 @@
-# INUCON Phase 2 デプロイ手順(runbook)
+# INUCON デプロイ手順(runbook)
 
-Task 11 のうち、**ローカルで完結する部分**(Dockerfile / k8s マニフェスト / seed)はこのリポジトリのコミットで完了している。
-このドキュメントは、それ以降の**リモート作業**(apphost への SSH・kubectl apply・ghcr push・Cloudflare 操作・GitHub OAuth App 作成)の手順書。
-実行するにはそれぞれの資格情報(apphost SSH 鍵、ghcr push 権限、Cloudflare API トークン、nixos-config-private への書き込み権限)が要る。
+初期セットアップ(Phase 2 Task 11 当時の手順)と、通常運用の再デプロイ手順をまとめる。
+実行にはそれぞれの資格情報(apphost SSH 鍵、Cloudflare API トークン、nixos-config-private への書き込み権限)が要る。
+コンテスト当日の運営作業は `docs/runbooks/contest-operations.md` を参照。
+
+## 運用ポリシー: 本番 = main(Phase 3 以降)
+
+- **本番(apphost の inucon-portal)は常に `main` ブランチと同一内容**にする。
+- 流れ: タスクごとのブランチ → PR → develop にマージ(ローカル codex レビュー)→
+  デプロイしたくなったら **develop → main の PR を作ってマージ → main からデプロイ**。
+- main へのマージ = デプロイ意思表示。デプロイせずに main を進めない(乖離を作らない)。
+
+## 通常の再デプロイ手順(Phase 3 Task 7 で確立した反復ループ)
+
+前提: デプロイ内容が main にマージ済みで、手元の main が origin/main と一致していること。
+
+```sh
+# 0. main を同期
+git switch main && git pull --ff-only
+
+# 1. amd64 クロスビルド(Apple Silicon から。apphost は amd64)
+docker buildx build --platform linux/amd64 \
+  -f deploy/Dockerfile -t ghcr.io/kisepichu/inucon-portal:latest --load .
+
+# 2. tarball にして apphost へ転送(レジストリ不使用)
+docker save ghcr.io/kisepichu/inucon-portal:latest | gzip > /tmp/inucon-portal.tar.gz
+scp /tmp/inucon-portal.tar.gz apphost.kisen.one:/tmp/
+
+# 3. containerd に取り込み(sudo パスワード対話が要るので TTY 付き)
+ssh -t apphost.kisen.one \
+  'gunzip -c /tmp/inucon-portal.tar.gz | sudo k3s ctr images import - && rm /tmp/inucon-portal.tar.gz'
+
+# 4. 入れ替え(起動時にマイグレーションが自動適用される)
+ssh apphost.kisen.one \
+  'kubectl -n inucon rollout restart deployment/inucon-portal && \
+   kubectl -n inucon rollout status deployment/inucon-portal --timeout=180s'
+
+# 5. 確認
+curl -s -o /dev/null -w '%{http_code}\n' https://inucon.kisen.one/api/health   # 200
+ssh apphost.kisen.one 'kubectl -n inucon logs deploy/inucon-portal --tail=20'
+```
+
+### DB マイグレーションを含むデプロイの注意
+
+- マイグレーションは **pod 起動時に自動適用**(forward-only、`effect_sql_migrations` で管理)。
+- **スキーマ変更を含むデプロイの前にはバックアップを取る**。pod 内の better-sqlite3 で
+  整合スナップショットを作り、手元に取り出す:
+  ```sh
+  POD=$(ssh apphost.kisen.one 'kubectl -n inucon get pods -o name' | head -1 | cut -d/ -f2)
+  ssh apphost.kisen.one "kubectl -n inucon exec -i $POD -- node -e \"const D=require('/app/node_modules/.pnpm/better-sqlite3@12.11.1/node_modules/better-sqlite3');new D('/data/portal.db',{readonly:true}).backup('/data/backup.db').then(()=>console.log('OK'))\""
+  ssh apphost.kisen.one "kubectl -n inucon exec -i $POD -- cat /data/backup.db" > ./portal-backup-$(date +%Y%m%d).db
+  ssh apphost.kisen.one "kubectl -n inucon exec -i $POD -- rm /data/backup.db"
+  ```
+  (better-sqlite3 のパスは pnpm のバージョンで変わる。`find /app/node_modules/.pnpm -maxdepth 1 -name 'better-sqlite3*'` で確認)
+- 大きな移行(テーブル再構築等)は、スナップショットのコピーに対して手元で
+  ドライラン(`DB_PATH=<copy> pnpm exec tsx` でマイグレータを起動)してから本番に流す
+  (Phase 3 の 0002/0003 で実施した手順。詳細:
+  `docs/superpowers/reviews/2026-07-18-phase3-task7-verification.md` ステップ0)。
+
+### ロールバック
+
+イメージタグは `:latest` 運用のため、ロールバック = **問題のコミットを revert して main に積み、
+上記ループで再デプロイ**(main の force-push はしない)。マイグレーションは
+forward-only なのでスキーマは戻せない — スキーマを含む場合はバックアップからの復元になる
+(pod 停止 → PVC の portal.db をバックアップで置換 → 旧イメージ起動)。
 
 ## 0. 前提
 
