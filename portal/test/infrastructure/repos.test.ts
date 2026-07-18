@@ -408,6 +408,58 @@ layer("InstanceRepo: create 重複拒否", (it) => {
       expect(created.id).toStrictEqual(fresh.id)
     })
   )
+
+  // Task 6 レビュー #E: migration 0003 で部分ユニークインデックスの述語を
+  // 「status != 'deleted'」に締め直した(failed も対象)。以前は failed 行が
+  // あっても同じ idx へ新規 create できてしまい(#A のアプリ層 allocator の
+  // 意図と食い違っていた)、vmid/IP 衝突や後述の 500 エラーの温床だった。
+  it.effect("failed 行がある idx への新規 create は DuplicateInstanceIndex(Task 6 レビュー #E)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const team = new Team({
+        id: TeamId.make("team-repo-idx-failed-dup"),
+        name: "Idx Failed Dup",
+        teamNumber: 105
+      })
+      yield* teams.create(team)
+
+      // idx=1 が failed のまま(未掃除、VM/vmid をまだ握っている想定)
+      const failed = new Instance({
+        id: InstanceId.make("instance-failed-dup-old"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1105,
+        privateIp: "10.100.105.11",
+        status: "failed",
+        progress: [],
+        errorMessage: Option.some("boom"),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(failed)
+
+      // 同 idx=1 への新規 create は許されない(以前は成功していた #A バグ)
+      const colliding = new Instance({
+        id: InstanceId.make("instance-failed-dup-new"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1105,
+        privateIp: "10.100.105.11",
+        status: "running",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 1,
+        updatedAt: 1
+      })
+      const exit = yield* Effect.exit(instances.create(colliding))
+      expect(exit).toStrictEqual(Exit.fail(new DuplicateInstanceIndex({ teamId: team.id, index: 1 })))
+
+      // 拒否された行は挿入されていない(failed 行のみ残る)
+      const listed = yield* instances.listByTeam(team.id)
+      expect(listed).toStrictEqual([failed])
+    })
+  )
 })
 
 layer("InstanceRepo: beginDeletingIfAllowed", (it) => {
@@ -557,6 +609,11 @@ layer("InstanceRepo: beginDeletingIfAllowed", (it) => {
     })
   )
 
+  // Task 6 レビュー #E 確認: この UPDATE は自分自身(同一 id)の行を書き換える
+  // だけで新しい行を挿入するわけではないため、migration 0003 で failed も
+  // 部分ユニークインデックスの対象(status != 'deleted')に含めても、他に
+  // 同じ idx を持つ行が無ければこの遷移は問題なく成功し続ける
+  // (「failed 行の通常の自己サービス削除」経路は壊れない)。
   it.effect("failed からも deleting へ遷移できる(Task 4 レビュー I4)", () =>
     Effect.gen(function* () {
       const teams = yield* TeamRepo

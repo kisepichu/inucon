@@ -60,9 +60,13 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
           )
         ),
 
-      // (team_id, idx) の重複判定は migration 0002 の部分ユニークインデックス
-      // (status IN ('creating','running','deleting'))と同条件で行う。
-      // deleted/failed の行があっても同 idx を再作成できる。判定と INSERT は
+      // (team_id, idx) の重複判定は migration 0003 の部分ユニークインデックス
+      // (status != 'deleted', Task 6 レビュー #E で failed も予約対象に
+      // 変更)と同条件で行う。deleted の行があった idx だけ再作成できる。
+      // この WHERE NOT EXISTS の条件を DB のインデックス述語と一致させて
+      // おかないと、failed 行との衝突が「NOT EXISTS は通る→INSERT が UNIQUE
+      // 制約違反で失敗→RepoError(500)」になってしまい、本来返すべき
+      // DuplicateInstanceIndex(409)にならない。判定と INSERT は
       // 「INSERT ... SELECT ... WHERE NOT EXISTS ... RETURNING」の単一原子的操作
       // (TOCTOU 回避、teamRepo.create / benchJobRepo.insertIfAllowed と同じ形)。
       create: (i: Instance) =>
@@ -77,7 +81,7 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
               WHERE NOT EXISTS (
                 SELECT 1 FROM instances
                 WHERE team_id = ${i.teamId} AND idx = ${i.index}
-                  AND status IN ('creating', 'running', 'deleting')
+                  AND status != 'deleted'
               )
               RETURNING ${columns}
             `
@@ -99,6 +103,12 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
       // 重複)で判定する(currentStatusOrDie と同じ「失敗時のみ読み直す」
       // 方針。実際の許可判定は上の単一原子的操作が行っており、この読み直しは
       // 呼び出し元に返すエラー種別を選ぶためだけに使う)。
+      // (3) の重複判定は migration 0003 の部分ユニークインデックス
+      // (status != 'deleted')と同条件にする(Task 6 レビュー #E)。
+      // 呼び出し元(requestCreateInstance)の occupiedIndices が既に
+      // deleted 以外を占有中として index を選ぶため通常はここに来ないが、
+      // 同一 idx への競合 INSERT が割り込んだ場合の TOCTOU backstop として
+      // DB のインデックスと同じ条件で弾く必要がある。
       createIfAllowed: (i: Instance, quota: number) =>
         wrapSqlError(
           sql.withTransaction(
@@ -120,7 +130,7 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
                   AND NOT EXISTS (
                     SELECT 1 FROM instances
                     WHERE team_id = ${i.teamId} AND idx = ${i.index}
-                      AND status IN ('creating', 'running', 'deleting')
+                      AND status != 'deleted'
                   )
                 RETURNING ${columns}
               `

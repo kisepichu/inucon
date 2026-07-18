@@ -84,6 +84,12 @@ export default Effect.gen(function* () {
   // 「進行中/稼働中」に限定した部分ユニークインデックス。deleted/failed の
   // 行が残っていても同じ (team_id, idx) で再作成できる(スペック §Instance
   // 集約: 削除対象の index 再利用は deleted/failed の行があっても可)。
+  //
+  // 【2026-07 追記】failed を対象外にする上の判断は Task 6 レビュー #E で
+  // 覆された(failed 行はまだ vmid/VM を握っているため、アプリ層の
+  // allocator と同様に (team_id, idx) を予約すべき)。0002 は本番適用済みの
+  // forward-only migration のため述語はここでは変更せず、0003 で
+  // DROP INDEX → 再作成して「status != 'deleted'」に締め直している。
   yield* sql`
     CREATE UNIQUE INDEX idx_instances_team_idx_active
     ON instances (team_id, idx)

@@ -332,11 +332,11 @@ export const makeInstanceRepoTest = (initial: ReadonlyArray<Instance> = []): Lay
               if (inProgress) {
                 return [Either.left(new ProvisionInProgress({ teamId: i.teamId })), instances]
               }
+              // Task 6 レビュー #E: 本番 SQLite 実装(migration 0003)と同じく
+              // deleted 以外(failed を含む)は (teamId, index) スロットを
+              // 予約中として扱う。
               const duplicate = instances.some(
-                (x) =>
-                  x.teamId === i.teamId &&
-                  x.index === i.index &&
-                  (x.status === "creating" || x.status === "running" || x.status === "deleting")
+                (x) => x.teamId === i.teamId && x.index === i.index && x.status !== "deleted"
               )
               if (duplicate) {
                 return [Either.left(new DuplicateInstanceIndex({ teamId: i.teamId, index: i.index })), instances]
