@@ -319,14 +319,17 @@ export function Team({ me }: TeamProps) {
 
           {useManualTarget ? (
             <div className="form-field">
-              <label>IP:port</label>
+              <label htmlFor="team-bench-manual-ip">IP:port</label>
               <input
+                id="team-bench-manual-ip"
                 placeholder="IP"
                 value={manualIp}
                 onChange={(event) => setManualIp(event.target.value)}
                 required
               />
               <input
+                id="team-bench-manual-port"
+                aria-label="port"
                 placeholder="port"
                 value={manualPort}
                 onChange={(event) => setManualPort(event.target.value)}
@@ -335,8 +338,8 @@ export function Team({ me }: TeamProps) {
             </div>
           ) : (
             <div className="form-field">
-              <label>インスタンス</label>
-              <select value={selectedInstanceId} onChange={(event) => setSelectedInstanceId(event.target.value)}>
+              <label htmlFor="team-bench-instance">インスタンス</label>
+              <select id="team-bench-instance" value={selectedInstanceId} onChange={(event) => setSelectedInstanceId(event.target.value)}>
                 {runningInstances.map((instance) => (
                   <option key={instance.id} value={instance.id}>
                     {instanceLabel(team.teamNumber, instance)}

@@ -305,9 +305,7 @@ code, .mono { font-family: var(--font-mono); font-size: 0.93em; }
   font-weight: 600;
   color: var(--text-muted);
 }
-.form input[type="text"],
-.form input[type="email"],
-.form input[type="number"],
+.form input:not([type="checkbox"]):not([type="radio"]),
 .form select,
 input.input, select.input {
   font-family: var(--font-sans);
@@ -449,6 +447,11 @@ input.input:focus, select.input:focus {
   width: 6px; height: 6px; border-radius: 50%;
   background: currentColor;
   animation: badge-pulse 1.6s ease-in-out infinite;
+}
+/* live-indicator の既定アニメーションはこの規則より前(status バッジ用)の
+   reduced-motion ブロックでは後勝ちで上書きできないため、定義直後に置く。 */
+@media (prefers-reduced-motion: reduce) {
+  .live-indicator::before { animation: none; }
 }
 
 /* ---------- Login ---------- */
