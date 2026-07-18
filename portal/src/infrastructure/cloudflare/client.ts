@@ -265,6 +265,12 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
         }),
 
       // GET → 和集合 → PUT(締め出し防止。既存ポリシーの include を消さない)。
+      //
+      // emails が空のときはポリシーを書き込まない(Task 7 実機検出): CF は空の
+      // include を 400 で拒否する。ポリシー無しのアプリは deny-by-default なので
+      // 安全側であり、email は後から招待フロー(inviteMember →
+      // syncRunningInstances → ensureAccessApp 再実行)が登録した時点でポリシー
+      // が作られる。
       ensureAccessApp: ({ hostname, emails }) =>
         Effect.gen(function* () {
           const existingApp = yield* findAccessApp(hostname)
@@ -280,6 +286,7 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
               ),
               AccessApp
             )
+            if (emails.length === 0) return
             yield* requestJson(
               HttpClientRequest.post(
                 `${CF_API_BASE}/accounts/${accountId}/access/apps/${app.id}/policies`
@@ -306,6 +313,8 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
           const targetPolicy = policies.find((p) => p.decision === "allow")
 
           if (targetPolicy === undefined) {
+            // 空 include は CF 400(上記コメント)。email が来るまで作らない。
+            if (emails.length === 0) return
             yield* requestJson(
               HttpClientRequest.post(
                 `${CF_API_BASE}/accounts/${accountId}/access/apps/${existingApp.id}/policies`
@@ -324,6 +333,11 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
           const otherIncludes = targetPolicy.include.filter((i) => !isEmailInclude(i))
           const union = Array.from(new Set([...currentEmails, ...emails]))
           const includeBody = [...otherIncludes, ...union.map((email) => ({ email: { email } }))]
+
+          // 防御的ガード: includeBody が空になる場合(既存 allow ポリシーの include
+          // も追加 emails も空)は PUT しない(空 include は CF 400)。実運用では
+          // 既存 allow ポリシーの include が空になることは無いが、安全側に倒す。
+          if (includeBody.length === 0) return
 
           yield* requestJson(
             HttpClientRequest.put(

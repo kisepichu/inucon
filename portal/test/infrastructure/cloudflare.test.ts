@@ -174,6 +174,16 @@ const emailsOf = (include: ReadonlyArray<unknown>): Array<string> =>
     })
     .map((i) => i.email.email)
 
+// 記録済み request から pathname を取り出す(makeFakeCf 内のロジックと同じ)。
+const pathOf = (request: HttpClientRequest.HttpClientRequest): string =>
+  HttpClientRequest.toUrl(request).pipe((opt) => (opt._tag === "Some" ? opt.value : new URL(request.url))).pathname
+
+// emails が空のときにポリシー POST/PUT が発生していないかを requests から確認する。
+const policyWriteRequests = (requests: ReadonlyArray<HttpClientRequest.HttpClientRequest>) =>
+  requests.filter(
+    (r) => pathOf(r).includes("/policies") && (r.method === "POST" || r.method === "PUT")
+  )
+
 describe("ensureInstanceRoute", () => {
   it.effect("新規: DNS CNAME 作成 + tunnel ingress を catch-all の前に追加", () =>
     Effect.gen(function* () {
@@ -505,6 +515,55 @@ describe("ensureAccessApp", () => {
         "new@example.com"
       ])
     })
+  )
+
+  it.effect(
+    "新規: emails が空ならアプリは作るがポリシー作成はスキップする(空 include は CF 400、Task 7 実機検出)",
+    () =>
+      Effect.gen(function* () {
+        const fake = makeFakeCf()
+        yield* CloudflarePort.pipe(
+          Effect.flatMap((cf) => cf.ensureAccessApp({ hostname: "inucon-team1-1.kisen.one", emails: [] })),
+          Effect.provide(portLayer(fake))
+        )
+
+        expect(fake.state.accessApps).toHaveLength(1)
+        const app = fake.state.accessApps[0]
+        expect(app.domain).toBe("inucon-team1-1.kisen.one")
+        expect(app.policies).toHaveLength(0)
+        expect(policyWriteRequests(fake.requests)).toHaveLength(0)
+      })
+  )
+
+  it.effect(
+    "既存: allow ポリシーが無く emails も空ならポリシー作成をスキップする(空 include は CF 400)",
+    () =>
+      Effect.gen(function* () {
+        const fake = makeFakeCf({
+          accessApps: [
+            {
+              id: "app-1",
+              domain: "inucon-team1-1.kisen.one",
+              policies: [
+                { id: "pol-deny", decision: "deny", include: [{ ip: { ip: "203.0.113.0/24" } }] }
+              ]
+            }
+          ]
+        })
+        yield* CloudflarePort.pipe(
+          Effect.flatMap((cf) => cf.ensureAccessApp({ hostname: "inucon-team1-1.kisen.one", emails: [] })),
+          Effect.provide(portLayer(fake))
+        )
+
+        const app = fake.state.accessApps[0]
+        expect(app.policies).toHaveLength(1)
+        expect(app.policies[0]).toStrictEqual({
+          id: "pol-deny",
+          decision: "deny",
+          include: [{ ip: { ip: "203.0.113.0/24" } }]
+        })
+        expect(policyWriteRequests(fake.requests)).toHaveLength(0)
+      })
   )
 })
 
