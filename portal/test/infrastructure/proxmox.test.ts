@@ -54,6 +54,12 @@ const makeFakeProxmox = (
     notFoundVmids?: ReadonlyArray<number>
     // status/current(vmExists)を復旧不能なエラー(403 等)で応答させる vmid。
     statusCurrentErrorVmids?: ReadonlyArray<number>
+    // PVE 9 実機(Task 7)で観測: 存在しない VM への status/current・stop・delete は
+    // 404 ではなく 500 + {"data":null,"message":"Configuration file '...' does not exist\n"}
+    // を返す。この vmid に対しては該当エンドポイントすべてでその応答を模す。
+    missingConfig500Vmids?: ReadonlyArray<number>
+    // 「does not exist」を含まない、本当の 500(復旧不能)を模す vmid。
+    genericServerError500Vmids?: ReadonlyArray<number>
   }
 ) => {
   const requests: Array<HttpClientRequest.HttpClientRequest> = []
@@ -64,6 +70,16 @@ const makeFakeProxmox = (
   let agentPingCallCount = 0
   const notFoundVmids = new Set(overrides?.notFoundVmids ?? [])
   const statusCurrentErrorVmids = new Set(overrides?.statusCurrentErrorVmids ?? [])
+  const missingConfig500Vmids = new Set(overrides?.missingConfig500Vmids ?? [])
+  const genericServerError500Vmids = new Set(overrides?.genericServerError500Vmids ?? [])
+  const missingConfigResponse = (request: HttpClientRequest.HttpClientRequest, vmid: number) =>
+    jsonResponse(
+      request,
+      { data: null, message: `Configuration file 'nodes/eevee/qemu-server/${vmid}.conf' does not exist\n` },
+      500
+    )
+  const genericErrorResponse = (request: HttpClientRequest.HttpClientRequest) =>
+    jsonResponse(request, { data: null, message: "internal error" }, 500)
 
   const registerTask = (key: string): string => {
     const upid = `UPID:eevee:${++upidCounter}:${key}`
@@ -103,6 +119,9 @@ const makeFakeProxmox = (
     const stopMatch = path.match(/^\/api2\/json\/nodes\/eevee\/qemu\/(\d+)\/status\/stop$/)
     if (stopMatch && method === "POST") {
       const vmid = Number(stopMatch[1])
+      if (missingConfig500Vmids.has(vmid)) {
+        return Effect.succeed(missingConfigResponse(request, vmid))
+      }
       if (notFoundVmids.has(vmid)) {
         return Effect.succeed(jsonResponse(request, { errors: "no such VM" }, 404))
       }
@@ -114,6 +133,9 @@ const makeFakeProxmox = (
     const destroyMatch = path.match(/^\/api2\/json\/nodes\/eevee\/qemu\/(\d+)$/)
     if (destroyMatch && method === "DELETE") {
       const vmid = Number(destroyMatch[1])
+      if (missingConfig500Vmids.has(vmid)) {
+        return Effect.succeed(missingConfigResponse(request, vmid))
+      }
       if (notFoundVmids.has(vmid)) {
         return Effect.succeed(jsonResponse(request, { errors: "no such VM" }, 404))
       }
@@ -127,6 +149,12 @@ const makeFakeProxmox = (
       const vmid = Number(statusCurrentMatch[1])
       if (statusCurrentErrorVmids.has(vmid)) {
         return Effect.succeed(jsonResponse(request, { errors: "forbidden" }, 403))
+      }
+      if (genericServerError500Vmids.has(vmid)) {
+        return Effect.succeed(genericErrorResponse(request))
+      }
+      if (missingConfig500Vmids.has(vmid)) {
+        return Effect.succeed(missingConfigResponse(request, vmid))
       }
       if (notFoundVmids.has(vmid)) {
         return Effect.succeed(jsonResponse(request, { errors: "no such VM" }, 404))
@@ -344,6 +372,19 @@ describe("startVm / stopAndDestroyVm", () => {
       )
     })
   )
+
+  // PVE 9 実機(Task 7)で観測: 既に消えている VM への stop/delete は 404 ではなく
+  // 500 + "Configuration file '...' does not exist" を返す。テアダウンは冪等
+  // 操作なので、この応答も「既に無い」= 成功として扱わなければならない。
+  it.effect("冪等: VM が既に存在しない(500 + does not exist)場合も成功する(Task 7 実機検出)", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox({ missingConfig500Vmids: [1102] })
+      yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.stopAndDestroyVm(1102)),
+        Effect.provide(portLayer(fake))
+      )
+    })
+  )
 })
 
 describe("vmExists(clone 再入可能性チェック、Task 4 レビュー C1)", () => {
@@ -376,6 +417,33 @@ describe("vmExists(clone 再入可能性チェック、Task 4 レビュー C1)",
       const exit = yield* Effect.exit(
         ProxmoxPort.pipe(
           Effect.flatMap((px) => px.vmExists(1101)),
+          Effect.provide(portLayer(fake))
+        )
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+    })
+  )
+
+  // PVE 9 実機(Task 7)で観測: 存在しない VM への status/current は 404 ではなく
+  // 500 + {"data":null,"message":"Configuration file '...' does not exist\n"} を返す。
+  // 404 決め打ちだと fatal ProxmoxError になり払い出しが即失敗していた実バグ。
+  it.effect("status/current が 500 + does not exist なら false(Task 7 実機検出)", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox({ missingConfig500Vmids: [1102] })
+      const exists = yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.vmExists(1102)),
+        Effect.provide(portLayer(fake))
+      )
+      expect(exists).toBe(false)
+    })
+  )
+
+  it.effect("status/current が 500 だが does not exist を含まない場合は ProxmoxError(本当のエラーを飲み込まない)", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox({ genericServerError500Vmids: [1102] })
+      const exit = yield* Effect.exit(
+        ProxmoxPort.pipe(
+          Effect.flatMap((px) => px.vmExists(1102)),
           Effect.provide(portLayer(fake))
         )
       )

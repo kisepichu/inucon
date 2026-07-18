@@ -130,42 +130,78 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         Effect.scoped
       )
 
-    // 冪等操作用。404(対象 VM が既に無い)と 204(No Content = 待つべき
-    // タスクが無い)はどちらも None を返し、それ以外の成功はボディの UPID を
-    // Some で返す。
+    // PVE 9 実機(Task 7 実機検証で確認)では、存在しない VM に対する
+    // GET .../status/current(や、既に消えている VM への stop/delete)が
+    // 404 ではなく HTTP 500 で返り、ボディは
+    // {"data":null,"message":"Configuration file 'nodes/eevee/qemu-server/<vmid>.conf' does not exist\n"}
+    // となる。404 のみを「存在しない」とみなす実装ではこの 500 がそのまま
+    // 復旧不能な ProxmoxError として伝播し、自己サービス払い出しが
+    // creating → failed で即死する(Task 7 で実際に踏んだ本番障害)。
+    // そのため、404 に加えて「非 2xx かつボディがこのメッセージにマッチする」
+    // 場合も「VM が存在しない」として扱う。逆に、メッセージが一致しない
+    // 非 2xx(本当のサーバエラー等)まで不在扱いにすると、二重 clone などの
+    // 実害があるため、そこは従来通り ProxmoxError で fail させる。
+    // 呼び出し側は 2xx をこの関数に渡さない前提(呼び出し前に 2xx 分岐済み)。
+    const VM_MISSING_MESSAGE_PATTERN = /does not exist/i
+
+    const isVmMissingResponse = (
+      response: HttpClientResponse.HttpClientResponse
+    ): Effect.Effect<boolean> =>
+      response.status === 404
+        ? Effect.succeed(true)
+        : response.text.pipe(
+            Effect.map((text) => VM_MISSING_MESSAGE_PATTERN.test(text)),
+            Effect.orElseSucceed(() => false)
+          )
+
+    // 冪等操作用。404(対象 VM が既に無い)、204(No Content = 待つべき
+    // タスクが無い)、および上記の「500 + does not exist」はどれも None を返し、
+    // それ以外の成功はボディの UPID を Some で返す。
     const requestUpidOrNotFound = (
       req: HttpClientRequest.HttpClientRequest
     ): Effect.Effect<Option.Option<string>, ProxmoxError> =>
       client.execute(req).pipe(
         Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) })),
         Effect.flatMap((response) => {
-          if (response.status === 404 || response.status === 204) return Effect.succeed(Option.none<string>())
-          if (response.status < 200 || response.status >= 300) {
-            return Effect.fail(
-              new ProxmoxError({ cause: `Proxmox API ${req.method} ${requestPath(req)} → ${response.status}` })
+          if (response.status === 204) return Effect.succeed(Option.none<string>())
+          if (response.status >= 200 && response.status < 300) {
+            return HttpClientResponse.schemaBodyJson(UpidResponse)(response).pipe(
+              Effect.map((r) => Option.some(r.data)),
+              Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) }))
             )
           }
-          return HttpClientResponse.schemaBodyJson(UpidResponse)(response).pipe(
-            Effect.map((r) => Option.some(r.data)),
-            Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) }))
+          return isVmMissingResponse(response).pipe(
+            Effect.flatMap((missing) =>
+              missing
+                ? Effect.succeed(Option.none<string>())
+                : Effect.fail(
+                    new ProxmoxError({ cause: `Proxmox API ${req.method} ${requestPath(req)} → ${response.status}` })
+                  )
+            )
           )
         }),
         Effect.scoped
       )
 
-    // 存在確認専用(vmExists)。404 を「存在しない」として吸収し、それ以外の
-    // 非 2xx は復旧不能な ProxmoxError にする(requestUpidOrNotFound と同じ
-    // 404 の扱いだが、こちらはボディをデコードせず有無だけを boolean で返す)。
+    // 存在確認専用(vmExists)。404、および「500 + does not exist」を
+    // 「存在しない」として吸収し、それ以外の非 2xx は復旧不能な ProxmoxError
+    // にする(requestUpidOrNotFound と同じ判定だが、こちらはボディをデコード
+    // せず有無だけを boolean で返す)。
     const requestExistsOrNotFound = (
       req: HttpClientRequest.HttpClientRequest
     ): Effect.Effect<boolean, ProxmoxError> =>
       client.execute(req).pipe(
         Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) })),
         Effect.flatMap((response) => {
-          if (response.status === 404) return Effect.succeed(false)
           if (response.status >= 200 && response.status < 300) return Effect.succeed(true)
-          return Effect.fail(
-            new ProxmoxError({ cause: `Proxmox API ${req.method} ${requestPath(req)} → ${response.status}` })
+          return isVmMissingResponse(response).pipe(
+            Effect.flatMap((missing) =>
+              missing
+                ? Effect.succeed(false)
+                : Effect.fail(
+                    new ProxmoxError({ cause: `Proxmox API ${req.method} ${requestPath(req)} → ${response.status}` })
+                  )
+            )
           )
         }),
         Effect.scoped
@@ -265,7 +301,9 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         }),
 
       // clone 再入可能性チェック用(Task 4 レビュー C1)。status/current は
-      // 対象 VM が存在しない場合 404 を返す(Proxmox VE API の一般的な挙動)。
+      // 対象 VM が存在しない場合 404 を返すことが多いが、PVE 9 実機(Task 7)では
+      // 500 + "Configuration file '...' does not exist" で返ることを確認済み
+      // (requestExistsOrNotFound / isVmMissingResponse が両方を吸収する)。
       vmExists: (vmid) => requestExistsOrNotFound(HttpClientRequest.get(`${nodeUrl}/qemu/${vmid}/status/current`)),
 
       // guest agent 未起動時、Proxmox は agent/ping に 500(QEMU guest agent is not
