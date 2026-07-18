@@ -228,7 +228,7 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         Effect.scoped
       )
 
-    const waitForTask = (upid: string) =>
+    const pollTaskStatus = (upid: string) =>
       pollUntil({
         attempt: request(
           HttpClientRequest.get(`${apiUrl}/nodes/${NODE}/tasks/${encodeURIComponent(upid)}/status`),
@@ -238,7 +238,10 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         intervalMillis: TASK_POLL_INTERVAL_MILLIS,
         timeoutMillis: TASK_POLL_TIMEOUT_MILLIS,
         onTimeout: () => new ProxmoxError({ cause: `task ${upid} did not complete within timeout` })
-      }).pipe(
+      })
+
+    const waitForTask = (upid: string) =>
+      pollTaskStatus(upid).pipe(
         Effect.flatMap((data) =>
           data.exitstatus === "OK"
             ? Effect.void
@@ -248,6 +251,30 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
 
     const runTask = (req: HttpClientRequest.HttpClientRequest) =>
       request(req, UpidResponse).pipe(Effect.flatMap((r) => waitForTask(r.data)))
+
+    // PVE 9 実機(Task 7 再検証)では、既に消えている VM への stop/delete が
+    // 同期エラー(404 / 500 + does not exist)にならず、200 + UPID を返した上で
+    // タスク自体が exitstatus="unable to find configuration file for VM <vmid>"
+    // で失敗することがある(非同期版の「VM 不在」)。stopAndDestroyVm は冪等操作
+    // なので、この特定パターンの task 失敗だけは「既に無い」= 成功として許容する。
+    // vmid を組み込んだ正規表現でマッチさせ、無関係な task 失敗(本当の障害)を
+    // 誤って握りつぶさないようにする。
+    const vmMissingTaskExitstatusPattern = (vmid: number) =>
+      new RegExp(`unable to find configuration file for VM ${vmid}\\b`, "i")
+
+    const waitForTaskTolerateMissing = (vmid: number, upid: string) =>
+      pollTaskStatus(upid).pipe(
+        Effect.flatMap((data) => {
+          if (data.exitstatus === "OK") return Effect.void
+          if (data.exitstatus !== undefined && vmMissingTaskExitstatusPattern(vmid).test(data.exitstatus)) {
+            return Effect.void
+          }
+          return Effect.fail(new ProxmoxError({ cause: `task ${upid} failed: exitstatus=${data.exitstatus}` }))
+        })
+      )
+
+    const vmExistsEffect = (vmid: number): Effect.Effect<boolean, ProxmoxError> =>
+      requestExistsOrNotFound(HttpClientRequest.get(`${nodeUrl}/qemu/${vmid}/status/current`))
 
     return {
       cloneVm: ({ name, newVmid, templateVmid }) =>
@@ -292,27 +319,42 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
 
       startVm: (vmid) => runTask(HttpClientRequest.post(`${nodeUrl}/qemu/${vmid}/status/start`)),
 
-      // 冪等: stop/destroy いずれも対象 VM が既に存在しない(404)場合は成功扱い。
+      // 冪等: 対象 VM が既に存在しない場合は成功扱い。PVE 9 実機(Task 7)で
+      // 2 通りの「VM 不在」が確認されている。
+      // (1) 同期パス: stop/delete 自体が 404、または 500 +
+      //     "Configuration file '...qemu-server/<vmid>.conf' does not exist"
+      //     で返る(isVmMissingResponse / requestUpidOrNotFound が吸収)。
+      // (2) 非同期パス(Task 7 再検証): 存在しない VM への stop が同期エラーに
+      //     ならず 200 + UPID を返し、そのタスクを poll すると
+      //     exitstatus="unable to find configuration file for VM <vmid>" で
+      //     stopped する(waitForTaskTolerateMissing が吸収)。
+      // さらに、そもそも VM が最初から存在しない(vmExists=false)場合は
+      // stop/destroy のリクエスト自体を送らずに即成功させる(冪等操作の
+      // 事前短絡。無用な API 呼び出しを避け、(1)(2)いずれの応答パターンにも
+      // 依存しない最も確実な経路)。
       stopAndDestroyVm: (vmid) =>
         Effect.gen(function* () {
+          const exists = yield* vmExistsEffect(vmid)
+          if (!exists) return
+
           const stopUpid = yield* requestUpidOrNotFound(
             HttpClientRequest.post(`${nodeUrl}/qemu/${vmid}/status/stop`)
           )
-          if (Option.isSome(stopUpid)) yield* waitForTask(stopUpid.value)
+          if (Option.isSome(stopUpid)) yield* waitForTaskTolerateMissing(vmid, stopUpid.value)
 
           const deleteUpid = yield* requestUpidOrNotFound(
             HttpClientRequest.del(`${nodeUrl}/qemu/${vmid}`).pipe(
               HttpClientRequest.setUrlParam("purge", "1")
             )
           )
-          if (Option.isSome(deleteUpid)) yield* waitForTask(deleteUpid.value)
+          if (Option.isSome(deleteUpid)) yield* waitForTaskTolerateMissing(vmid, deleteUpid.value)
         }),
 
       // clone 再入可能性チェック用(Task 4 レビュー C1)。status/current は
       // 対象 VM が存在しない場合 404 を返すことが多いが、PVE 9 実機(Task 7)では
       // 500 + "Configuration file '...' does not exist" で返ることを確認済み
       // (requestExistsOrNotFound / isVmMissingResponse が両方を吸収する)。
-      vmExists: (vmid) => requestExistsOrNotFound(HttpClientRequest.get(`${nodeUrl}/qemu/${vmid}/status/current`)),
+      vmExists: (vmid) => vmExistsEffect(vmid),
 
       // guest agent 未起動時、Proxmox は agent/ping に 500(QEMU guest agent is not
       // running)を返す。これは「まだ ready でない」= リトライすべきケース。
