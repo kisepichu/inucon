@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useState } from "react"
 import { Navigate, NavLink, Route, Routes } from "react-router-dom"
 import type { Contest, Me } from "shared/schemas"
-import { ApiError, api } from "./api.ts"
+import { ApiError, api, loginUrl } from "./api.ts"
 import { Admin } from "./pages/Admin.tsx"
 import { JobDetail } from "./pages/JobDetail.tsx"
-import { Login } from "./pages/Login.tsx"
 import { Scoreboard } from "./pages/Scoreboard.tsx"
 import { Team } from "./pages/Team.tsx"
 
@@ -37,7 +36,7 @@ export function App() {
   }, [loadMe])
 
   useEffect(() => {
-    if (status !== "authenticated") {
+    if (status === "loading") {
       return
     }
     let canceled = false
@@ -80,10 +79,6 @@ export function App() {
     )
   }
 
-  if (status === "unauthenticated" || me === null) {
-    return <Login />
-  }
-
   return (
     <>
       <header className="app-header">
@@ -96,29 +91,45 @@ export function App() {
             <NavLink to="/" end className={({ isActive }) => (isActive ? "nav-link active" : "nav-link")}>
               Scoreboard
             </NavLink>
-            <NavLink to="/team" className={({ isActive }) => (isActive ? "nav-link active" : "nav-link")}>
-              Team
-            </NavLink>
-            {me.user.isAdmin && (
+            {me !== null && (
+              <NavLink to="/team" className={({ isActive }) => (isActive ? "nav-link active" : "nav-link")}>
+                Team
+              </NavLink>
+            )}
+            {me?.user.isAdmin && (
               <NavLink to="/admin" className={({ isActive }) => (isActive ? "nav-link active" : "nav-link")}>
                 Admin
               </NavLink>
             )}
           </nav>
           <div className="app-user">
-            <span className="app-user-name">{me.user.displayName}</span>
-            <button type="button" className="btn btn-sm btn-ghost-dark" onClick={handleLogout}>
-              logout
-            </button>
+            {me !== null ? (
+              <>
+                <span className="app-user-name">{me.user.displayName}</span>
+                <button type="button" className="btn btn-sm btn-ghost-dark" onClick={handleLogout}>
+                  logout
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                onClick={() => {
+                  window.location.href = loginUrl
+                }}
+              >
+                GitHub でログイン
+              </button>
+            )}
           </div>
         </div>
       </header>
       <main className="app-main">
         <Routes>
           <Route path="/" element={<Scoreboard />} />
-          <Route path="/team" element={<Team me={me} />} />
-          <Route path="/jobs/:id" element={<JobDetail />} />
-          {me.user.isAdmin && <Route path="/admin" element={<Admin />} />}
+          <Route path="/team" element={me !== null ? <Team me={me} /> : <Navigate to="/" replace />} />
+          <Route path="/jobs/:id" element={me !== null ? <JobDetail /> : <Navigate to="/" replace />} />
+          <Route path="/admin" element={me?.user.isAdmin ? <Admin /> : <Navigate to="/" replace />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>

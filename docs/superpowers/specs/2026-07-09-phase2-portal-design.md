@@ -224,8 +224,8 @@ deploy/            apphost k3s マニフェスト(Deployment/Service/Ingress/PVC
 | グループ | エンドポイント | 認可 | 内容 |
 | --- | --- | --- | --- |
 | auth | `GET /auth/github` / `GET /auth/github/callback` / `POST /api/auth/logout` / `GET /api/me` | 公開 / セッション | ログインフロー、自分+所属チーム情報 |
-| contest | `GET /api/contest` | セッション | 現在のコンテスト(名前・問題・状態) |
-| scoreboard | `GET /api/scoreboard` | セッション | チームごとの最新/最高スコア一覧 |
+| contest | `GET /api/contest` | 公開 | 現在のコンテスト(名前・問題・状態) |
+| scoreboard | `GET /api/scoreboard` | 公開 | チームごとの最新/最高スコア一覧 |
 | teams | `GET /api/teams` / `POST /api/teams` / `PUT /api/teams/:id/members` | 参照はセッション、変更は admin | チーム一覧、作成、メンバー割当 |
 | instances | `GET /api/teams/:id/instances` / `POST /api/instances` / `DELETE /api/instances/:id` | 参照は当該チーム or admin、変更は admin | インスタンス台帳 |
 | bench | `POST /api/bench-jobs`(enqueue)/ `GET /api/bench-jobs?teamId=` / `GET /api/bench-jobs/:id` / `POST /api/bench-jobs/:id/cancel` | enqueue/cancel はチームメンバー(自チームのみ)。一覧(スコア・状態)は全員可、**詳細(ログ)は自チーム + admin のみ**(ログはチューニング戦略が漏れるため) | エンキュー、履歴、詳細(ログ含む)、キャンセル。**キャンセルは `queued` のみ可**(dequeue 前のみ。`running` 以降は 409 — 実行中断はランナー側の中断処理が必要になるため Phase 2 ではしない) |

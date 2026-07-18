@@ -6,11 +6,19 @@ import { login } from "../support/login.js"
 import { TestLayer } from "../support/apiTestHelpers.js"
 
 describe("GET /api/scoreboard", () => {
-  it.effect("cookie なしは401", () =>
+  it.effect("cookie なしでも200と配列が返る(公開エンドポイント)", () =>
     Effect.gen(function* () {
       const client = yield* HttpClient.HttpClient
       const res = yield* client.get("/api/scoreboard")
-      expect(res.status).toBe(401)
+      expect(res.status).toBe(200)
+      const body = (yield* res.json) as ReadonlyArray<{
+        teamId: string
+        teamName: string
+        bestScore: number | null
+        latestScore: number | null
+        latestAt: number | null
+      }>
+      expect(Array.isArray(body)).toBe(true)
     }).pipe(Effect.provide(TestLayer))
   )
 
