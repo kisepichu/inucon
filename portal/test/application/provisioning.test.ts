@@ -157,7 +157,7 @@ describe("requestCreateInstance(ガード)", () => {
 
   it.effect("正常系: creating 行が返る(202 相当)", () =>
     Effect.gen(function* () {
-      const instance = yield* requestCreateInstance({ user: alice, teamId: team1Id, index: 1 })
+      const instance = yield* requestCreateInstance({ user: alice, teamId: team1Id })
       expect(instance.status).toBe("creating")
       expect(instance.teamId).toBe(team1Id)
       expect(instance.index).toBe(1)
@@ -169,7 +169,7 @@ describe("requestCreateInstance(ガード)", () => {
 
   it.effect("quota 超過(creating+running = quota)は QuotaExceeded", () =>
     Effect.gen(function* () {
-      const exit = yield* Effect.exit(requestCreateInstance({ user: alice, teamId: team1Id, index: 3 }))
+      const exit = yield* Effect.exit(requestCreateInstance({ user: alice, teamId: team1Id }))
       expect(exit).toStrictEqual(Exit.fail(new QuotaExceeded({ teamId: team1Id, quota: 2 })))
     }).pipe(
       Effect.provide(
@@ -186,7 +186,7 @@ describe("requestCreateInstance(ガード)", () => {
 
   it.effect("進行中(creating/deleting)が既にあれば ProvisionInProgress", () =>
     Effect.gen(function* () {
-      const exit = yield* Effect.exit(requestCreateInstance({ user: alice, teamId: team1Id, index: 2 }))
+      const exit = yield* Effect.exit(requestCreateInstance({ user: alice, teamId: team1Id }))
       expect(exit).toStrictEqual(Exit.fail(new ProvisionInProgress({ teamId: team1Id })))
     }).pipe(
       Effect.provide(
@@ -197,7 +197,7 @@ describe("requestCreateInstance(ガード)", () => {
 
   it.effect("空き RAM が閾値未満なら InsufficientMemory(DB 書き込み前に拒否)", () =>
     Effect.gen(function* () {
-      const exit = yield* Effect.exit(requestCreateInstance({ user: alice, teamId: team1Id, index: 1 }))
+      const exit = yield* Effect.exit(requestCreateInstance({ user: alice, teamId: team1Id }))
       expect(exit).toStrictEqual(
         Exit.fail(new InsufficientMemory({ freeBytes: 1_000_000_000, requiredBytes: 5_000_000_000 }))
       )
@@ -210,14 +210,14 @@ describe("requestCreateInstance(ガード)", () => {
 
   it.effect("非メンバーは Forbidden", () =>
     Effect.gen(function* () {
-      const exit = yield* Effect.exit(requestCreateInstance({ user: carol, teamId: team1Id, index: 1 }))
+      const exit = yield* Effect.exit(requestCreateInstance({ user: carol, teamId: team1Id }))
       expect(exit).toStrictEqual(Exit.fail(new Forbidden()))
     }).pipe(Effect.provide(baseGuardLayer()))
   )
 
   it.effect("admin は他チームでも作成できる", () =>
     Effect.gen(function* () {
-      const instance = yield* requestCreateInstance({ user: admin, teamId: team1Id, index: 1 })
+      const instance = yield* requestCreateInstance({ user: admin, teamId: team1Id })
       expect(instance.status).toBe("creating")
     }).pipe(Effect.provide(baseGuardLayer()))
   )
@@ -229,7 +229,7 @@ describe("requestCreateInstance(ガード)", () => {
   // 確認することで、DB チェックが先に fail-fast していることを検証する。
   it.effect("quota 超過かつ RAM 不足が同時に成り立つ場合、安価な quota チェックが先に効く(QuotaExceeded)", () =>
     Effect.gen(function* () {
-      const exit = yield* Effect.exit(requestCreateInstance({ user: alice, teamId: team1Id, index: 3 }))
+      const exit = yield* Effect.exit(requestCreateInstance({ user: alice, teamId: team1Id }))
       expect(exit).toStrictEqual(Exit.fail(new QuotaExceeded({ teamId: team1Id, quota: 2 })))
     }).pipe(
       Effect.provide(
@@ -248,7 +248,7 @@ describe("requestCreateInstance(ガード)", () => {
 
   it.effect("進行中かつ RAM 不足が同時に成り立つ場合、安価な進行中チェックが先に効く(ProvisionInProgress)", () =>
     Effect.gen(function* () {
-      const exit = yield* Effect.exit(requestCreateInstance({ user: alice, teamId: team1Id, index: 2 }))
+      const exit = yield* Effect.exit(requestCreateInstance({ user: alice, teamId: team1Id }))
       expect(exit).toStrictEqual(Exit.fail(new ProvisionInProgress({ teamId: team1Id })))
     }).pipe(
       Effect.provide(
@@ -256,6 +256,82 @@ describe("requestCreateInstance(ガード)", () => {
           freeMemBytes: 1_000_000_000,
           minFreeMemBytes: 5_000_000_000,
           instances: [creatingInstance({ id: "c1", teamId: team1Id, index: 1, teamNumber: 1 })]
+        })
+      )
+    )
+  )
+})
+
+// Task 6 レビュー #1: index はクライアント指定ではなくサーバー側で
+// 「当該チームの active(creating/running)でない、1..instanceQuota の
+// もっとも小さい空き」を採番する。vmid/privateIp 不変条件(vmid = 1000 +
+// teamNumber*100 + index、ipFor = 10.100.<tn>.1<index>)は index が
+// instanceQuota 以下であることに依存するため、ここではその採番ロジック
+// そのものを検証する(requestCreateInstance 自体は index を引数に取らない)。
+describe("requestCreateInstance(index のサーバー採番)", () => {
+  const indexLayer = (opts: { instances?: ReadonlyArray<Instance>; quota?: number } = {}) =>
+    Layer.mergeAll(
+      UuidGenTest,
+      teamRepoLayer,
+      contestLayer(opts.quota ?? 3),
+      makeInstanceRepoTest(opts.instances ?? []),
+      makeProxmoxPortTest({ freeMemBytes: 6_000_000_000 }).layer,
+      ProvisioningConfigTest({ minFreeMemBytes: 5_000_000_000 })
+    )
+
+  it.effect("空の台帳への最初の追加は index=1(quota >= 3)", () =>
+    Effect.gen(function* () {
+      const instance = yield* requestCreateInstance({ user: alice, teamId: team1Id })
+      expect(instance.index).toBe(1)
+      expect(instance.vmid).toBe(vmidFor(1, 1))
+      expect(instance.privateIp).toBe(ipFor(1, 1))
+    }).pipe(Effect.provide(indexLayer({ quota: 3 })))
+  )
+
+  it.effect("active な index=1 が既にあれば次は index=2 を採番する", () =>
+    Effect.gen(function* () {
+      const instance = yield* requestCreateInstance({ user: alice, teamId: team1Id })
+      expect(instance.index).toBe(2)
+      expect(instance.vmid).toBe(vmidFor(1, 2))
+      expect(instance.privateIp).toBe(ipFor(1, 2))
+    }).pipe(
+      Effect.provide(
+        indexLayer({
+          quota: 3,
+          instances: [runningInstance({ id: "r1", teamId: team1Id, index: 1, teamNumber: 1 })]
+        })
+      )
+    )
+  )
+
+  // index=1 は deleted(non-active)、index=2 は running(active)という状態を
+  // 想定する。「削除→再追加を繰り返すと index が増え続ける」旧 UI ロジック
+  // (nextInstanceIndex = active の max+1)の問題がサーバー採番では起きない
+  // (最小の空き index=1 を再利用し、単調増加しない)ことを確認する。
+  const deletedIndex1 = new Instance({
+    id: InstanceId.make("deleted-1"),
+    teamId: team1Id,
+    index: 1,
+    vmid: vmidFor(1, 1),
+    privateIp: ipFor(1, 1),
+    status: "deleted",
+    progress: ["clone_done", "configured", "started", "route_done", "access_done"],
+    errorMessage: Option.none(),
+    createdAt: 0,
+    updatedAt: 0
+  })
+
+  it.effect("index=1 が(削除により non-active になって)解放されていれば、単調増加せず最小の空き index=1 を再利用する", () =>
+    Effect.gen(function* () {
+      const instance = yield* requestCreateInstance({ user: alice, teamId: team1Id })
+      expect(instance.index).toBe(1)
+      expect(instance.vmid).toBe(vmidFor(1, 1))
+      expect(instance.privateIp).toBe(ipFor(1, 1))
+    }).pipe(
+      Effect.provide(
+        indexLayer({
+          quota: 3,
+          instances: [deletedIndex1, runningInstance({ id: "r2", teamId: team1Id, index: 2, teamNumber: 1 })]
         })
       )
     )

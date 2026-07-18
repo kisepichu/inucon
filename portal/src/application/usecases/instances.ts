@@ -120,7 +120,7 @@ export const removeInstance = (args: { instanceId: InstanceId }) =>
 // どうせ弾かれる quota 超過/進行中のリクエストで無駄な Proxmox 呼び出しを
 // 起こさない(fail-fast)。ここでの事前チェックは非原子的(TOCTOU あり)だが、
 // 正しさの最終保証は原子的な createIfAllowed 側にあるため実害は無い。
-export const requestCreateInstance = (args: { user: User; teamId: TeamId; index: number }) =>
+export const requestCreateInstance = (args: { user: User; teamId: TeamId }) =>
   Effect.gen(function* () {
     const teams = yield* TeamRepo
     const team = yield* teams.findById(args.teamId).pipe(
@@ -145,6 +145,21 @@ export const requestCreateInstance = (args: { user: User; teamId: TeamId; index:
       return yield* Effect.fail(new ProvisionInProgress({ teamId: team.id }))
     }
 
+    // index はサーバー側で採番する(Task 6 レビュー #1): vmid = 1000 +
+    // teamNumber*100 + index / ipFor = 10.100.<tn>.1<index> という不変条件は
+    // index が小さい(概ね < 100)ことを前提にしており、クライアント指定の
+    // index を無検証で使うと衝突・不正 IP に到達しうる。直上の quota チェックで
+    // activeCount < instanceQuota が保証されているため、1..instanceQuota の
+    // 範囲には必ず未使用の index が存在する(defensive に quota+1 へ
+    // フォールバックするが理論上到達しない)。
+    const activeIndices = new Set(
+      existing.filter((x) => x.status === "creating" || x.status === "running").map((x) => x.index)
+    )
+    const freeIndices = Array.from({ length: contest.instanceQuota }, (_, i) => i + 1).filter(
+      (i) => !activeIndices.has(i)
+    )
+    const index = freeIndices[0] ?? contest.instanceQuota + 1
+
     const config = yield* ProvisioningConfig
     const proxmox = yield* ProxmoxPort
     const freeBytes = yield* proxmox.getNodeFreeMemBytes
@@ -158,7 +173,7 @@ export const requestCreateInstance = (args: { user: User; teamId: TeamId; index:
     const instance = newInstance({
       id,
       teamId: team.id,
-      index: args.index,
+      index,
       teamNumber: team.teamNumber,
       now
     })

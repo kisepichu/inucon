@@ -125,12 +125,11 @@ export const CreateInstanceRequest = Schema.Struct({
 export type CreateInstanceRequest = typeof CreateInstanceRequest.Type
 
 // POST /api/teams/:id/instances(追加ボタン、セルフサービス。スペック §HTTP
-// API 差分)。privateIp/vmid はサーバー側で teamNumber/index から算出するため
-// (スペック §Instance 集約 不変条件3・5、公平性のためユーザー入力を受けない)、
-// admin 専用の CreateInstanceRequest と異なり index のみを受け取る。
-export const CreateTeamInstanceRequest = Schema.Struct({
-  index: Schema.Int.pipe(Schema.positive())
-})
+// API 差分)。privateIp/vmid/index はすべてサーバー側で算出する(Task 6 レビュー
+// #1: クライアント指定の index を無検証で使うと vmid/IP 不変条件が壊れて衝突・
+// 不正 IP に到達しうるため、index もサーバー採番=公平性のためユーザー入力を
+// 受けない)。ペイロードは空。
+export const CreateTeamInstanceRequest = Schema.Struct({})
 export type CreateTeamInstanceRequest = typeof CreateTeamInstanceRequest.Type
 
 // POST /api/admin/teams/:id/invites(admin。スペック §招待フロー)。email は

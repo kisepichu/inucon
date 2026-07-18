@@ -63,9 +63,9 @@ export const InstancesLive = HttpApiBuilder.group(api, "instances", (handlers) =
       )
     )
     .handle("deleteInstance", ({ path }) => removeInstance({ instanceId: path.id }).pipe(Effect.orDie))
-    .handle("createTeamInstance", ({ path, payload }) =>
+    .handle("createTeamInstance", ({ path }) =>
       CurrentUser.pipe(
-        Effect.flatMap((user) => requestCreateInstance({ user, teamId: path.id, index: payload.index })),
+        Effect.flatMap((user) => requestCreateInstance({ user, teamId: path.id })),
         Effect.map(toInstanceResponse),
         Effect.catchTags({
           TeamNotFound: () => Effect.fail(new NotFound()),

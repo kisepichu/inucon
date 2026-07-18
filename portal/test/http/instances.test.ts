@@ -297,12 +297,17 @@ describe("POST /api/teams/:id/instances", () => {
       const { user, cookieHeader } = yield* login({ githubLogin: "createteaminst-member" })
       yield* teams.setMembers(team.id, [user.id])
 
-      const res = yield* post(cookieHeader, team.id, { index: 1 })
+      // index はサーバー側で採番するためペイロードは空(Task 6 レビュー #1)。
+      const res = yield* post(cookieHeader, team.id, {})
       expect(res.status).toBe(200)
-      const body = (yield* res.json) as { status: string; teamId: string; index: number }
+      const body = (yield* res.json) as { status: string; teamId: string; index: number; vmid: number; privateIp: string }
       expect(body.status).toBe("creating")
       expect(body.teamId).toBe(team.id)
+      // 空の台帳への最初の追加なので採番される index は 1、
+      // vmid/privateIp は vmidFor/ipFor(teamNumber=70, index=1)の計算式どおり。
       expect(body.index).toBe(1)
+      expect(body.vmid).toBe(1000 + 70 * 100 + 1)
+      expect(body.privateIp).toBe("10.100.70.11")
     }).pipe(Effect.provide(TestLayer))
   )
 
@@ -317,7 +322,7 @@ describe("POST /api/teams/:id/instances", () => {
       const { user, cookieHeader } = yield* login({ githubLogin: "createteaminst-other" })
       yield* teams.setMembers(teamB.id, [user.id])
 
-      const res = yield* post(cookieHeader, teamA.id, { index: 1 })
+      const res = yield* post(cookieHeader, teamA.id, {})
       expect(res.status).toBe(403)
     }).pipe(Effect.provide(TestLayer))
   )
@@ -326,7 +331,7 @@ describe("POST /api/teams/:id/instances", () => {
     Effect.gen(function* () {
       yield* setupRunningContest(3)
       const { cookieHeader } = yield* asAdmin()
-      const res = yield* post(cookieHeader, "no-such-team", { index: 1 })
+      const res = yield* post(cookieHeader, "no-such-team", {})
       expect(res.status).toBe(404)
     }).pipe(Effect.provide(TestLayer))
   )
@@ -340,10 +345,10 @@ describe("POST /api/teams/:id/instances", () => {
       const { user, cookieHeader } = yield* login({ githubLogin: "createteaminst-quota" })
       yield* teams.setMembers(team.id, [user.id])
 
-      const first = yield* post(cookieHeader, team.id, { index: 1 })
+      const first = yield* post(cookieHeader, team.id, {})
       expect(first.status).toBe(200)
 
-      const second = yield* post(cookieHeader, team.id, { index: 2 })
+      const second = yield* post(cookieHeader, team.id, {})
       expect(second.status).toBe(409)
       const body = yield* second.json
       expect(body).toStrictEqual({ _tag: "QuotaExceeded", teamId: team.id, quota: 1 })
@@ -359,10 +364,10 @@ describe("POST /api/teams/:id/instances", () => {
       const { user, cookieHeader } = yield* login({ githubLogin: "createteaminst-inprogress" })
       yield* teams.setMembers(team.id, [user.id])
 
-      const first = yield* post(cookieHeader, team.id, { index: 1 })
+      const first = yield* post(cookieHeader, team.id, {})
       expect(first.status).toBe(200)
 
-      const second = yield* post(cookieHeader, team.id, { index: 2 })
+      const second = yield* post(cookieHeader, team.id, {})
       expect(second.status).toBe(409)
       const body = yield* second.json
       expect(body).toStrictEqual({ _tag: "ProvisionInProgress", teamId: team.id })
