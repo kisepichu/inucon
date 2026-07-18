@@ -1,5 +1,21 @@
 import { SqlClient } from "@effect/sql"
-import { Clock, Effect } from "effect"
+import { Data, Effect } from "effect"
+
+// 0002_selfservice.ts が定義する MigrationDataError と同じ _tag/形状の複製。
+// 【重要】Migrator の本番ローダー(client.ts の migrationsLoader =
+// SqliteMigrator.fromFileSystem)は各 migration ファイルを
+// `import(/* @vite-ignore */ "<abs path>/000N_xxx.ts")` という「vite の変換を
+// 経ない生の動的 import」で個別に読み込む(@effect/sql の Migrator/FileSystem.ts
+// 参照)。この経路では相対 import の拡張子解決(TS の "*.js" 指定 → 実体
+// "*.ts" へのマッピング)が効かず、migration ファイルが兄弟 migration ファイル
+// を相対 import すると「Cannot find module '.../0002_selfservice.js'」で
+// migration 全体が読み込み不能になる(実際に確認済み)。そのため 0001/0002 が
+// 各々自己完結している既存方針に合わせ、0002 から import せずこのファイル内で
+// 同じ _tag のエラー型を再定義する(Migrator は _tag で分類するため、
+// クラスの同一性ではなく _tag 文字列が一致していれば十分)。
+export class MigrationDataError extends Data.TaggedError("MigrationDataError")<{
+  readonly message: string
+}> {}
 
 // Task 6 レビュー #E: 0002 で作った部分ユニークインデックス
 // idx_instances_team_idx_active(status IN ('creating','running','deleting'))は
@@ -41,47 +57,47 @@ import { Clock, Effect } from "effect"
 // (Migrator は各 migration を1トランザクションで包むため、この失敗は
 // 「起動できない」という形で露呈する)。
 //
+// 【Task 6 レビュー #J】#G は「重複側(failed を優先して倒す)を deleted に
+// 書き換えて自動整理してから索引を張る」defensive reconciliation だったが、
+// これはデータを破壊しうるため撤回する。admin の台帳取り込み経路
+// (instanceRepo.create)は任意の vmid と subnet 有効な privateIp を許すため、
+// 同じ (team_id, idx) に存在する failed 行は「使い捨て可能な重複」とは限らず、
+// 実在する別の VM の台帳行かもしれない。そうした行を #G のように黙って
+// deleted へ倒すと、その VM を指すレコードがどこにも残らなくなり(vmid/IP
+// を握ったまま)、実 VM が誰にも解体されず孤立する事故になる。
+//
 // 対策: CREATE UNIQUE INDEX の前に、各 (team_id, idx) グループで deleted
-// 以外の行が複数ある場合は 1 行だけ残して残りを deleted に倒す(defensive
-// reconciliation)。生き残らせる行の優先順位:
-//   1. failed でない行を failed の行より優先する(failed 行は「vmid/IP を
-//      握ったまま实質使われていない」使い捨て可能な重複という前提、上の
-//      #E コメント参照)
-//   2. 優先順位が同じ場合は updated_at が新しい方を優先する
-//   3. さらに同じ場合は id で決定的にする(SQLite に安定ソートを頼らない)
-// この「生存者選定」は 1 本の UPDATE ... WHERE EXISTS(...) 文で表現する:
-// ある行 r は、同じ (team_id, idx) グループ内に r より優先順位が高い別の
-// deleted 以外の行が存在する場合にだけ deleted へ倒す。優先順位はグループ内
-// で相異なる id により厳密な全順序になるため、各グループでちょうど 1 行
-// (最優先の行)だけが生き残る。
+// 以外の行が複数ある(= 索引作成が失敗する)ことを検出したら、行を書き換え
+// たりせず migration を MigrationDataError で中断する(0002 の孤立 instances
+// 行数不一致チェックと同じ fail-fast パターン、同じ型を再利用する)。
+// エラーメッセージには重複している team_id/idx を列挙し、運用者が手動で
+// (実 VM の状態を Proxmox 側で確認したうえで)reconcile できるようにする。
+// self-service(Phase 3)は本番未稼働のため、現状の想定シナリオでは重複行は
+// 存在せず、通常はそのまま CREATE UNIQUE INDEX に進む。
 export default Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient
-  const now = yield* Clock.currentTimeMillis
 
-  yield* sql`
-    UPDATE instances
-    SET status = 'deleted', updated_at = ${now}
+  const duplicates = yield* sql<{ teamId: string; idx: number; count: number }>`
+    SELECT team_id AS teamId, idx, COUNT(*) AS count
+    FROM instances
     WHERE status != 'deleted'
-      AND EXISTS (
-        SELECT 1 FROM instances AS other
-        WHERE other.team_id = instances.team_id
-          AND other.idx = instances.idx
-          AND other.id != instances.id
-          AND other.status != 'deleted'
-          AND (
-            (CASE WHEN other.status != 'failed' THEN 1 ELSE 0 END)
-              > (CASE WHEN instances.status != 'failed' THEN 1 ELSE 0 END)
-            OR (
-              (CASE WHEN other.status != 'failed' THEN 1 ELSE 0 END)
-                = (CASE WHEN instances.status != 'failed' THEN 1 ELSE 0 END)
-              AND (
-                other.updated_at > instances.updated_at
-                OR (other.updated_at = instances.updated_at AND other.id > instances.id)
-              )
-            )
-          )
-      )
+    GROUP BY team_id, idx
+    HAVING COUNT(*) > 1
   `
+
+  if (duplicates.length > 0) {
+    const detail = duplicates.map((d) => `(team_id=${d.teamId}, idx=${d.idx}, count=${d.count})`).join(", ")
+    yield* Effect.fail(
+      new MigrationDataError({
+        message:
+          `migration 0003: (team_id, idx) が重複する deleted 以外の instances 行が見つかりました: ${detail}。` +
+          `0002 の緩い部分ユニークインデックス(failed を対象外)と admin の台帳取り込み(重複判定なし)により、` +
+          `failed 行が実在する別の VM を指している可能性があるため自動整理はしません。` +
+          `Proxmox 側の実 VM 状態を確認したうえで、片方を deleted にする/vmid・idx を修正するなど手動で` +
+          `reconcile してから migration を再実行してください。`
+      })
+    )
+  }
 
   yield* sql`DROP INDEX idx_instances_team_idx_active`
 
