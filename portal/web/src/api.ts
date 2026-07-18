@@ -86,8 +86,9 @@ export const api = {
   deleteInstance: (id: string) => request<void>(`/api/instances/${id}`, { method: "DELETE" }),
 
   // セルフサービス(追加/削除ボタン、Phase 3)。チームメンバー or admin。
-  createTeamInstance: (teamId: string, body: CreateTeamInstanceRequest) =>
-    request<Instance>(`/api/teams/${teamId}/instances`, { method: "POST", body }),
+  // index/privateIp/vmid はサーバー側で採番するためペイロードは空(Task 6 レビュー #1)。
+  createTeamInstance: (teamId: string) =>
+    request<Instance>(`/api/teams/${teamId}/instances`, { method: "POST", body: {} satisfies CreateTeamInstanceRequest }),
   deleteTeamInstance: (teamId: string, instanceId: string) =>
     request<void>(`/api/teams/${teamId}/instances/${instanceId}`, { method: "DELETE" }),
 

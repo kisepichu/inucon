@@ -31,15 +31,6 @@ const instanceLabel = (teamNumber: number, instance: Instance) => `inucon-team${
 
 const formatDate = (millis: number) => new Date(millis).toLocaleString()
 
-// 追加ボタン押下時の index: 現存する creating/running のうち最大 index + 1
-// (削除済み/失敗した index は再利用してよいので集計対象に含めない)。
-const nextInstanceIndex = (instances: Array<Instance>) => {
-  const maxIndex = instances
-    .filter((instance) => ACTIVE_STATUSES.has(instance.status))
-    .reduce((max, instance) => Math.max(max, instance.index), 0)
-  return maxIndex + 1
-}
-
 interface TeamProps {
   readonly me: Me
 }
@@ -72,7 +63,16 @@ export function Team({ me }: TeamProps) {
       if (!isCanceled()) {
         setInstances(data)
         setInstancesError(null)
-        setSelectedInstanceId((current) => (current !== "" ? current : (data[0]?.id ?? "")))
+        // ベンチ対象は running のインスタンスのみ選択可能(Task 6 レビュー #3)。
+        // 現在の選択が running でなくなった(削除/失敗等)場合は最初の running に
+        // フォールバックする。
+        // instance.id は InstanceId(ブランド付き string)なので、素の string
+        // である selectedInstanceId state と比較できるよう明示的に string[]
+        // として扱う(select の value は plain string)。
+        const runningIds: ReadonlyArray<string> = data
+          .filter((instance) => instance.status === "running")
+          .map((instance) => instance.id)
+        setSelectedInstanceId((current) => (runningIds.includes(current) ? current : (runningIds[0] ?? "")))
       }
     } catch (err) {
       if (!isCanceled()) {
@@ -156,11 +156,14 @@ export function Team({ me }: TeamProps) {
   const instanceList = instances ?? []
   const activeCount = instanceList.filter((instance) => ACTIVE_STATUSES.has(instance.status)).length
   const hasPendingOp = instanceList.some((instance) => PENDING_STATUSES.has(instance.status))
+  const runningInstances = instanceList.filter((instance) => instance.status === "running")
   const contestRunning = contest?.status === "running"
 
-  const addDisabledReason = !contestRunning
-    ? "コンテストが開催されていません"
-    : contest !== null && activeCount >= contest.instanceQuota
+  // 追加ボタン: admin/team がコンテスト開催前にインスタンスを事前払い出しする
+  // 運用を想定しており、backend もコンテスト running を要求しない(Task 6
+  // レビュー #2)。quota・進行中ガードのみ維持する。
+  const addDisabledReason =
+    contest !== null && activeCount >= contest.instanceQuota
       ? "インスタンス数が上限に達しています"
       : hasPendingOp
         ? "処理中のインスタンスがあります"
@@ -170,7 +173,8 @@ export function Team({ me }: TeamProps) {
     setAddError(null)
     setAdding(true)
     try {
-      await api.createTeamInstance(team.id, { index: nextInstanceIndex(instanceList) })
+      // index/privateIp/vmid はサーバー側で採番するためペイロード不要(Task 6 レビュー #1)。
+      await api.createTeamInstance(team.id)
       await loadInstances(team.id, () => false)
     } catch (err) {
       setAddError(messageForError(err, "追加に失敗しました"))
@@ -196,13 +200,17 @@ export function Team({ me }: TeamProps) {
   }
 
   const hasActiveJob = jobs?.some((job) => job.status === "queued" || job.status === "running") ?? false
+  // ベンチ対象は running のインスタンスのみ許可する(Task 6 レビュー #3)。
+  // running が 1 つも無い場合は選択の余地が無いので専用の理由文言を出す。
   const disabledReason = !contestRunning
     ? "コンテストは開催されていません"
     : hasActiveJob
       ? "既に実行中のジョブがあります"
-      : !useManualTarget && !selectedInstanceId
-        ? "インスタンスを選択してください"
-        : null
+      : !useManualTarget && runningInstances.length === 0
+        ? "実行可能なインスタンス(running)がありません"
+        : !useManualTarget && !selectedInstanceId
+          ? "インスタンスを選択してください"
+          : null
 
   const handleEnqueue = async (event: React.FormEvent) => {
     event.preventDefault()
@@ -317,7 +325,7 @@ export function Team({ me }: TeamProps) {
             <div className="form-field">
               <label>インスタンス</label>
               <select value={selectedInstanceId} onChange={(event) => setSelectedInstanceId(event.target.value)}>
-                {instanceList.map((instance) => (
+                {runningInstances.map((instance) => (
                   <option key={instance.id} value={instance.id}>
                     {instanceLabel(team.teamNumber, instance)}
                   </option>
