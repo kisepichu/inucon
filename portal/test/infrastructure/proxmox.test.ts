@@ -60,6 +60,10 @@ const makeFakeProxmox = (
     missingConfig500Vmids?: ReadonlyArray<number>
     // 「does not exist」を含まない、本当の 500(復旧不能)を模す vmid。
     genericServerError500Vmids?: ReadonlyArray<number>
+    // 「does not exist」は含むが、VM の設定ファイル欠落とは無関係な 500(例:
+    // ストレージ側のエラー)を模す vmid。qemu-server 設定ファイル欠落の
+    // メッセージにのみマッチさせる回帰テスト用(codex P1)。
+    unrelatedDoesNotExistVmids?: ReadonlyArray<number>
   }
 ) => {
   const requests: Array<HttpClientRequest.HttpClientRequest> = []
@@ -72,6 +76,7 @@ const makeFakeProxmox = (
   const statusCurrentErrorVmids = new Set(overrides?.statusCurrentErrorVmids ?? [])
   const missingConfig500Vmids = new Set(overrides?.missingConfig500Vmids ?? [])
   const genericServerError500Vmids = new Set(overrides?.genericServerError500Vmids ?? [])
+  const unrelatedDoesNotExistVmids = new Set(overrides?.unrelatedDoesNotExistVmids ?? [])
   const missingConfigResponse = (request: HttpClientRequest.HttpClientRequest, vmid: number) =>
     jsonResponse(
       request,
@@ -80,6 +85,8 @@ const makeFakeProxmox = (
     )
   const genericErrorResponse = (request: HttpClientRequest.HttpClientRequest) =>
     jsonResponse(request, { data: null, message: "internal error" }, 500)
+  const unrelatedDoesNotExistResponse = (request: HttpClientRequest.HttpClientRequest) =>
+    jsonResponse(request, { data: null, message: "storage 'local' does not exist\n" }, 500)
 
   const registerTask = (key: string): string => {
     const upid = `UPID:eevee:${++upidCounter}:${key}`
@@ -122,6 +129,9 @@ const makeFakeProxmox = (
       if (missingConfig500Vmids.has(vmid)) {
         return Effect.succeed(missingConfigResponse(request, vmid))
       }
+      if (unrelatedDoesNotExistVmids.has(vmid)) {
+        return Effect.succeed(unrelatedDoesNotExistResponse(request))
+      }
       if (notFoundVmids.has(vmid)) {
         return Effect.succeed(jsonResponse(request, { errors: "no such VM" }, 404))
       }
@@ -135,6 +145,9 @@ const makeFakeProxmox = (
       const vmid = Number(destroyMatch[1])
       if (missingConfig500Vmids.has(vmid)) {
         return Effect.succeed(missingConfigResponse(request, vmid))
+      }
+      if (unrelatedDoesNotExistVmids.has(vmid)) {
+        return Effect.succeed(unrelatedDoesNotExistResponse(request))
       }
       if (notFoundVmids.has(vmid)) {
         return Effect.succeed(jsonResponse(request, { errors: "no such VM" }, 404))
@@ -155,6 +168,9 @@ const makeFakeProxmox = (
       }
       if (missingConfig500Vmids.has(vmid)) {
         return Effect.succeed(missingConfigResponse(request, vmid))
+      }
+      if (unrelatedDoesNotExistVmids.has(vmid)) {
+        return Effect.succeed(unrelatedDoesNotExistResponse(request))
       }
       if (notFoundVmids.has(vmid)) {
         return Effect.succeed(jsonResponse(request, { errors: "no such VM" }, 404))
@@ -385,6 +401,24 @@ describe("startVm / stopAndDestroyVm", () => {
       )
     })
   )
+
+  // codex レビュー P1: 「does not exist」を含む非 2xx を無差別に「VM 不在」扱いすると、
+  // stop/delete 中に起きた無関係なエラー(例: storage 'local' does not exist)まで
+  // 「既に消えている」と誤認し、インスタンスを deleted にしてしまう(VM 実体は残った
+  // まま orphan 化する)。qemu-server 設定ファイル欠落メッセージ以外は復旧不能な
+  // ProxmoxError として fail しなければならない。
+  it.effect("無関係な 500(storage 'local' does not exist 等)は不在扱いにせず ProxmoxError で fail する(codex P1)", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox({ unrelatedDoesNotExistVmids: [1103] })
+      const exit = yield* Effect.exit(
+        ProxmoxPort.pipe(
+          Effect.flatMap((px) => px.stopAndDestroyVm(1103)),
+          Effect.provide(portLayer(fake))
+        )
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+    })
+  )
 })
 
 describe("vmExists(clone 再入可能性チェック、Task 4 レビュー C1)", () => {
@@ -444,6 +478,23 @@ describe("vmExists(clone 再入可能性チェック、Task 4 レビュー C1)",
       const exit = yield* Effect.exit(
         ProxmoxPort.pipe(
           Effect.flatMap((px) => px.vmExists(1102)),
+          Effect.provide(portLayer(fake))
+        )
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+    })
+  )
+
+  // codex レビュー P1: 「does not exist」を含む文字列全般を不在扱いにすると、
+  // storage 'local' does not exist のような無関係なエラーまで「VM 不在」と
+  // 誤認し、vmExists が false を返して二重 clone を招く。qemu-server 設定
+  // ファイル欠落メッセージ以外は復旧不能な ProxmoxError として fail する。
+  it.effect("status/current が 500 + 無関係な does not exist(例: storage)なら ProxmoxError(codex P1)", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox({ unrelatedDoesNotExistVmids: [1103] })
+      const exit = yield* Effect.exit(
+        ProxmoxPort.pipe(
+          Effect.flatMap((px) => px.vmExists(1103)),
           Effect.provide(portLayer(fake))
         )
       )

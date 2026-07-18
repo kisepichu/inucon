@@ -137,12 +137,20 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
     // となる。404 のみを「存在しない」とみなす実装ではこの 500 がそのまま
     // 復旧不能な ProxmoxError として伝播し、自己サービス払い出しが
     // creating → failed で即死する(Task 7 で実際に踏んだ本番障害)。
-    // そのため、404 に加えて「非 2xx かつボディがこのメッセージにマッチする」
-    // 場合も「VM が存在しない」として扱う。逆に、メッセージが一致しない
-    // 非 2xx(本当のサーバエラー等)まで不在扱いにすると、二重 clone などの
-    // 実害があるため、そこは従来通り ProxmoxError で fail させる。
+    // そのため、404 に加えて「非 2xx かつボディがこの VM 設定ファイル欠落
+    // メッセージに一致する」場合も「VM が存在しない」として扱う。
+    // codex レビュー P1: 当初 /does not exist/i という広すぎるパターンで
+    // マッチさせていたが、これだと stop/delete 中に起きた無関係なエラー
+    // (例: "storage 'local' does not exist")まで VM 不在と誤認し、
+    // テアダウンがインスタンスを deleted にする一方で VM 実体は残る(orphan
+    // 化)・vmExists が誤って false を返し二重 clone を招く、という実害が
+    // あった。そのため、上記メッセージの中核である
+    // "Configuration file 'nodes/eevee/qemu-server/<vmid>.conf' does not exist"
+    // の qemu-server/<数字>.conf という形の VM 設定ファイルパスにのみ限定して
+    // マッチさせる。これに一致しない非 2xx(本当のサーバエラー等)は、
+    // 従来通り ProxmoxError で fail させる。
     // 呼び出し側は 2xx をこの関数に渡さない前提(呼び出し前に 2xx 分岐済み)。
-    const VM_MISSING_MESSAGE_PATTERN = /does not exist/i
+    const VM_MISSING_MESSAGE_PATTERN = /Configuration file '[^']*qemu-server\/\d+\.conf' does not exist/i
 
     const isVmMissingResponse = (
       response: HttpClientResponse.HttpClientResponse
