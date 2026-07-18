@@ -293,7 +293,11 @@ describe("cloneVm", () => {
 })
 
 describe("configureCloudInit", () => {
-  it.effect("snippet を multipart でアップロードし、cicustom/ipconfig0 を config に設定する", () =>
+  // pveproxy の upload ハンドラは Content-Length 明示のボディを要求する
+  // (chunked な FormData ストリーミングは 501 で拒否される。Task 7 実機検証)。
+  // そのため FormData/bodyFormData ではなく、手組みの multipart バイト列を
+  // Content-Length 付きで送る実装であることをここで検証する。
+  it.effect("snippet を Content-Length 明示の手組み multipart でアップロードし、cicustom/ipconfig0 を config に設定する", () =>
     Effect.gen(function* () {
       const fake = makeFakeProxmox()
       yield* ProxmoxPort.pipe(
@@ -310,15 +314,33 @@ describe("configureCloudInit", () => {
 
       const uploadReq = fake.requests.find((r) => urlPath(r) === "/api2/json/nodes/eevee/storage/local/upload")
       expect(uploadReq).toBeDefined()
-      expect(uploadReq!.body._tag).toBe("FormData")
-      const formData = uploadReq!.body._tag === "FormData" ? uploadReq!.body.formData : undefined
-      expect(formData?.get("content")).toBe("snippets")
-      const filePart = formData?.get("filename") as File
-      expect(filePart.name).toBe("inucon-1101.yaml")
-      const yamlText = yield* Effect.promise(() => filePart.text())
-      expect(yamlText).toContain("isucon")
-      expect(yamlText).toContain("ssh-ed25519 AAAA... a@b")
-      expect(yamlText).toContain("ssh-rsa BBBB... c@d")
+
+      // chunked ストリーミングになる FormData ボディは使わない。固定長バイト列
+      // (Uint8Array)として送ることで、プラットフォームが Content-Length を
+      // 導出できるようにする。
+      expect(uploadReq!.body._tag).toBe("Uint8Array")
+      const bytes = uploadReq!.body._tag === "Uint8Array" ? uploadReq!.body.body : undefined
+      expect(bytes).toBeDefined()
+
+      const contentType = uploadReq!.headers["content-type"]
+      expect(contentType).toMatch(/^multipart\/form-data; boundary=.+$/)
+      const boundary = contentType.replace(/^multipart\/form-data; boundary=/, "")
+
+      const text = new TextDecoder().decode(bytes!)
+
+      // 各パートのヘッダーは CRLF 区切り(手組み multipart の必須要件)。
+      expect(text).toContain('Content-Disposition: form-data; name="content"\r\n\r\nsnippets')
+      expect(text).toContain(
+        `Content-Disposition: form-data; name="filename"; filename="inucon-1101.yaml"\r\nContent-Type: text/yaml\r\n\r\n`
+      )
+      expect(text).toContain("#cloud-config")
+      expect(text).toContain("ssh-ed25519 AAAA... a@b")
+      expect(text).toContain("ssh-rsa BBBB... c@d")
+      // 閉じ boundary(末尾のターミネータ)。
+      expect(text.trimEnd().endsWith(`--${boundary}--`)).toBe(true)
+      // 固定長ボディであること(chunked ではない)を、実バイト長と Uint8Array
+      // の長さが一致することで確認する。
+      expect(bytes!.length).toBe(new TextEncoder().encode(text).length)
 
       const configReq = fake.requests.find(
         (r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/1101/config" && r.method === "POST"
