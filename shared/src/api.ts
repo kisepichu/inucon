@@ -152,6 +152,15 @@ export class InstanceInUse extends Schema.TaggedError<InstanceInUse>()(
   HttpApiSchema.annotations({ status: 409 })
 ) {}
 
+// POST /api/bench-jobs: instanceId 指定時、対象 Instance が running でない
+// (Task 6 レビュー #3、application の InstanceNotRunning をマップ)。
+// InstanceInUse と同じ「Instance の現在状態に起因する 409」なので同じ status。
+export class InstanceNotRunning extends Schema.TaggedError<InstanceNotRunning>()(
+  "InstanceNotRunning",
+  { instanceId: InstanceId },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
 // DELETE /api/teams/:id/instances/:instanceId: running/failed 以外からの削除
 // 要求(domain の beginDeleting をマップ。InvalidJobTransition と同じ形)。
 export class InvalidInstanceTransition extends Schema.TaggedError<InvalidInstanceTransition>()(
@@ -403,6 +412,7 @@ export const benchGroup = HttpApiGroup.make("bench")
       .addError(TargetIpOutOfSubnet)
       .addError(Forbidden)
       .addError(NotFound)
+      .addError(InstanceNotRunning)
       .middleware(Authentication)
   )
   .add(

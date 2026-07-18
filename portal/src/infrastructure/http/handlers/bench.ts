@@ -6,6 +6,7 @@ import {
   ContestNotRunning,
   CurrentUser,
   Forbidden,
+  InstanceNotRunning,
   InvalidJobTransition,
   NotFound,
   TargetIpOutOfSubnet,
@@ -48,7 +49,8 @@ export const BenchLive = HttpApiBuilder.group(api, "bench", (handlers) =>
           NotInTeam: () => Effect.fail(new Forbidden()),
           // 他チームのインスタンス指定(application の Forbidden)→ 403。
           Forbidden: () => Effect.fail(new Forbidden()),
-          InstanceNotFound: () => Effect.fail(new NotFound())
+          InstanceNotFound: () => Effect.fail(new NotFound()),
+          InstanceNotRunning: (e) => Effect.fail(new InstanceNotRunning({ instanceId: e.instanceId }))
         }),
         Effect.orDie
       )

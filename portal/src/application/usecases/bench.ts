@@ -3,7 +3,7 @@ import { checkEnqueueAllowed, newJob } from "../../domain/benchJob.js"
 import { ContestNotRunning } from "../../domain/errors.js"
 import type { User } from "../../domain/user.js"
 import { BenchJobId, InstanceId, TeamId } from "../../domain/ids.js"
-import { Forbidden, InstanceNotFound, NotInTeam } from "../errors.js"
+import { Forbidden, InstanceNotFound, InstanceNotRunning, NotInTeam } from "../errors.js"
 import { BenchJobRepo, ContestRepo, InstanceRepo, RunnerConfig, TeamRepo, UuidGen } from "../ports.js"
 
 // enqueue は「repo 取得 → domain 遷移関数(Either.match で E チャネルへ)→
@@ -153,6 +153,13 @@ export const enqueueBenchJob = (args: {
       // 不一致は Forbidden で落とす(privateIp は返さない)。
       if (instance.teamId !== team.id) {
         return yield* Effect.fail(new Forbidden())
+      }
+      // running でない(creating/deleting/deleted/failed)VM へは enqueue しない
+      // (Task 6 レビュー #3)。deleted/failed な対象へ投げても接続失敗で
+      // ジョブ枠を浪費するだけなので事前に明示エラーで弾く。所有権確認の
+      // 「後」に判定することで privateIp 漏洩防止の順序は変えない。
+      if (instance.status !== "running") {
+        return yield* Effect.fail(new InstanceNotRunning({ instanceId: instance.id }))
       }
       return yield* enqueueBench({ user: args.user, targetIp: instance.privateIp, targetPort: 80 })
     }

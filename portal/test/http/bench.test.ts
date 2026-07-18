@@ -302,6 +302,46 @@ describe("POST /api/bench-jobs: instanceId 指定", () => {
       expect(text).not.toContain(`10.100.${owner.teamNumber}.30`)
     }).pipe(Effect.provide(TestLayer))
   )
+
+  // Task 6 レビュー #3: running 以外(creating/deleting/deleted/failed)の
+  // Instance を instanceId 指定で enqueue しようとすると、接続先が存在しない
+  // (or もう存在しない)状態にジョブを投げてジョブ枠を浪費するだけなので
+  // 明示的に拒否する。テーブル駆動で非 running 状態を一通り確認する。
+  for (const status of ["creating", "deleting", "deleted", "failed"] as const) {
+    it.effect(`instanceId が ${status} の Instance を指すと 409(InstanceNotRunning)で enqueue されない`, () =>
+      Effect.gen(function* () {
+        const { cookieHeader, team, teamNumber } = yield* setup()
+        const instances = yield* InstanceRepo
+        const instance = new Instance({
+          id: InstanceId.make(`inst-bench-notrunning-${status}`),
+          teamId: team.id,
+          index: 1,
+          vmid: 1000 + teamNumber * 100 + 1,
+          privateIp: `10.100.${teamNumber}.20`,
+          status,
+          progress: [],
+          errorMessage: status === "failed" ? Option.some("boom") : Option.none(),
+          createdAt: 0,
+          updatedAt: 0
+        })
+        yield* instances.create(instance)
+
+        const res = yield* enqueue(cookieHeader, { instanceId: instance.id })
+        expect(res.status).toBe(409)
+        const body = yield* res.json
+        expect(body).toStrictEqual({ _tag: "InstanceNotRunning", instanceId: instance.id })
+
+        // 何もキューに積まれていない(ジョブ枠を浪費しない)ことも確認する。
+        const client = yield* HttpClient.HttpClient
+        const listRes = yield* client.get("/api/bench-jobs", {
+          headers: { cookie: cookieHeader },
+          urlParams: { teamId: team.id }
+        })
+        const jobs = (yield* listRes.json) as ReadonlyArray<unknown>
+        expect(jobs).toHaveLength(0)
+      }).pipe(Effect.provide(TestLayer))
+    )
+  }
 })
 
 describe("POST /api/bench-jobs/:id/cancel", () => {
