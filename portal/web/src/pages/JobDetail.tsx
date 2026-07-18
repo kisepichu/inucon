@@ -47,29 +47,40 @@ export function JobDetail() {
 
   if (error !== null) {
     return (
-      <p role="alert" className="error">
+      <p role="alert" className="error-page">
         {error}
       </p>
     )
   }
 
   if (job === null) {
-    return <p>Loading...</p>
+    return <p className="loading">Loading...</p>
   }
+
+  const isPolling = job.status === "queued" || job.status === "running"
 
   return (
     <div>
       <h1>ジョブ詳細</h1>
-      <dl>
+      <dl className="detail-dl">
         <dt>状態</dt>
-        <dd>{job.status}</dd>
+        <dd>
+          <span
+            className={job.status === "running" ? "status-badge job-status status-running" : `status-badge status-${job.status}`}
+          >
+            {job.status}
+          </span>
+        </dd>
         <dt>スコア</dt>
-        <dd>{job.score ?? "-"}</dd>
+        {job.score === null ? <dd className="empty-cell">-</dd> : <dd className="num mono">{job.score}</dd>}
         <dt>エラー</dt>
-        <dd>{job.errorMessage ?? "-"}</dd>
+        {job.errorMessage === null ? <dd className="empty-cell">-</dd> : <dd>{job.errorMessage}</dd>}
       </dl>
-      <h2>ログ</h2>
-      <pre>{job.log}</pre>
+      <div className="log-header">
+        <h2>ログ</h2>
+        {isPolling && <span className="live-indicator">live</span>}
+      </div>
+      <pre className="log-block">{job.log}</pre>
     </div>
   )
 }

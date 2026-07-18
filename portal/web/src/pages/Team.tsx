@@ -145,7 +145,12 @@ export function Team({ me }: TeamProps) {
   }, [team, instances, loadInstances])
 
   if (team === null) {
-    return <p>チームに所属していません。管理者に問い合わせてください。</p>
+    return (
+      <div>
+        <h1>Team</h1>
+        <div className="empty-state">チームに所属していません。管理者に問い合わせてください。</div>
+      </div>
+    )
   }
 
   const instanceList = instances ?? []
@@ -223,62 +228,67 @@ export function Team({ me }: TeamProps) {
     <div>
       <h1>{team.name}</h1>
 
-      <section>
+      <section className="section">
         <h2>インスタンス</h2>
         {instancesError !== null && (
           <p role="alert" className="error">
             {instancesError}
           </p>
         )}
-        <table>
-          <thead>
-            <tr>
-              <th>名前</th>
-              <th>状態</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {instanceList.map((instance) => (
-              <tr key={instance.id}>
-                <td>{instanceLabel(team.teamNumber, instance)}</td>
-                <td>
-                  <span className={`status-badge status-${instance.status}`}>{instance.status}</span>
-                  {instance.errorMessage !== null && <p className="error instance-error">{instance.errorMessage}</p>}
-                </td>
-                <td>
-                  <button
-                    type="button"
-                    disabled={!DELETABLE_STATUSES.has(instance.status) || deletingId === instance.id}
-                    onClick={() => handleDeleteInstance(instance)}
-                  >
-                    削除
-                  </button>
-                </td>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>名前</th>
+                <th>状態</th>
+                <th></th>
               </tr>
-            ))}
-          </tbody>
-        </table>
-        <button type="button" onClick={handleAddInstance} disabled={adding || addDisabledReason !== null}>
-          インスタンス追加
-        </button>
-        {addDisabledReason !== null && <p>{addDisabledReason}</p>}
-        {addError !== null && (
-          <p role="alert" className="error">
-            {addError}
-          </p>
-        )}
-        {deleteError !== null && (
-          <p role="alert" className="error">
-            {deleteError}
-          </p>
-        )}
+            </thead>
+            <tbody>
+              {instanceList.map((instance) => (
+                <tr key={instance.id}>
+                  <td className="mono">{instanceLabel(team.teamNumber, instance)}</td>
+                  <td>
+                    <span className={`status-badge status-${instance.status}`}>{instance.status}</span>
+                    {instance.errorMessage !== null && <span className="cell-error">{instance.errorMessage}</span>}
+                  </td>
+                  <td style={{ textAlign: "right" }}>
+                    <button
+                      type="button"
+                      className="btn btn-sm btn-danger"
+                      disabled={!DELETABLE_STATUSES.has(instance.status) || deletingId === instance.id}
+                      onClick={() => handleDeleteInstance(instance)}
+                    >
+                      削除
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="section-actions">
+          <button type="button" className="btn btn-primary" onClick={handleAddInstance} disabled={adding || addDisabledReason !== null}>
+            インスタンス追加
+          </button>
+          {addDisabledReason !== null && <p className="disabled-reason">{addDisabledReason}</p>}
+          {addError !== null && (
+            <p role="alert" className="error">
+              {addError}
+            </p>
+          )}
+          {deleteError !== null && (
+            <p role="alert" className="error">
+              {deleteError}
+            </p>
+          )}
+        </div>
       </section>
 
-      <section>
+      <section className="section">
         <h2>ベンチ実行</h2>
-        <form onSubmit={handleEnqueue}>
-          <label>
+        <form className="form" onSubmit={handleEnqueue}>
+          <label className="checkbox-row">
             <input
               type="checkbox"
               checked={useManualTarget}
@@ -288,7 +298,8 @@ export function Team({ me }: TeamProps) {
           </label>
 
           {useManualTarget ? (
-            <div>
+            <div className="form-field">
+              <label>IP:port</label>
               <input
                 placeholder="IP"
                 value={manualIp}
@@ -303,60 +314,75 @@ export function Team({ me }: TeamProps) {
               />
             </div>
           ) : (
-            <select value={selectedInstanceId} onChange={(event) => setSelectedInstanceId(event.target.value)}>
-              {instanceList.map((instance) => (
-                <option key={instance.id} value={instance.id}>
-                  {instanceLabel(team.teamNumber, instance)}
-                </option>
-              ))}
-            </select>
+            <div className="form-field">
+              <label>インスタンス</label>
+              <select value={selectedInstanceId} onChange={(event) => setSelectedInstanceId(event.target.value)}>
+                {instanceList.map((instance) => (
+                  <option key={instance.id} value={instance.id}>
+                    {instanceLabel(team.teamNumber, instance)}
+                  </option>
+                ))}
+              </select>
+            </div>
           )}
 
-          <button type="submit" disabled={submitting || disabledReason !== null}>
-            実行
-          </button>
-          {disabledReason !== null && <p>{disabledReason}</p>}
-          {error !== null && (
-            <p role="alert" className="error">
-              {error}
-            </p>
-          )}
+          <div>
+            <button type="submit" className="btn btn-primary" disabled={submitting || disabledReason !== null}>
+              実行
+            </button>
+            {disabledReason !== null && <p className="disabled-reason">{disabledReason}</p>}
+            {error !== null && (
+              <p role="alert" className="error">
+                {error}
+              </p>
+            )}
+          </div>
         </form>
       </section>
 
-      <section>
+      <section className="section">
         <h2>ジョブ履歴</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>状態</th>
-              <th>スコア</th>
-              <th>時刻</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(jobs ?? []).map((job) => (
-              <tr
-                key={job.id}
-                className="clickable"
-                tabIndex={0}
-                role="link"
-                aria-label={`ジョブ詳細: ${job.id}`}
-                onClick={() => navigate(`/jobs/${job.id}`)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault()
-                    navigate(`/jobs/${job.id}`)
-                  }
-                }}
-              >
-                <td>{job.status}</td>
-                <td>{job.score ?? "-"}</td>
-                <td>{formatDate(job.enqueuedAt)}</td>
+        <div className="table-wrap">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>状態</th>
+                <th>スコア</th>
+                <th>時刻</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {(jobs ?? []).map((job) => (
+                <tr
+                  key={job.id}
+                  className="clickable"
+                  tabIndex={0}
+                  role="link"
+                  aria-label={`ジョブ詳細: ${job.id}`}
+                  onClick={() => navigate(`/jobs/${job.id}`)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault()
+                      navigate(`/jobs/${job.id}`)
+                    }
+                  }}
+                >
+                  <td>
+                    <span
+                      className={
+                        job.status === "running" ? "status-badge job-status status-running" : `status-badge status-${job.status}`
+                      }
+                    >
+                      {job.status}
+                    </span>
+                  </td>
+                  {job.score === null ? <td className="empty-cell">-</td> : <td className="num">{job.score}</td>}
+                  <td className="num">{formatDate(job.enqueuedAt)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </section>
     </div>
   )
