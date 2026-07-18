@@ -159,16 +159,28 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
         ),
 
       // requestDeleteInstance(削除ボタン)専用の原子的 guard 付き UPDATE
-      // (Task 6 レビュー #B)。単一の UPDATE ... WHERE ... RETURNING 文で
+      // (Task 6 レビュー #B、#D)。単一の UPDATE ... WHERE ... RETURNING 文で
       // (1) 対象行が running/failed であること、(2) 同じチームに(対象以外で)
-      // creating/deleting の行が無いこと、を検証してから status を deleting
-      // に更新する(TOCTOU 回避、createIfAllowed と同型)。listByTeam で
-      // 読んでから update する二段階実装だと、二つの並行リクエストが両方
-      // 読み取りを通過して両方 deleting へ書き込めてしまう(チームにつき進行中
-      // は高々1件という不変条件違反)。0 行更新時は Option.none() を返し、
-      // 呼び出し元(requestDeleteInstance)が再読み込みして原因(対象不在 /
-      // 対象の状態が既に running/failed でない / 他行が進行中)を優先順位付けて
-      // 判定する。
+      // creating/deleting の行が無いこと、(3) 対象の private_ip を targetIp と
+      // する queued/running な bench_jobs が無いこと、を検証してから status を
+      // deleting に更新する(TOCTOU 回避、createIfAllowed と同型)。
+      // listByTeam/BenchJobRepo.listByTeam で読んでから update する二段階実装
+      // だと、二つの並行リクエストが両方読み取りを通過して両方書き込めてしまう
+      // (チームにつき進行中は高々1件という不変条件違反、または削除とベンチ
+      // enqueue が両方成功してベンチ対象 VM が消える不整合)。
+      // (3) を追加した経緯(Task 6 レビュー #D): 旧実装は「bench 対象中」判定を
+      // このアトミック UPDATE の外側(requestDeleteInstance の事前 listByTeam
+      // 読み取り)でしか行っておらず、削除リクエストがそのチェックを通過した
+      // 直後に(BenchJobRepo.insertIfAllowed 側の instanceGuard も同様に非
+      // アトミックだった当時は)enqueue が割り込んで queued 行を挿入できて
+      // しまい、削除がそのまま deleting へ進んでベンチ対象の VM を壊し得た。
+      // SQLite は書き込みを直列化するため、この NOT EXISTS を UPDATE 文自身に
+      // 含めることで「削除 UPDATE と enqueue INSERT のどちらが先に確定した
+      // ものを見るか」がどちらの実行順序でも正しく決まる(先に確定した方を
+      // 後続の一方が必ず見る)。0 行更新時は Option.none() を返し、呼び出し元
+      // (requestDeleteInstance)が再読み込みして原因(対象不在 / 対象の状態が
+      // 既に running/failed でない / bench 対象中 / 他行が進行中)を優先順位
+      // 付けて判定する。
       beginDeletingIfAllowed: (instanceId: InstanceId, now: number) =>
         wrapSqlError(
           sql<InstanceRow>`
@@ -181,6 +193,11 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
                 WHERE i2.team_id = instances.team_id
                   AND i2.id <> ${instanceId}
                   AND i2.status IN ('creating', 'deleting')
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM bench_jobs bj
+                WHERE bj.target_ip = instances.private_ip
+                  AND bj.status IN ('queued', 'running')
               )
             RETURNING ${columns}
           `
