@@ -3,10 +3,12 @@ import { it } from "@effect/vitest"
 import { Effect, Option } from "effect"
 import { describe, expect } from "vitest"
 import { DuplicateInstanceIndex } from "shared"
+import { BenchJob } from "../../src/domain/benchJob.js"
+import { Contest } from "../../src/domain/contest.js"
 import { Instance } from "../../src/domain/instance.js"
-import { InstanceId, TeamId } from "../../src/domain/ids.js"
+import { BenchJobId, ContestId, InstanceId, TeamId } from "../../src/domain/ids.js"
 import { Team } from "../../src/domain/team.js"
-import { InstanceRepo, TeamRepo } from "../../src/application/ports.js"
+import { BenchJobRepo, ContestRepo, InstanceRepo, TeamRepo } from "../../src/application/ports.js"
 import { login } from "../support/login.js"
 import { TestLayer, asAdmin, makeApiClient } from "../support/apiTestHelpers.js"
 
@@ -252,6 +254,317 @@ describe("DELETE /api/instances/:id", () => {
 
       const listed = yield* instances.listByTeam(team.id)
       expect(listed).toStrictEqual([])
+    }).pipe(Effect.provide(TestLayer))
+  )
+})
+
+// セルフサービス(追加ボタン、スペック §HTTP API 差分)。ガードの網羅的な分岐
+// (RAM 不足含む)は application 層(test/application/provisioning.test.ts)で
+// 検証済みのため、ここでは HTTP 配線(ステータスコード・エラー _tag マップ・
+// 認可)が正しいことだけを確認する。
+describe("POST /api/teams/:id/instances", () => {
+  let contestSeq = 0
+  const setupRunningContest = (quota: number) =>
+    Effect.gen(function* () {
+      contestSeq++
+      const contests = yield* ContestRepo
+      const contest = new Contest({
+        id: ContestId.make(`contest-createteaminst-${contestSeq}`),
+        name: "INUCON",
+        problemKey: "private-isu",
+        status: "running",
+        instanceQuota: quota
+      })
+      yield* contests.save(contest)
+      return contest
+    })
+
+  const post = (cookieHeader: string, teamId: string, payload: unknown) =>
+    Effect.gen(function* () {
+      const client = yield* HttpClient.HttpClient
+      return yield* client.post(`/api/teams/${teamId}/instances`, {
+        headers: { cookie: cookieHeader },
+        body: HttpBody.unsafeJson(payload)
+      })
+    })
+
+  it.effect("自チームのメンバーは追加できる(creating 行が返る)", () =>
+    Effect.gen(function* () {
+      yield* setupRunningContest(3)
+      const teams = yield* TeamRepo
+      const team = new Team({ id: TeamId.make("team-createteaminst-ok"), name: "CreateTeamInst OK", teamNumber: 70 })
+      yield* teams.create(team)
+      const { user, cookieHeader } = yield* login({ githubLogin: "createteaminst-member" })
+      yield* teams.setMembers(team.id, [user.id])
+
+      // index はサーバー側で採番するためペイロードは空(Task 6 レビュー #1)。
+      const res = yield* post(cookieHeader, team.id, {})
+      expect(res.status).toBe(200)
+      const body = (yield* res.json) as { status: string; teamId: string; index: number; vmid: number; privateIp: string }
+      expect(body.status).toBe("creating")
+      expect(body.teamId).toBe(team.id)
+      // 空の台帳への最初の追加なので採番される index は 1、
+      // vmid/privateIp は vmidFor/ipFor(teamNumber=70, index=1)の計算式どおり。
+      expect(body.index).toBe(1)
+      expect(body.vmid).toBe(1000 + 70 * 100 + 1)
+      expect(body.privateIp).toBe("10.100.70.11")
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("他チームのメンバー(非 admin)は403", () =>
+    Effect.gen(function* () {
+      yield* setupRunningContest(3)
+      const teams = yield* TeamRepo
+      const teamA = new Team({ id: TeamId.make("team-createteaminst-a"), name: "A", teamNumber: 71 })
+      const teamB = new Team({ id: TeamId.make("team-createteaminst-b"), name: "B", teamNumber: 72 })
+      yield* teams.create(teamA)
+      yield* teams.create(teamB)
+      const { user, cookieHeader } = yield* login({ githubLogin: "createteaminst-other" })
+      yield* teams.setMembers(teamB.id, [user.id])
+
+      const res = yield* post(cookieHeader, teamA.id, {})
+      expect(res.status).toBe(403)
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("存在しないチームは404", () =>
+    Effect.gen(function* () {
+      yield* setupRunningContest(3)
+      const { cookieHeader } = yield* asAdmin()
+      const res = yield* post(cookieHeader, "no-such-team", {})
+      expect(res.status).toBe(404)
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("quota 到達は409(QuotaExceeded)", () =>
+    Effect.gen(function* () {
+      yield* setupRunningContest(1)
+      const teams = yield* TeamRepo
+      const team = new Team({ id: TeamId.make("team-createteaminst-quota"), name: "Quota", teamNumber: 73 })
+      yield* teams.create(team)
+      const { user, cookieHeader } = yield* login({ githubLogin: "createteaminst-quota" })
+      yield* teams.setMembers(team.id, [user.id])
+
+      const first = yield* post(cookieHeader, team.id, {})
+      expect(first.status).toBe(200)
+
+      const second = yield* post(cookieHeader, team.id, {})
+      expect(second.status).toBe(409)
+      const body = yield* second.json
+      expect(body).toStrictEqual({ _tag: "QuotaExceeded", teamId: team.id, quota: 1 })
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("進行中(creating)がある場合は409(ProvisionInProgress)", () =>
+    Effect.gen(function* () {
+      yield* setupRunningContest(3)
+      const teams = yield* TeamRepo
+      const team = new Team({ id: TeamId.make("team-createteaminst-inprogress"), name: "InProgress", teamNumber: 74 })
+      yield* teams.create(team)
+      const { user, cookieHeader } = yield* login({ githubLogin: "createteaminst-inprogress" })
+      yield* teams.setMembers(team.id, [user.id])
+
+      const first = yield* post(cookieHeader, team.id, {})
+      expect(first.status).toBe(200)
+
+      const second = yield* post(cookieHeader, team.id, {})
+      expect(second.status).toBe(409)
+      const body = yield* second.json
+      expect(body).toStrictEqual({ _tag: "ProvisionInProgress", teamId: team.id })
+    }).pipe(Effect.provide(TestLayer))
+  )
+})
+
+describe("DELETE /api/teams/:id/instances/:instanceId", () => {
+  const del = (cookieHeader: string, teamId: string, instanceId: string) =>
+    Effect.gen(function* () {
+      const client = yield* HttpClient.HttpClient
+      return yield* client.del(`/api/teams/${teamId}/instances/${instanceId}`, { headers: { cookie: cookieHeader } })
+    })
+
+  it.effect("正常系: running は204でdeletingへ遷移する(行は消えない)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const team = new Team({ id: TeamId.make("team-delteaminst-ok"), name: "DelTeamInst OK", teamNumber: 90 })
+      yield* teams.create(team)
+      const instance = new Instance({
+        id: InstanceId.make("inst-delteaminst-ok"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1901,
+        privateIp: "10.100.90.10",
+        status: "running",
+        progress: ["clone_done", "configured", "started", "route_done", "access_done"],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(instance)
+      const { user, cookieHeader } = yield* login({ githubLogin: "delteaminst-member" })
+      yield* teams.setMembers(team.id, [user.id])
+
+      const res = yield* del(cookieHeader, team.id, instance.id)
+      expect(res.status).toBe(204)
+
+      const listed = yield* instances.listByTeam(team.id)
+      expect(listed).toHaveLength(1)
+      expect(listed[0].status).toBe("deleting")
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("他チームのメンバーは403", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const teamA = new Team({ id: TeamId.make("team-delteaminst-a"), name: "A", teamNumber: 91 })
+      const teamB = new Team({ id: TeamId.make("team-delteaminst-b"), name: "B", teamNumber: 92 })
+      yield* teams.create(teamA)
+      yield* teams.create(teamB)
+      const instance = new Instance({
+        id: InstanceId.make("inst-delteaminst-other"),
+        teamId: teamA.id,
+        index: 1,
+        vmid: 1911,
+        privateIp: "10.100.91.10",
+        status: "running",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(instance)
+      const { user, cookieHeader } = yield* login({ githubLogin: "delteaminst-other" })
+      yield* teams.setMembers(teamB.id, [user.id])
+
+      const res = yield* del(cookieHeader, teamA.id, instance.id)
+      expect(res.status).toBe(403)
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("creating の削除は409(InvalidInstanceTransition)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const team = new Team({ id: TeamId.make("team-delteaminst-creating"), name: "Creating", teamNumber: 93 })
+      yield* teams.create(team)
+      const instance = new Instance({
+        id: InstanceId.make("inst-delteaminst-creating"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1931,
+        privateIp: "10.100.93.10",
+        status: "creating",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(instance)
+      const { user, cookieHeader } = yield* login({ githubLogin: "delteaminst-creating" })
+      yield* teams.setMembers(team.id, [user.id])
+
+      const res = yield* del(cookieHeader, team.id, instance.id)
+      expect(res.status).toBe(409)
+      const body = yield* res.json
+      expect(body).toStrictEqual({
+        _tag: "InvalidInstanceTransition",
+        instanceId: instance.id,
+        from: "creating",
+        to: "deleting"
+      })
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("同一チームに他の進行中(creating)がある場合は409(ProvisionInProgress)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const team = new Team({ id: TeamId.make("team-delteaminst-inprogress"), name: "InProgress", teamNumber: 95 })
+      yield* teams.create(team)
+      const target = new Instance({
+        id: InstanceId.make("inst-delteaminst-inprogress-target"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1951,
+        privateIp: "10.100.95.10",
+        status: "running",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      const other = new Instance({
+        id: InstanceId.make("inst-delteaminst-inprogress-other"),
+        teamId: team.id,
+        index: 2,
+        vmid: 1952,
+        privateIp: "10.100.95.11",
+        status: "creating",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(target)
+      yield* instances.create(other)
+      const { user, cookieHeader } = yield* login({ githubLogin: "delteaminst-inprogress" })
+      yield* teams.setMembers(team.id, [user.id])
+
+      const res = yield* del(cookieHeader, team.id, target.id)
+      expect(res.status).toBe(409)
+      const body = yield* res.json
+      expect(body).toStrictEqual({ _tag: "ProvisionInProgress", teamId: team.id })
+
+      // 進行中ガードで弾かれ、対象は running のまま(deleting に遷移していない)。
+      const listed = yield* instances.listByTeam(team.id)
+      expect(listed.find((i) => i.id === target.id)?.status).toBe("running")
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("ベンチ対象中(queued)は409(InstanceInUse)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const jobs = yield* BenchJobRepo
+      const team = new Team({ id: TeamId.make("team-delteaminst-inuse"), name: "InUse", teamNumber: 94 })
+      yield* teams.create(team)
+      const instance = new Instance({
+        id: InstanceId.make("inst-delteaminst-inuse"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1941,
+        privateIp: "10.100.94.10",
+        status: "running",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(instance)
+      yield* jobs.insertIfAllowed(
+        new BenchJob({
+          id: BenchJobId.make("job-delteaminst-inuse"),
+          teamId: team.id,
+          targetIp: instance.privateIp,
+          targetPort: 80,
+          status: "queued",
+          score: Option.none(),
+          passed: Option.none(),
+          errorMessage: Option.none(),
+          enqueuedAt: 0,
+          startedAt: Option.none(),
+          finishedAt: Option.none(),
+          lastProgressAt: Option.none()
+        })
+      )
+      const { user, cookieHeader } = yield* login({ githubLogin: "delteaminst-inuse" })
+      yield* teams.setMembers(team.id, [user.id])
+
+      const res = yield* del(cookieHeader, team.id, instance.id)
+      expect(res.status).toBe(409)
+      const body = yield* res.json
+      expect(body).toStrictEqual({ _tag: "InstanceInUse", instanceId: instance.id })
     }).pipe(Effect.provide(TestLayer))
   )
 })

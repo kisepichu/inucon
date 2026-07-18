@@ -73,3 +73,11 @@ export class InsufficientMemory extends Data.TaggedError("InsufficientMemory")<{
 export class InstanceInUse extends Data.TaggedError("InstanceInUse")<{
   instanceId: InstanceId
 }> {}
+
+// enqueueBenchJob(Task 6 レビュー #3): instanceId 指定でベンチを投げる際、
+// 対象 Instance が running でない(creating/deleting/deleted/failed)。
+// deleted/failed な VM へ enqueue すると接続失敗でジョブ枠を浪費するだけなので、
+// 事前に明示エラーで弾く。InstanceInUse と同様チーム所属確認の後に判定する。
+export class InstanceNotRunning extends Data.TaggedError("InstanceNotRunning")<{
+  instanceId: InstanceId
+}> {}

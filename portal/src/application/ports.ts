@@ -145,6 +145,19 @@ export class InstanceRepo extends Context.Tag("app/InstanceRepo")<
       i: Instance,
       quota: number
     ) => Effect.Effect<Instance, RepoError | QuotaExceeded | ProvisionInProgress | DuplicateInstanceIndex>
+    // requestDeleteInstance(削除ボタン)専用の原子的 guard 付き UPDATE(Task 6
+    // レビュー #B)。単一の UPDATE ... WHERE ... RETURNING 文で (1) 対象行が
+    // running/failed であること、(2) 同じチームに(対象以外で)creating/deleting
+    // の行が無いこと、を検証してから status を deleting に更新する(TOCTOU
+    // 回避、createIfAllowed と同型)。listByTeam で読んでから update する
+    // 二段階実装だと、二つの並行リクエストが両方読み取りを通過して両方
+    // deleting へ書き込めてしまう(チームにつき進行中は高々1件という不変条件
+    // 違反)。0 行更新なら Option.none()(呼び出し元が再読み込みしてエラー種別
+    // を判定する)。
+    readonly beginDeletingIfAllowed: (
+      instanceId: InstanceId,
+      now: number
+    ) => Effect.Effect<Option.Option<Instance>, RepoError>
     // saga(provisioning.ts)が各ステップ後に progress/status/errorMessage/
     // updatedAt を保存するための全量更新(id で 1 行を丸ごと置き換える)。
     readonly update: (i: Instance) => Effect.Effect<void, RepoError>

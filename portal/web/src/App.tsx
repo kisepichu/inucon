@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react"
-import { Link, Navigate, Route, Routes } from "react-router-dom"
+import { Navigate, NavLink, Route, Routes } from "react-router-dom"
 import type { Contest, Me } from "shared/schemas"
 import { ApiError, api } from "./api.ts"
 import { Admin } from "./pages/Admin.tsx"
@@ -69,11 +69,15 @@ export function App() {
   }
 
   if (status === "loading") {
-    return <p>Loading...</p>
+    return <p className="loading">Loading...</p>
   }
 
   if (status === "error") {
-    return <p className="error">読み込みに失敗しました。再読み込みしてください。</p>
+    return (
+      <p className="error-page" role="alert">
+        読み込みに失敗しました。再読み込みしてください。
+      </p>
+    )
   }
 
   if (status === "unauthenticated" || me === null) {
@@ -83,23 +87,33 @@ export function App() {
   return (
     <>
       <header className="app-header">
-        <div>
-          <strong>{contest?.name ?? "INUCON"}</strong>
-          {contest && <span> ({contest.status})</span>}
-        </div>
-        <nav>
-          <Link to="/">Scoreboard</Link>
-          <Link to="/team">Team</Link>
-          {me.user.isAdmin && <Link to="/admin">Admin</Link>}
-        </nav>
-        <div className="user">
-          <span>{me.user.displayName}</span>
-          <button type="button" onClick={handleLogout}>
-            logout
-          </button>
+        <div className="app-header-inner">
+          <div className="app-brand">
+            {contest?.name ?? "INUCON"}
+            {contest && <span className="app-contest-status">({contest.status})</span>}
+          </div>
+          <nav className="app-nav">
+            <NavLink to="/" end className={({ isActive }) => (isActive ? "nav-link active" : "nav-link")}>
+              Scoreboard
+            </NavLink>
+            <NavLink to="/team" className={({ isActive }) => (isActive ? "nav-link active" : "nav-link")}>
+              Team
+            </NavLink>
+            {me.user.isAdmin && (
+              <NavLink to="/admin" className={({ isActive }) => (isActive ? "nav-link active" : "nav-link")}>
+                Admin
+              </NavLink>
+            )}
+          </nav>
+          <div className="app-user">
+            <span className="app-user-name">{me.user.displayName}</span>
+            <button type="button" className="btn btn-sm btn-ghost-dark" onClick={handleLogout}>
+              logout
+            </button>
+          </div>
         </div>
       </header>
-      <main>
+      <main className="app-main">
         <Routes>
           <Route path="/" element={<Scoreboard />} />
           <Route path="/team" element={<Team me={me} />} />

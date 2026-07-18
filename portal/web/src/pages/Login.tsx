@@ -9,6 +9,7 @@ export function Login() {
       <p>参加するには GitHub でログインしてください。</p>
       <button
         type="button"
+        className="btn btn-github"
         onClick={() => {
           window.location.href = loginUrl
         }}

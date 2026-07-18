@@ -163,6 +163,10 @@ const ApiLive = HttpApiBuilder.api(api).pipe(
   Layer.provide(GithubOAuthLive.pipe(Layer.provide(NodeHttpClient.layer))),
   Layer.provide(AuthConfigLive),
   Layer.provide(InstancePortsLive),
+  // createTeamInstance ハンドラ(requestCreateInstance 経由)が RAM ガードの
+  // 閾値(ProvisioningConfig)を要求する(Task 4 で実装済みの既定値付き
+  // Config、ProvisionerConditionalLive と同一参照でメモ化される)。
+  Layer.provide(ProvisioningConfigLive),
   Layer.provide(ReposLive)
 )
 

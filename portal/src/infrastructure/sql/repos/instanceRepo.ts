@@ -148,6 +148,40 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
           )
         ),
 
+      // requestDeleteInstance(削除ボタン)専用の原子的 guard 付き UPDATE
+      // (Task 6 レビュー #B)。単一の UPDATE ... WHERE ... RETURNING 文で
+      // (1) 対象行が running/failed であること、(2) 同じチームに(対象以外で)
+      // creating/deleting の行が無いこと、を検証してから status を deleting
+      // に更新する(TOCTOU 回避、createIfAllowed と同型)。listByTeam で
+      // 読んでから update する二段階実装だと、二つの並行リクエストが両方
+      // 読み取りを通過して両方 deleting へ書き込めてしまう(チームにつき進行中
+      // は高々1件という不変条件違反)。0 行更新時は Option.none() を返し、
+      // 呼び出し元(requestDeleteInstance)が再読み込みして原因(対象不在 /
+      // 対象の状態が既に running/failed でない / 他行が進行中)を優先順位付けて
+      // 判定する。
+      beginDeletingIfAllowed: (instanceId: InstanceId, now: number) =>
+        wrapSqlError(
+          sql<InstanceRow>`
+            UPDATE instances
+            SET status = 'deleting', updated_at = ${now}
+            WHERE id = ${instanceId}
+              AND status IN ('running', 'failed')
+              AND NOT EXISTS (
+                SELECT 1 FROM instances i2
+                WHERE i2.team_id = instances.team_id
+                  AND i2.id <> ${instanceId}
+                  AND i2.status IN ('creating', 'deleting')
+              )
+            RETURNING ${columns}
+          `
+        ).pipe(
+          Effect.flatMap((rows) =>
+            rows.length === 0
+              ? Effect.succeed(Option.none<Instance>())
+              : decodeInstance(rows[0]).pipe(Effect.map(Option.some))
+          )
+        ),
+
       // saga(provisioning.ts)が各ステップ後に progress/status/errorMessage/
       // updatedAt を保存するための全量更新(id で 1 行を丸ごと置き換える)。
       update: (i: Instance) =>
