@@ -174,7 +174,12 @@ export function Team({ me }: TeamProps) {
     setAdding(true)
     try {
       // index/privateIp/vmid はサーバー側で採番するためペイロード不要(Task 6 レビュー #1)。
-      await api.createTeamInstance(team.id)
+      // レスポンスの Instance(creating 状態)を即座に state へ反映する(Task 6
+      // レビュー #C)。直後の loadInstances が一時的な失敗で state を更新
+      // できなくても、この楽観反映によって一覧に pending 行が残り、ポーリング
+      // useEffect が起動する。
+      const created = await api.createTeamInstance(team.id)
+      setInstances((current) => [...(current ?? []).filter((instance) => instance.id !== created.id), created])
       await loadInstances(team.id, () => false)
     } catch (err) {
       setAddError(messageForError(err, "追加に失敗しました"))
@@ -190,7 +195,14 @@ export function Team({ me }: TeamProps) {
     setDeleteError(null)
     setDeletingId(instance.id)
     try {
+      // API は 204 (void) を返す(削除後の Instance は返さない)ため、対象行を
+      // 楽観的に deleting へ更新する(Task 6 レビュー #C)。直後の loadInstances
+      // が一時的に失敗しても、この行が残ってポーリング useEffect が起動し、
+      // 削除ボタンも disabled のままになる。
       await api.deleteTeamInstance(team.id, instance.id)
+      setInstances((current) =>
+        (current ?? []).map((item) => (item.id === instance.id ? { ...item, status: "deleting" } : item))
+      )
       await loadInstances(team.id, () => false)
     } catch (err) {
       setDeleteError(messageForError(err, "削除に失敗しました"))
