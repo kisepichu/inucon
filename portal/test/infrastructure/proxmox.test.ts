@@ -419,6 +419,86 @@ describe("startVm / stopAndDestroyVm", () => {
       expect(Exit.isFailure(exit)).toBe(true)
     })
   )
+
+  // PVE 9 実機(Task 7 再検証)で観測: 存在しない VM への stop は 200 + UPID を
+  // 返し(同期エラーにならない)、そのタスクを poll すると
+  // exitstatus="unable to find configuration file for VM <vmid>" で stopped する。
+  // vmExists による事前短絡が効けば、そもそも stop/destroy は一切呼ばれない。
+  it.effect("冪等: vmExists が false(VM 不在)なら stop/destroy を呼ばずに成功する(Task 7 再検証)", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox({ missingConfig500Vmids: [1102] })
+      yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.stopAndDestroyVm(1102)),
+        Effect.provide(portLayer(fake))
+      )
+      const stopReq = fake.requests.find((r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/1102/status/stop")
+      const deleteReq = fake.requests.find(
+        (r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/1102" && r.method === "DELETE"
+      )
+      expect(stopReq).toBeUndefined()
+      expect(deleteReq).toBeUndefined()
+    })
+  )
+
+  // PVE 9 実機(Task 7 再検証)で観測: VM は存在する(vmExists=true)が、stop の
+  // UPID を poll すると exitstatus="unable to find configuration file for VM 1102"
+  // で stopped する非同期の VM 不在ケース(競合等)。これはタスクレベルの失敗だが
+  // 「既に無い」ことを意味するので、テアダウンは成功として扱わなければならない。
+  it.effect("冪等: stop タスクが 'unable to find configuration file for VM <vmid>' exitstatus で失敗しても成功する(Task 7 再検証)", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox({
+        tasks: { stop: [{ status: "stopped", exitstatus: "unable to find configuration file for VM 1102" }] }
+      })
+      yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.stopAndDestroyVm(1102)),
+        Effect.provide(portLayer(fake))
+      )
+    })
+  )
+
+  it.effect("冪等: destroy タスクが 'unable to find configuration file for VM <vmid>' exitstatus で失敗しても成功する(Task 7 再検証)", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox({
+        tasks: { destroy: [{ status: "stopped", exitstatus: "unable to find configuration file for VM 1102" }] }
+      })
+      yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.stopAndDestroyVm(1102)),
+        Effect.provide(portLayer(fake))
+      )
+    })
+  )
+
+  // 無関係な task 失敗(VM 不在パターンにマッチしない)まで飲み込んではいけない
+  // (テアダウンが実際には失敗しているのに成功扱いになると orphan 化する)。
+  it.effect("stop タスクが無関係な exitstatus で失敗した場合は ProxmoxError で fail する(飲み込まない)", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox({
+        tasks: { stop: [{ status: "stopped", exitstatus: "some other error" }] }
+      })
+      const exit = yield* Effect.exit(
+        ProxmoxPort.pipe(
+          Effect.flatMap((px) => px.stopAndDestroyVm(1102)),
+          Effect.provide(portLayer(fake))
+        )
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+    })
+  )
+
+  it.effect("destroy タスクが無関係な exitstatus で失敗した場合は ProxmoxError で fail する(飲み込まない)", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox({
+        tasks: { destroy: [{ status: "stopped", exitstatus: "some other error" }] }
+      })
+      const exit = yield* Effect.exit(
+        ProxmoxPort.pipe(
+          Effect.flatMap((px) => px.stopAndDestroyVm(1102)),
+          Effect.provide(portLayer(fake))
+        )
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+    })
+  )
 })
 
 describe("vmExists(clone 再入可能性チェック、Task 4 レビュー C1)", () => {
