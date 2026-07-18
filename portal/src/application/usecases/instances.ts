@@ -2,7 +2,7 @@ import { Clock, Effect, Either, Option } from "effect"
 import { validateBenchTarget } from "../../domain/subnet.js"
 import { InvalidInstanceTransition } from "../../domain/errors.js"
 import { InstanceId, TeamId } from "../../domain/ids.js"
-import { beginDeleting, Instance, newInstance, vmidFor } from "../../domain/instance.js"
+import { Instance, newInstance, vmidFor } from "../../domain/instance.js"
 import type { ProvisionStep } from "../../domain/instance.js"
 import type { User } from "../../domain/user.js"
 import {
@@ -208,33 +208,30 @@ export const requestCreateInstance = (args: { user: User; teamId: TeamId }) =>
 // とする BenchJob が queued/running なら InstanceInUse(409、ベンチ対象の
 // 消失防止) — failed インスタンスは running ではないため通常このチェックに
 // 引っかかることは無いが、ガード自体は running/failed で分岐させず維持する
-// (対象 IP が偶然一致するケースを含め、単純さを優先)。ガード通過後は
-// beginDeleting で deleting へ遷移させ、実処理(撤収 saga)はワーカーが
-// 引き継ぐ。存在しない instanceId は「他チームのインスタンス」と同じ
-// Forbidden として扱う(cancelBench と同様、ID の存在有無を漏らさない)。
+// (対象 IP が偶然一致するケースを含め、単純さを優先)。存在しない
+// instanceId は「他チームのインスタンス」と同じ Forbidden として扱う
+// (cancelBench と同様、ID の存在有無を漏らさない)。
 //
-// ガード順序(Task 6 レビュー #4): authz → 対象自身の状態ガード
-// (InvalidInstanceTransition) → チーム全体の進行中1本ガード
-// (ProvisionInProgress) → bench 使用中ガード(InstanceInUse) →
-// beginDeleting 遷移、の順。authz を最初に置くのは他エンドポイントと同じく
-// 「他チームの情報の有無を漏らさない」ため。対象自身の状態ガードを次に
-// 置くのは、それ自体が creating/deleting/deleted であれば以降のチーム
-// 横断チェックをするまでもなく 409 が確定するため(無駄な listByTeam を
-// 避ける fail-fast)。その後にチーム全体の進行中ガードを置くのは、
-// このガードは「対象以外」の行を見るため対象自身の状態が定まってから
-// でないと自己参照の除外条件が書けないため。bench 使用中ガードは
-// 最後(対象 IP の実利用状況というより局所的な確認)。
+// ガード順序: authz → 対象自身の状態ガード(InvalidInstanceTransition、
+// 事前チェック) → bench 使用中ガード(InstanceInUse) → 原子的な
+// beginDeletingIfAllowed(チーム全体の進行中1本ガード込み)、の順。authz を
+// 最初に置くのは他エンドポイントと同じく「他チームの情報の有無を漏らさない」
+// ため。対象自身の状態ガードを次に置くのは、それ自体が
+// creating/deleting/deleted であれば以降のチェックをするまでもなく 409 が
+// 確定するため(無駄な listByTeam/UPDATE を避ける fail-fast)。bench
+// 使用中ガードはその後(対象 IP の実利用状況の局所的な確認)。
 //
-// スペック §Instance 集約 不変条件2(チームにつき進行中の
-// creating/deleting は高々1件)は requestCreateInstance 側では
-// ProvisionInProgress で担保しているが、このセルフサービス削除経路は
-// 対象インスタンス自身の状態しか見ておらず、チームに他の
-// creating/deleting 行があっても素通りしていた(Task 6 レビュー #4)。
-// これだと「一方が作成中/削除中の間にもう一方を削除開始する」といった形で
-// 同一チームに複数の進行中行が生まれてしまうため、create 側と同じ
-// team-wide ガードをここにも課す。failed インスタンスの自己整理
-// (掃除)もこのガードで一時的にブロックされる形になるが、単に
-// 「進行中の1本が片付くまで待つ」だけで実害は無いため許容する。
+// 原子性(Task 6 レビュー #B、TOCTOU 修正): スペック §Instance 集約
+// 不変条件2(チームにつき進行中の creating/deleting は高々1件)を守るための
+// 「対象以外に creating/deleting が無いこと」チェックは、旧実装では
+// listByTeam で読んでから update する二段階で行っていた(Task 6 レビュー
+// #4)。これだと二つの並行削除リクエスト(または作成と削除の競合)が両方とも
+// 読み取りを通過し、両方が deleting へ書き込めてしまう(不変条件違反)。
+// InstanceRepo.beginDeletingIfAllowed が「対象行が running/failed」「チーム
+// に対象以外の creating/deleting が無い」を単一の原子的 UPDATE 文で検証する
+// ため、ここではその結果だけを見る。0 行更新(None)の場合は再読み込みして
+// 原因を優先順位(対象不在 → 対象の状態が running/failed でなくなった →
+// 他の進行中に競り負けた)で判定し、対応する型付きエラーを返す。
 export const requestDeleteInstance = (args: { user: User; instanceId: InstanceId }) =>
   Effect.gen(function* () {
     const instances = yield* InstanceRepo
@@ -250,14 +247,6 @@ export const requestDeleteInstance = (args: { user: User; instanceId: InstanceId
       )
     }
 
-    const teamInstances = yield* instances.listByTeam(instance.teamId)
-    const otherInProgress = teamInstances.some(
-      (x) => x.id !== instance.id && (x.status === "creating" || x.status === "deleting")
-    )
-    if (otherInProgress) {
-      return yield* Effect.fail(new ProvisionInProgress({ teamId: instance.teamId }))
-    }
-
     const jobs = yield* BenchJobRepo
     const teamJobs = yield* jobs.listByTeam(instance.teamId, 50)
     const inUse = teamJobs.some(
@@ -268,10 +257,24 @@ export const requestDeleteInstance = (args: { user: User; instanceId: InstanceId
     }
 
     const now = yield* Clock.currentTimeMillis
-    const deleting = yield* Either.match(beginDeleting(instance, now), {
-      onLeft: Effect.fail,
-      onRight: Effect.succeed
-    })
-    yield* instances.update(deleting)
-    return deleting
+    const updated = yield* instances.beginDeletingIfAllowed(instance.id, now)
+    if (Option.isSome(updated)) {
+      return updated.value
+    }
+
+    // 原子的な UPDATE が 0 行(競合または競合状態の変化)。再読み込みして
+    // 「呼び出し元に返すエラー種別を選ぶためだけ」に原因を判定する(実際の
+    // 許可判定は上の単一原子的操作が行っている、createIfAllowed と同じ方針)。
+    const recheck = yield* instances.findById(instance.id)
+    if (Option.isNone(recheck)) {
+      // findById 直後の行なので通常は起こらないが、既存の「存在有無を漏らさ
+      // ない」方針に倣い Forbidden とする。
+      return yield* Effect.fail(new Forbidden())
+    }
+    if (recheck.value.status !== "running" && recheck.value.status !== "failed") {
+      return yield* Effect.fail(
+        new InvalidInstanceTransition({ instanceId: recheck.value.id, from: recheck.value.status, to: "deleting" })
+      )
+    }
+    return yield* Effect.fail(new ProvisionInProgress({ teamId: instance.teamId }))
   })

@@ -5,7 +5,7 @@ import type { Contest } from "../../src/domain/contest.js"
 import { CannotCancelRunning, DuplicateInstanceIndex, InvalidJobTransition, TeamJobAlreadyQueued } from "../../src/domain/errors.js"
 import type { BenchJobId, InstanceId, TeamId } from "../../src/domain/ids.js"
 import { UserId } from "../../src/domain/ids.js"
-import type { Instance } from "../../src/domain/instance.js"
+import { Instance } from "../../src/domain/instance.js"
 import { User } from "../../src/domain/user.js"
 import type { Team } from "../../src/domain/team.js"
 import type { TeamInvite } from "../../src/domain/teamInvite.js"
@@ -344,6 +344,30 @@ export const makeInstanceRepoTest = (initial: ReadonlyArray<Instance> = []): Lay
               return [Either.right(i), [...instances, i]]
             }
           ).pipe(Effect.flatMap(Either.match({ onLeft: Effect.fail, onRight: Effect.succeed }))),
+        // requestDeleteInstance(削除ボタン)専用の原子的 guard 付き UPDATE
+        // (Task 6 レビュー #B)。単一の Ref.modify コールバック内で (1) 対象が
+        // running/failed、(2) チームに対象以外の creating/deleting が無い、を
+        // 判定してから status を deleting に更新する(本番 SQLite 実装の単一
+        // UPDATE ... WHERE ... RETURNING 文と同じ TOCTOU 回避を Ref の単一
+        // 操作で模す)。
+        beginDeletingIfAllowed: (instanceId: InstanceId, now: number) =>
+          Ref.modify(instancesRef, (instances): readonly [Option.Option<Instance>, ReadonlyArray<Instance>] => {
+            const target = instances.find((x) => x.id === instanceId)
+            if (target === undefined || (target.status !== "running" && target.status !== "failed")) {
+              return [Option.none(), instances]
+            }
+            const otherInProgress = instances.some(
+              (x) => x.teamId === target.teamId && x.id !== instanceId && (x.status === "creating" || x.status === "deleting")
+            )
+            if (otherInProgress) {
+              return [Option.none(), instances]
+            }
+            const updated = new Instance({ ...target, status: "deleting", updatedAt: now })
+            return [
+              Option.some(updated),
+              instances.map((x) => (x.id === instanceId ? updated : x))
+            ]
+          }),
         // saga(provisioning.ts)の各ステップ後の progress/status/errorMessage
         // 保存。id で 1 件を丸ごと置き換える(本番 SQLite 実装の UPDATE と同じ
         // 意味論)。

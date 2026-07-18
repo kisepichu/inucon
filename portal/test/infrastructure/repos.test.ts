@@ -410,6 +410,183 @@ layer("InstanceRepo: create 重複拒否", (it) => {
   )
 })
 
+layer("InstanceRepo: beginDeletingIfAllowed", (it) => {
+  it.effect("running を deleting へ原子的に遷移させ、Some を返す(競合する行が無い場合)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const team = new Team({ id: TeamId.make("team-begindel-ok"), name: "BeginDel OK", teamNumber: 210 })
+      yield* teams.create(team)
+
+      const target = new Instance({
+        id: InstanceId.make("instance-begindel-ok"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1210,
+        privateIp: "10.100.210.11",
+        status: "running",
+        progress: ["clone_done", "configured", "started", "route_done", "access_done"],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(target)
+
+      const result = yield* instances.beginDeletingIfAllowed(target.id, 500)
+      expect(Option.isSome(result)).toBe(true)
+      if (Option.isSome(result)) {
+        expect(result.value.status).toBe("deleting")
+        expect(result.value.updatedAt).toBe(500)
+      }
+
+      const listed = yield* instances.listByTeam(team.id)
+      expect(listed.find((i) => i.id === target.id)?.status).toBe("deleting")
+    })
+  )
+
+  it.effect("同チームに他の creating 行があれば None(対象は running のまま)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const team = new Team({ id: TeamId.make("team-begindel-creating"), name: "BeginDel Creating", teamNumber: 211 })
+      yield* teams.create(team)
+
+      const target = new Instance({
+        id: InstanceId.make("instance-begindel-creating-target"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1211,
+        privateIp: "10.100.211.11",
+        status: "running",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      const other = new Instance({
+        id: InstanceId.make("instance-begindel-creating-other"),
+        teamId: team.id,
+        index: 2,
+        vmid: 1212,
+        privateIp: "10.100.211.12",
+        status: "creating",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(target)
+      yield* instances.create(other)
+
+      const result = yield* instances.beginDeletingIfAllowed(target.id, 500)
+      expect(result).toStrictEqual(Option.none())
+
+      const listed = yield* instances.listByTeam(team.id)
+      expect(listed.find((i) => i.id === target.id)?.status).toBe("running")
+    })
+  )
+
+  it.effect("同チームに他の deleting 行があれば None(対象は running のまま)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const team = new Team({ id: TeamId.make("team-begindel-deleting"), name: "BeginDel Deleting", teamNumber: 212 })
+      yield* teams.create(team)
+
+      const target = new Instance({
+        id: InstanceId.make("instance-begindel-deleting-target"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1213,
+        privateIp: "10.100.212.11",
+        status: "running",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      const other = new Instance({
+        id: InstanceId.make("instance-begindel-deleting-other"),
+        teamId: team.id,
+        index: 2,
+        vmid: 1214,
+        privateIp: "10.100.212.12",
+        status: "deleting",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(target)
+      yield* instances.create(other)
+
+      const result = yield* instances.beginDeletingIfAllowed(target.id, 500)
+      expect(result).toStrictEqual(Option.none())
+
+      const listed = yield* instances.listByTeam(team.id)
+      expect(listed.find((i) => i.id === target.id)?.status).toBe("running")
+    })
+  )
+
+  it.effect("対象が creating(running/failed でない)なら None(状態を変えない)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const team = new Team({ id: TeamId.make("team-begindel-notarget"), name: "BeginDel NoTarget", teamNumber: 213 })
+      yield* teams.create(team)
+
+      const target = new Instance({
+        id: InstanceId.make("instance-begindel-notarget"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1215,
+        privateIp: "10.100.213.11",
+        status: "creating",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(target)
+
+      const result = yield* instances.beginDeletingIfAllowed(target.id, 500)
+      expect(result).toStrictEqual(Option.none())
+
+      const listed = yield* instances.listByTeam(team.id)
+      expect(listed.find((i) => i.id === target.id)?.status).toBe("creating")
+    })
+  )
+
+  it.effect("failed からも deleting へ遷移できる(Task 4 レビュー I4)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const team = new Team({ id: TeamId.make("team-begindel-failed"), name: "BeginDel Failed", teamNumber: 214 })
+      yield* teams.create(team)
+
+      const target = new Instance({
+        id: InstanceId.make("instance-begindel-failed"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1216,
+        privateIp: "10.100.214.11",
+        status: "failed",
+        progress: [],
+        errorMessage: Option.some("boom"),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(target)
+
+      const result = yield* instances.beginDeletingIfAllowed(target.id, 500)
+      expect(Option.isSome(result)).toBe(true)
+      if (Option.isSome(result)) {
+        expect(result.value.status).toBe("deleting")
+      }
+    })
+  )
+})
+
 // BenchJobRepo は「全体で running は同時に 1 本まで」というテーブル全体に
 // わたる不変条件を持つため、シナリオ同士が同じ DB を共有すると前のテストが
 // 残した queued/running 行が後続の dequeue 判定に混入してしまう。そのため

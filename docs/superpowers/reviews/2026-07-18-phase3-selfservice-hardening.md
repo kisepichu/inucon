@@ -76,3 +76,33 @@ bench 使用中ガード(`InstanceInUse`)→ `beginDeleting` 遷移、の順で�
 
 - コンテストが running でない間はインスタンス自体へアクセスできなくする仕組みは
   未実装。ネットワーク/Access 側のゲーティングが要るため別タスク。
+
+## 2nd codex round(#A/#B、Task 6 実装後の再レビュー)
+
+### #A `requestCreateInstance` の index 採番が failed/deleting の枠を再利用してしまう【真のバグ・対応した】
+
+- #1 対応後の採番は `existing` のうち `creating`/`running` の index だけを
+  除外して `1..instanceQuota` の最小空きを選んでいた。`failed`(や `deleting`)
+  の行は quota カウントに入らないため、その index を新規作成が再利用でき、
+  vmid/IP も同じ値になる。後でその `failed` 行を削除すると新インスタンスの
+  VM ごと撤収されてしまう(vmid/IP 衝突による VM 破壊)。
+- **対応**: 除外対象を「`deleted` 以外の全ステータス」に拡大し、探索範囲も
+  `1..instanceQuota` ではなく `1..MAX_INSTANCE_INDEX`(=99、vmid/IP 不変条件を
+  保つ上限)に広げた。空きが尽きた場合(実運用では到達不能)は `QuotaExceeded`
+  を安全弁として返す。
+  `portal/src/application/usecases/instances.ts` の `requestCreateInstance`。
+
+### #B `requestDeleteInstance` の team-wide 進行中ガードが TOCTOU【真のバグ・対応した】
+
+- #4 で追加したチーム全体の進行中ガードは `listByTeam` で読んでから
+  `update` するという二段階実装だったため、2 つの並行削除リクエスト(または
+  作成と削除の競合)が両方とも読み取りを通過し、両方が `deleting` へ書き込め
+  てしまう(スペック §Instance 集約 不変条件2 違反)。
+- **対応**: `InstanceRepo` に `beginDeletingIfAllowed`(単一の
+  `UPDATE ... WHERE status IN ('running','failed') AND NOT EXISTS (...)
+  RETURNING` 文)を追加し、`createIfAllowed` と同じ原子性パターンで
+  読み取り+書き込みを 1 操作に統合した。`requestDeleteInstance` は
+  この結果が `None` のときだけ再読み込みして原因(対象不在 / 対象の状態が
+  running/failed でなくなった / 他の進行中に競り負けた)を優先順位付けて
+  判定する。`portal/src/infrastructure/sql/repos/instanceRepo.ts` /
+  `portal/src/application/ports.ts` / `portal/src/application/usecases/instances.ts`。
