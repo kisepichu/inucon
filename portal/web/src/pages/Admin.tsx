@@ -59,21 +59,34 @@ export function Admin() {
     loadContest()
   }, [loadTeams, loadContest])
 
-  const loadInvites = useCallback(async (teamId: string) => {
+  const loadInvites = useCallback(async (teamId: string, isCanceled: () => boolean) => {
     if (teamId === "") {
-      setInvites([])
+      if (!isCanceled()) {
+        setInvites([])
+      }
       return
     }
     try {
-      setInvites(await api.listInvites(teamId))
+      const data = await api.listInvites(teamId)
+      if (!isCanceled()) {
+        setInvites(data)
+      }
     } catch {
-      setInvites([])
+      if (!isCanceled()) {
+        setInvites([])
+      }
     }
   }, [])
 
-  // 招待対象チームを切り替えたら招待中一覧を取り直す。
+  // 招待対象チームを切り替えたら招待中一覧を取り直す。切り替えを連打した場合に
+  // 古いチームのレスポンスが後から届いて表示を上書きしないよう、キャンセルフラグで
+  // 現在選択中のチーム以外の結果を破棄する(App.tsx/Team.tsx と同じパターン)。
   useEffect(() => {
-    loadInvites(inviteTeamId)
+    let canceled = false
+    loadInvites(inviteTeamId, () => canceled)
+    return () => {
+      canceled = true
+    }
   }, [inviteTeamId, loadInvites])
 
   const runAction = async (fn: () => Promise<void>) => {
@@ -147,7 +160,7 @@ export function Admin() {
         setInviteResult(result)
         setInviteLogin("")
         setInviteEmail("")
-        await loadInvites(inviteTeamId)
+        await loadInvites(inviteTeamId, () => false)
       } catch (err) {
         setInviteError(err instanceof ApiError ? err.tag : "招待に失敗しました")
       } finally {
