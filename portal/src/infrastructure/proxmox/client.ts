@@ -2,6 +2,7 @@ import { HttpClient, HttpClientRequest, HttpClientResponse } from "@effect/platf
 import { NodeHttpClient } from "@effect/platform-node"
 import { Clock, Config, Effect, Either, Layer, Option, Redacted, Schema } from "effect"
 import type { ConfigError } from "effect/ConfigError"
+import { randomUUID } from "node:crypto"
 import type * as Https from "node:https"
 import { ProvisionTimeout, ProxmoxError, ProxmoxPort } from "../../application/ports.js"
 import { describeHttpFailure, requestPath } from "../httpClientErrors.js"
@@ -94,6 +95,33 @@ users:
     ssh_authorized_keys:
 ${keysYaml}
 `
+}
+
+// snippet アップロード(POST .../storage/local/upload)は @effect/platform の
+// bodyFormData(= FormData)を使わない。pveproxy のアップロード専用ハンドラは
+// API の ACL チェックより前の段階で、リクエストボディを一旦テンポラリファイルへ
+// バッファリングするために明示的な Content-Length を要求しており、
+// bodyFormData が生成する chunked transfer encoding のストリーミングボディは
+// そこで HTTP 501 で拒否される(Task 7 実機(PVE 9.2.3)で確認)。
+// 手組みの multipart/form-data ボディ(バイト列、固定長)を bodyUint8Array で
+// 送ることで、プラットフォームの HTTP クライアントが Content-Length を
+// 導出できるようにする(手組みボディ自体は実機の pveproxy に対して疎通確認済み)。
+const buildSnippetUploadBody = (
+  filename: string,
+  snippet: string
+): { readonly boundary: string; readonly body: Uint8Array } => {
+  const boundary = `----inucon-${randomUUID()}`
+  const parts = [
+    `--${boundary}\r\n`,
+    `Content-Disposition: form-data; name="content"\r\n\r\n`,
+    `snippets\r\n`,
+    `--${boundary}\r\n`,
+    `Content-Disposition: form-data; name="filename"; filename="${filename}"\r\n`,
+    `Content-Type: text/yaml\r\n\r\n`,
+    `${snippet}\r\n`,
+    `--${boundary}--\r\n`
+  ].join("")
+  return { boundary, body: new TextEncoder().encode(parts) }
 }
 
 export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpClient> = Layer.effect(
@@ -287,16 +315,10 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
       configureCloudInit: ({ gateway, ip, sshKeys, vmid }) =>
         Effect.gen(function* () {
           const filename = `inucon-${vmid}.yaml`
-          const formData = new FormData()
-          formData.append("content", "snippets")
-          formData.append(
-            "filename",
-            new Blob([cloudInitSnippet(sshKeys)], { type: "text/yaml" }),
-            filename
-          )
+          const { body, boundary } = buildSnippetUploadBody(filename, cloudInitSnippet(sshKeys))
           yield* requestConfig(
             HttpClientRequest.post(`${apiUrl}/nodes/${NODE}/storage/local/upload`).pipe(
-              HttpClientRequest.bodyFormData(formData)
+              HttpClientRequest.bodyUint8Array(body, `multipart/form-data; boundary=${boundary}`)
             )
           )
           yield* requestConfig(
