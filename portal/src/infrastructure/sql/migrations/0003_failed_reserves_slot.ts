@@ -1,5 +1,5 @@
 import { SqlClient } from "@effect/sql"
-import { Effect } from "effect"
+import { Clock, Effect } from "effect"
 
 // Task 6 レビュー #E: 0002 で作った部分ユニークインデックス
 // idx_instances_team_idx_active(status IN ('creating','running','deleting'))は
@@ -28,11 +28,60 @@ import { Effect } from "effect"
 // DROP INDEX → CREATE UNIQUE INDEX で作り直す(テーブル自体のスキーマ変更は
 // 不要、0002 のようなテーブル再作成は不要)。
 //
-// 本番(apphost)への安全性: self-service instances(Phase 3)はまだ本番稼働
-// 前であり、既存行がこの厳格化後のインデックスに違反することはない
-// (violate しうる行が存在しないため、データクリーンアップは不要)。
+// 【Task 6 レビュー #G】当初「self-service instances(Phase 3)はまだ本番稼働
+// 前であり、既存行がこの厳格化後のインデックスに違反することはないためデータ
+// クリーンアップは不要」と判断していたが、これは楽観的すぎた。
+// 0002 の緩い部分ユニークインデックス(failed を対象外)と、admin の
+// createInstance(instanceRepo.create、(team_id, idx) の重複判定を持たない
+// 台帳取り込み専用経路)の両方が、同じ (team_id, idx) に failed と
+// creating/running/deleting が共存する状態を作りうる。そのまま
+// 「DROP INDEX → CREATE UNIQUE INDEX ... WHERE status != 'deleted'」を実行
+// すると、既にそうした重複行が存在する DB では CREATE UNIQUE INDEX 自体が
+// UNIQUE 制約違反で失敗し、migration 全体がロールバックされて起動不能になる
+// (Migrator は各 migration を1トランザクションで包むため、この失敗は
+// 「起動できない」という形で露呈する)。
+//
+// 対策: CREATE UNIQUE INDEX の前に、各 (team_id, idx) グループで deleted
+// 以外の行が複数ある場合は 1 行だけ残して残りを deleted に倒す(defensive
+// reconciliation)。生き残らせる行の優先順位:
+//   1. failed でない行を failed の行より優先する(failed 行は「vmid/IP を
+//      握ったまま实質使われていない」使い捨て可能な重複という前提、上の
+//      #E コメント参照)
+//   2. 優先順位が同じ場合は updated_at が新しい方を優先する
+//   3. さらに同じ場合は id で決定的にする(SQLite に安定ソートを頼らない)
+// この「生存者選定」は 1 本の UPDATE ... WHERE EXISTS(...) 文で表現する:
+// ある行 r は、同じ (team_id, idx) グループ内に r より優先順位が高い別の
+// deleted 以外の行が存在する場合にだけ deleted へ倒す。優先順位はグループ内
+// で相異なる id により厳密な全順序になるため、各グループでちょうど 1 行
+// (最優先の行)だけが生き残る。
 export default Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient
+  const now = yield* Clock.currentTimeMillis
+
+  yield* sql`
+    UPDATE instances
+    SET status = 'deleted', updated_at = ${now}
+    WHERE status != 'deleted'
+      AND EXISTS (
+        SELECT 1 FROM instances AS other
+        WHERE other.team_id = instances.team_id
+          AND other.idx = instances.idx
+          AND other.id != instances.id
+          AND other.status != 'deleted'
+          AND (
+            (CASE WHEN other.status != 'failed' THEN 1 ELSE 0 END)
+              > (CASE WHEN instances.status != 'failed' THEN 1 ELSE 0 END)
+            OR (
+              (CASE WHEN other.status != 'failed' THEN 1 ELSE 0 END)
+                = (CASE WHEN instances.status != 'failed' THEN 1 ELSE 0 END)
+              AND (
+                other.updated_at > instances.updated_at
+                OR (other.updated_at = instances.updated_at AND other.id > instances.id)
+              )
+            )
+          )
+      )
+  `
 
   yield* sql`DROP INDEX idx_instances_team_idx_active`
 

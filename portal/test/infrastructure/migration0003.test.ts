@@ -87,6 +87,61 @@ layer("migration 0003: failed 行の通常の自己サービス削除経路は�
   )
 })
 
+// Task 6 レビュー #G: 0002 の緩い部分ユニークインデックス(failed を対象外)
+// + admin の createInstance(台帳取り込み、(team_id, idx) の重複判定なし)
+// によって、0003 適用前の DB には同じ (team_id, idx) に deleted 以外の行が
+// 複数存在しうる。この状態で素朴に「DROP INDEX → CREATE UNIQUE INDEX ...
+// WHERE status != 'deleted'」を実行すると CREATE UNIQUE INDEX 自体が UNIQUE
+// 制約違反で失敗し migration 全体がロールバックされる(= 起動不能)。0003 は
+// CREATE UNIQUE INDEX の前に重複を整理してから索引を張るため、この事前状態
+// があっても migration 自体は必ず成功することを検証する。
+layer("migration 0003: 事前に (team_id, idx) が重複していても整理してから索引を張る", (it) => {
+  it.effect("failed 行(重複側)が deleted に倒され、running 行は残り、索引作成も成功する", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient
+      yield* migration0001
+      yield* migration0002
+      yield* insertTeam(sql, { id: "team-0003-reconcile", teamNumber: 43 })
+
+      // 0002 までの状態(failed は部分ユニークインデックスの対象外)なので、
+      // この 2 行はどちらも INSERT 時点では拒否されず共存できる。
+      // running 側は updated_at を意図的に古くし(0)、failed 側を新しく
+      // する(999999)ことで、「非 failed を failed より優先する」という
+      // keep-priority が「新しい updated_at を優先する」より優先されることを
+      // 同時に検証する。
+      yield* sql`
+        INSERT INTO instances (id, team_id, idx, vmid, private_ip, status, created_at, updated_at)
+        VALUES ('inst-0003-running', 'team-0003-reconcile', 1, 4301, '10.100.43.11', 'running', 0, 0)
+      `
+      yield* sql`
+        INSERT INTO instances (id, team_id, idx, vmid, private_ip, status, created_at, updated_at)
+        VALUES ('inst-0003-failed', 'team-0003-reconcile', 1, 4301, '10.100.43.11', 'failed', 0, 999999)
+      `
+
+      const exit = yield* Effect.exit(migration0003)
+      expect(exit._tag).toBe("Success")
+
+      const rows = yield* sql<{ id: string; status: string }>`
+        SELECT id, status FROM instances WHERE team_id = 'team-0003-reconcile' ORDER BY id
+      `
+      expect(rows).toStrictEqual([
+        { id: "inst-0003-failed", status: "deleted" },
+        { id: "inst-0003-running", status: "running" }
+      ])
+
+      // 索引が実際に作られ、機能していること(同じ idx への新規 INSERT が
+      // running 行と衝突して拒否される)も確認する。
+      const dupExit = yield* Effect.exit(
+        sql`
+          INSERT INTO instances (id, team_id, idx, vmid, private_ip, status, created_at, updated_at)
+          VALUES ('inst-0003-newdup', 'team-0003-reconcile', 1, 4301, '10.100.43.12', 'creating', 100, 100)
+        `
+      )
+      expect(dupExit._tag).toBe("Failure")
+    })
+  )
+})
+
 layer("migration 0003: deleted 行がある idx は再作成できる", (it) => {
   it.effect("0003 適用後も deleted は部分ユニークインデックスの対象外", () =>
     Effect.gen(function* () {
