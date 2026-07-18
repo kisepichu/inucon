@@ -63,11 +63,20 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
       // 0 行挿入(= 既に queued/running あり)なら TeamJobAlreadyQueued。
       // bench_job_logs の空行 INSERT は同一トランザクション内の別文のまま。
       //
-      // requireRunningInstance(Task 6 レビュー #D): enqueueBenchJob の
+      // requireRunningInstance(Task 6 レビュー #D、id 照合は #H): enqueueBenchJob の
       // instanceId 起点の enqueue だけが渡す。渡された場合、この INSERT の
       // WHERE に「対象 instance が今も running であること」を
       // `AND EXISTS (SELECT 1 FROM instances WHERE ...)` として同一原子操作に
-      // 追加する。instanceRepo.beginDeletingIfAllowed 側も対称に「対象 IP を
+      // 追加する。
+      // 【Task 6 レビュー #H】この EXISTS は id で対象行を一意に特定する
+      // (`id = requireRunningInstance.instanceId`)。team_id + private_ip だけの
+      // 照合では、対象 instance 自体は running でなくなっていても、スロット
+      // 再利用や admin 台帳取り込みの重複 IP によって「同じ team・同じ IP の
+      // 別の running 行」がたまたま存在すると誤って通ってしまう。id が
+      // 対象行を一意に決める権威であり、team_id は defensive な追加条件として
+      // 残す(他チームの instance id を誤って渡すような呼び出し側のバグを
+      // 二重に防ぐだけで、判定自体は id で完結する)。
+      // instanceRepo.beginDeletingIfAllowed 側も対称に「対象 IP を
       // targetIp とする queued/running な bench_jobs が無いこと」を UPDATE の
       // WHERE に含めているため、削除 UPDATE とこの INSERT のどちらが先に
       // 確定してもレースなく相手を検出できる(SQLite が書き込みを直列化する
@@ -85,7 +94,7 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
       // 上の単一原子的 INSERT が行っている、createIfAllowed と同じ方針)。
       insertIfAllowed: (
         job: BenchJob,
-        requireRunningInstance?: { instanceId: InstanceId; teamId: TeamId; privateIp: string }
+        requireRunningInstance?: { instanceId: InstanceId; teamId: TeamId }
       ) =>
         wrapSqlError(
           sql.withTransaction(
@@ -93,8 +102,8 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
               const instanceGuard = requireRunningInstance
                 ? sql`AND EXISTS (
                     SELECT 1 FROM instances
-                    WHERE team_id = ${requireRunningInstance.teamId}
-                      AND private_ip = ${requireRunningInstance.privateIp}
+                    WHERE id = ${requireRunningInstance.instanceId}
+                      AND team_id = ${requireRunningInstance.teamId}
                       AND status = 'running'
                   )`
                 : sql.literal("")

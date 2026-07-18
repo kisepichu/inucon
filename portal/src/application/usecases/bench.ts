@@ -68,8 +68,7 @@ export const enqueueBench = (args: {
         ? undefined
         : {
             instanceId: args.requireRunningInstance.instanceId,
-            teamId: team.id,
-            privateIp: args.targetIp
+            teamId: team.id
           }
     )
   })

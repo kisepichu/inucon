@@ -194,7 +194,7 @@ export class BenchJobRepo extends Context.Tag("app/BenchJobRepo")<
     // なる、TOCTOU 回避)。
     readonly insertIfAllowed: (
       job: BenchJob,
-      requireRunningInstance?: { instanceId: InstanceId; teamId: TeamId; privateIp: string }
+      requireRunningInstance?: { instanceId: InstanceId; teamId: TeamId }
     ) => Effect.Effect<BenchJob, RepoError | TeamJobAlreadyQueued | InstanceNotRunning>
     readonly findById: (id: BenchJobId) => Effect.Effect<Option.Option<BenchJob>, RepoError>
     readonly listByTeam: (teamId: TeamId, limit: number) => Effect.Effect<ReadonlyArray<BenchJob>, RepoError>
