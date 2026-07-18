@@ -106,3 +106,43 @@ bench 使用中ガード(`InstanceInUse`)→ `beginDeleting` 遷移、の順で�
   running/failed でなくなった / 他の進行中に競り負けた)を優先順位付けて
   判定する。`portal/src/infrastructure/sql/repos/instanceRepo.ts` /
   `portal/src/application/ports.ts` / `portal/src/application/usecases/instances.ts`。
+
+## 3回目 codex ラウンドの指摘(#A/#B 修正後)
+
+### #C Team ページが mutation 成功後の refresh 失敗でポーリングを止める【UI・対応した】
+
+- 追加/削除リクエストが成功しても、直後の `loadInstances` が一時的に失敗すると
+  ヘルパーがエラーを握り潰し、mutation 前のリストが state に残る。ポーリングは
+  リストに `creating`/`deleting` があるときだけ開始するため、リトライが
+  スケジュールされず、リロードするまで画面が stale(削除ボタンも復活)。
+- **対応**: mutation 成功時に返る pending インスタンスを楽観的に反映し、
+  リフレッシュ失敗後もポーリング(リトライ)が継続するようにする。
+  `portal/web/src/pages/Team.tsx`。
+
+### #D 削除とベンチ enqueue の競合【P1・記録 → Task 7 で対応】
+
+- 削除の bench 使用中チェック(`InstanceInUse`)は依然として read-then-act。
+  ベンチ enqueue と削除が並行すると、削除側が「使用中ジョブなし」を観測した
+  直後に enqueue がジョブを挿入し、両方成功して**走行中/キュー中ベンチの対象
+  VM を撤去**しうる。`beginDeletingIfAllowed` はインスタンス行しか原子ガードし
+  ておらず、enqueue 側も「対象が running のまま」を原子的に主張しない。
+- **なぜ今すぐ直さないか**: 正しい修正はインスタンス status とベンチ挿入を
+  またぐクロステーブルの原子ガード(共有トランザクション/条件付き挿入)が必要で、
+  専用の設計・テストに値する。実効リスクは低い(私物・チーム数人・操作はほぼ
+  逐次で逐次なら既存 `InstanceInUse` が防ぐ・失敗ベンチは再実行可能)。
+- **対応予定**: Task 7(本番検証)前後で、削除の bench 使用中判定を
+  `beginDeletingIfAllowed` の SQL に畳み込む + enqueue 挿入を「対象が running」
+  条件付きにする、の双方向原子化として対応する。
+
+### #E failed 行と (team,index) の衝突で削除が 500【P2・記録 → 今後対応】
+
+- 部分ユニークインデックス `(team_id, idx)` は `failed` を除外しており、admin
+  作成パス(`createInstance`、index を明示指定)も failed を除外しないため、
+  `failed@idx` と `running@idx` が併存し得る。この状態で `failed@idx` を削除
+  すると `deleting@idx` へ遷移し、ユニークインデックス違反 → `RepoError` →
+  HTTP 500(想定していた「failed 掃除」が壊れる)。
+- self-service の採番は #A で failed スロットを再利用しなくなったが、admin パス
+  とスキーマの許容が根本原因として残る。
+- **対応予定**: admin 作成パスの index 検証(failed と衝突する index を弾く)
+  か、`beginDeletingIfAllowed` でユニーク違反を検出して制御されたエラーに
+  マップする。今後対応。
