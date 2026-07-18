@@ -197,11 +197,6 @@ const makeFakeProxmox = (
       return Effect.succeed(jsonResponse(request, { data: null }))
     }
 
-    // snippet upload
-    if (path === "/api2/json/nodes/eevee/storage/local/upload" && method === "POST") {
-      return Effect.succeed(jsonResponse(request, { data: null }))
-    }
-
     // guest agent ping
     const pingMatch = path.match(/^\/api2\/json\/nodes\/eevee\/qemu\/(\d+)\/agent\/ping$/)
     if (pingMatch && method === "POST") {
@@ -293,61 +288,47 @@ describe("cloneVm", () => {
 })
 
 describe("configureCloudInit", () => {
-  // pveproxy の upload ハンドラは Content-Length 明示のボディを要求する
-  // (chunked な FormData ストリーミングは 501 で拒否される。Task 7 実機検証)。
-  // そのため FormData/bodyFormData ではなく、手組みの multipart バイト列を
-  // Content-Length 付きで送る実装であることをここで検証する。
-  it.effect("snippet を Content-Length 明示の手組み multipart でアップロードし、cicustom/ipconfig0 を config に設定する", () =>
+  // PVE 9.2 実機(Task 7)では snippets の upload API 自体が
+  // 400 Parameter verification failed: content 'snippets' does not have a value
+  // in the enumeration 'iso, vztmpl, import' で拒否される(snippets は upload
+  // 不可)。そのため cicustom + snippet アップロードはやめ、PVE ネイティブの
+  // ciuser/sshkeys パラメータだけを 1 回の config 更新で設定する。
+  it.effect("upload は行わず、config に ciuser/sshkeys/ipconfig0 を 1 リクエストで設定する", () =>
     Effect.gen(function* () {
       const fake = makeFakeProxmox()
+      // 鍵にスペースと '+' を含めて、sshkeys の値が(transport の form-decode を
+      // 一段挟んだ後もなお)encodeURIComponent 済みの形で保持されることを確認する。
+      const keyWithSpecialChars = "ssh-ed25519 AAAA+abc user@host"
       yield* ProxmoxPort.pipe(
         Effect.flatMap((px) =>
           px.configureCloudInit({
             vmid: 1101,
             ip: "10.100.1.11",
             gateway: "10.100.1.1",
-            sshKeys: "ssh-ed25519 AAAA... a@b\nssh-rsa BBBB... c@d"
+            sshKeys: `ssh-ed25519 AAAA... a@b\n${keyWithSpecialChars}`
           })
         ),
         Effect.provide(portLayer(fake))
       )
 
+      // snippet upload リクエストは一切送らない。
       const uploadReq = fake.requests.find((r) => urlPath(r) === "/api2/json/nodes/eevee/storage/local/upload")
-      expect(uploadReq).toBeDefined()
+      expect(uploadReq).toBeUndefined()
 
-      // chunked ストリーミングになる FormData ボディは使わない。固定長バイト列
-      // (Uint8Array)として送ることで、プラットフォームが Content-Length を
-      // 導出できるようにする。
-      expect(uploadReq!.body._tag).toBe("Uint8Array")
-      const bytes = uploadReq!.body._tag === "Uint8Array" ? uploadReq!.body.body : undefined
-      expect(bytes).toBeDefined()
-
-      const contentType = uploadReq!.headers["content-type"]
-      expect(contentType).toMatch(/^multipart\/form-data; boundary=.+$/)
-      const boundary = contentType.replace(/^multipart\/form-data; boundary=/, "")
-
-      const text = new TextDecoder().decode(bytes!)
-
-      // 各パートのヘッダーは CRLF 区切り(手組み multipart の必須要件)。
-      expect(text).toContain('Content-Disposition: form-data; name="content"\r\n\r\nsnippets')
-      expect(text).toContain(
-        `Content-Disposition: form-data; name="filename"; filename="inucon-1101.yaml"\r\nContent-Type: text/yaml\r\n\r\n`
-      )
-      expect(text).toContain("#cloud-config")
-      expect(text).toContain("ssh-ed25519 AAAA... a@b")
-      expect(text).toContain("ssh-rsa BBBB... c@d")
-      // 閉じ boundary(末尾のターミネータ)。
-      expect(text.trimEnd().endsWith(`--${boundary}--`)).toBe(true)
-      // 固定長ボディであること(chunked ではない)を、実バイト長と Uint8Array
-      // の長さが一致することで確認する。
-      expect(bytes!.length).toBe(new TextEncoder().encode(text).length)
-
-      const configReq = fake.requests.find(
+      // config 更新は 1 回だけ。
+      const configReqs = fake.requests.filter(
         (r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/1101/config" && r.method === "POST"
       )
-      expect(configReq).toBeDefined()
-      const params = bodyParams(configReq!)
-      expect(params.get("cicustom")).toBe("user=local:snippets/inucon-1101.yaml")
+      expect(configReqs.length).toBe(1)
+
+      const params = bodyParams(configReqs[0])
+      expect(params.get("ciuser")).toBe("isucon")
+      // params.get() は transport(bodyUrlParams)の form-decode を 1 段行う。
+      // 実装は sshkeys の値そのものを encodeURIComponent しているので、
+      // ここで得られる値はなお percent-encode されたままであるはず(PVE
+      // 自身がこの形で config に保存する既知の慣習。bpg/proxmox provider と同じ)。
+      const expectedSshkeys = encodeURIComponent(`ssh-ed25519 AAAA... a@b\n${keyWithSpecialChars}`)
+      expect(params.get("sshkeys")).toBe(expectedSshkeys)
       expect(params.get("ipconfig0")).toBe("gw=10.100.1.1,ip=10.100.1.11/24")
       expect(params.get("nameserver")).toBe("1.1.1.1")
     })

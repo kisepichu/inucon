@@ -2,17 +2,36 @@ import { HttpClient, HttpClientRequest, HttpClientResponse } from "@effect/platf
 import { NodeHttpClient } from "@effect/platform-node"
 import { Clock, Config, Effect, Either, Layer, Option, Redacted, Schema } from "effect"
 import type { ConfigError } from "effect/ConfigError"
-import { randomUUID } from "node:crypto"
 import type * as Https from "node:https"
 import { ProvisionTimeout, ProxmoxError, ProxmoxPort } from "../../application/ports.js"
 import { describeHttpFailure, requestPath } from "../httpClientErrors.js"
 
 // Proxmox VE API(https://192.0.2.10:8006/api2/json)。トークン認証。
 // spike メモ(docs/superpowers/research/2026-07-11-phase3-spike.md)で確定した
-// 払い出しレシピ(linked clone + snippet(cicustom)+ ipconfig0、既存 VM への鍵追加
-// は guest-exec)を生 API で駆動する。node は eevee 固定(スペック上、単一ノード)。
+// 払い出しレシピを生 API で駆動する。node は eevee 固定(スペック上、単一ノード)。
+// cloud-init の設定は「linked clone + PVE ネイティブの ciuser/sshkeys +
+// ipconfig0」(既存 VM への鍵追加は guest-exec)。当初は cicustom で snippet
+// (user-data)を差し込む案だったが、PVE 9.2 実機(Task 7)で
+// `POST .../storage/local/upload` が
+// `400 Parameter verification failed: content 'snippets' does not have a value
+// in the enumeration 'iso, vztmpl, import'` を返すことを確認した。つまり
+// snippets は API 経由でのアップロードができない(PVE 9.2 の制約)。
+// snippet の唯一の役割は isucon ユーザー(NOPASSWD sudo・bash シェル・
+// team の ssh_authorized_keys)の作成だったが、これは Ubuntu クラウドイメージの
+// default_user 機構(NOPASSWD sudo 済みの既定ユーザーを cloud-init 経由で
+// 用意する仕組み)と PVE ネイティブの ciuser/sshkeys パラメータだけで
+// アップロード無しに実現できるため、configureCloudInit はそちらへ切り替える。
 
 const NODE = "eevee"
+
+// テンプレート VM(9100)上の Ubuntu クラウドイメージが cloud-init 経由で
+// 用意する既定ユーザー名(NOPASSWD sudo 済み、実機 Task 7 で確認)。
+// invites.ts の AUTHORIZED_KEYS_PATH(/home/isucon/...)と同じユーザーを指す
+// 定数だが、application 層(usecases/invites.ts)と infrastructure 層
+// (この proxmox クライアント)は別レイヤーの関心事であり、この 1 文字列のためだけに
+// 共有モジュールを新設するほどの重複ではないため、ここではローカル定数として
+// 個別に持つ。
+const CLOUD_INIT_USER = "isucon"
 
 // --- レスポンス Schema(必要フィールドのみ検証) ---
 
@@ -78,51 +97,6 @@ const TASK_POLL_TIMEOUT_MILLIS = 120_000
 const GUEST_AGENT_POLL_INTERVAL_MILLIS = 2_000
 const GUEST_EXEC_POLL_INTERVAL_MILLIS = 500
 const GUEST_EXEC_POLL_TIMEOUT_MILLIS = 60_000
-
-// cloud-init snippet(user-data)。isucon ユーザー + ssh_authorized_keys を
-// 固定で持つ(spike メモの実測済み形。sshKeys は 1 行 1 鍵の複数行文字列)。
-const cloudInitSnippet = (sshKeys: string): string => {
-  const keys = sshKeys
-    .split("\n")
-    .map((k) => k.trim())
-    .filter((k) => k !== "")
-  const keysYaml = keys.map((k) => `      - ${k}`).join("\n")
-  return `#cloud-config
-users:
-  - name: isucon
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    shell: /bin/bash
-    ssh_authorized_keys:
-${keysYaml}
-`
-}
-
-// snippet アップロード(POST .../storage/local/upload)は @effect/platform の
-// bodyFormData(= FormData)を使わない。pveproxy のアップロード専用ハンドラは
-// API の ACL チェックより前の段階で、リクエストボディを一旦テンポラリファイルへ
-// バッファリングするために明示的な Content-Length を要求しており、
-// bodyFormData が生成する chunked transfer encoding のストリーミングボディは
-// そこで HTTP 501 で拒否される(Task 7 実機(PVE 9.2.3)で確認)。
-// 手組みの multipart/form-data ボディ(バイト列、固定長)を bodyUint8Array で
-// 送ることで、プラットフォームの HTTP クライアントが Content-Length を
-// 導出できるようにする(手組みボディ自体は実機の pveproxy に対して疎通確認済み)。
-const buildSnippetUploadBody = (
-  filename: string,
-  snippet: string
-): { readonly boundary: string; readonly body: Uint8Array } => {
-  const boundary = `----inucon-${randomUUID()}`
-  const parts = [
-    `--${boundary}\r\n`,
-    `Content-Disposition: form-data; name="content"\r\n\r\n`,
-    `snippets\r\n`,
-    `--${boundary}\r\n`,
-    `Content-Disposition: form-data; name="filename"; filename="${filename}"\r\n`,
-    `Content-Type: text/yaml\r\n\r\n`,
-    `${snippet}\r\n`,
-    `--${boundary}--\r\n`
-  ].join("")
-  return { boundary, body: new TextEncoder().encode(parts) }
-}
 
 export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpClient> = Layer.effect(
   ProxmoxPort,
@@ -312,25 +286,26 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
           )
         ),
 
+      // PVE ネイティブの ciuser/sshkeys で cloud-init を設定する(snippet
+      // アップロード無し、単一の config リクエスト)。
+      // sshkeys の値は PVE の既知の慣習として、config に保存される時点で
+      // percent-encode(RFC 3986)済みであることが要求される
+      // (bpg/proxmox Terraform provider も同じ方式でエンコードしている)。
+      // ここで encodeURIComponent したものを bodyUrlParams のパラメータ値として
+      // 渡すため、実際の HTTP ボディ上ではさらにもう一段 form/url エンコードが
+      // 掛かる(= 意図的な二重エンコード。PVE 側が受け取って一段 form-decode
+      // した結果、ちょうど percent-encode 済みの sshkeys 文字列になる)。
       configureCloudInit: ({ gateway, ip, sshKeys, vmid }) =>
-        Effect.gen(function* () {
-          const filename = `inucon-${vmid}.yaml`
-          const { body, boundary } = buildSnippetUploadBody(filename, cloudInitSnippet(sshKeys))
-          yield* requestConfig(
-            HttpClientRequest.post(`${apiUrl}/nodes/${NODE}/storage/local/upload`).pipe(
-              HttpClientRequest.bodyUint8Array(body, `multipart/form-data; boundary=${boundary}`)
-            )
+        requestConfig(
+          HttpClientRequest.post(`${nodeUrl}/qemu/${vmid}/config`).pipe(
+            HttpClientRequest.bodyUrlParams({
+              ciuser: CLOUD_INIT_USER,
+              sshkeys: encodeURIComponent(sshKeys.split("\n").map((k) => k.trim()).filter((k) => k !== "").join("\n")),
+              ipconfig0: `gw=${gateway},ip=${ip}/24`,
+              nameserver: "1.1.1.1"
+            })
           )
-          yield* requestConfig(
-            HttpClientRequest.post(`${nodeUrl}/qemu/${vmid}/config`).pipe(
-              HttpClientRequest.bodyUrlParams({
-                cicustom: `user=local:snippets/${filename}`,
-                ipconfig0: `gw=${gateway},ip=${ip}/24`,
-                nameserver: "1.1.1.1"
-              })
-            )
-          )
-        }),
+        ),
 
       setVnet: ({ bridge, vmid }) =>
         requestConfig(
