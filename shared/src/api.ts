@@ -353,12 +353,17 @@ export const instancesGroup = HttpApiGroup.make("instances")
   // URL 構造上の入れ子(GET/POST と同じ /api/teams/:id/instances 配下)の
   // ためだけに存在し、認可判定は instanceId から解決した実際の所属チームで
   // 行う(requestDeleteInstance が内部で解決するため teamId 自体は使わない)。
+  // Task 6 レビュー #4: 対象自身は running/failed でも、同一チームの他の
+  // インスタンスが既に creating/deleting なら ProvisionInProgress(409)。
+  // createTeamInstance と同じ「進行中1本」ガード(スペック §Instance 集約
+  // 不変条件2)を削除経路にも課す(既存の ProvisionInProgress を再利用)。
   .add(
     HttpApiEndpoint.del(
       "deleteTeamInstance"
     )`/api/teams/${HttpApiSchema.param("teamId", TeamId)}/instances/${HttpApiSchema.param("instanceId", InstanceId)}`
       .addSuccess(HttpApiSchema.NoContent)
       .addError(Forbidden)
+      .addError(ProvisionInProgress)
       .addError(InstanceInUse)
       .addError(InvalidInstanceTransition)
       .middleware(Authentication)

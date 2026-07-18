@@ -195,6 +195,29 @@ export const requestCreateInstance = (args: { user: User; teamId: TeamId }) =>
 // beginDeleting で deleting へ遷移させ、実処理(撤収 saga)はワーカーが
 // 引き継ぐ。存在しない instanceId は「他チームのインスタンス」と同じ
 // Forbidden として扱う(cancelBench と同様、ID の存在有無を漏らさない)。
+//
+// ガード順序(Task 6 レビュー #4): authz → 対象自身の状態ガード
+// (InvalidInstanceTransition) → チーム全体の進行中1本ガード
+// (ProvisionInProgress) → bench 使用中ガード(InstanceInUse) →
+// beginDeleting 遷移、の順。authz を最初に置くのは他エンドポイントと同じく
+// 「他チームの情報の有無を漏らさない」ため。対象自身の状態ガードを次に
+// 置くのは、それ自体が creating/deleting/deleted であれば以降のチーム
+// 横断チェックをするまでもなく 409 が確定するため(無駄な listByTeam を
+// 避ける fail-fast)。その後にチーム全体の進行中ガードを置くのは、
+// このガードは「対象以外」の行を見るため対象自身の状態が定まってから
+// でないと自己参照の除外条件が書けないため。bench 使用中ガードは
+// 最後(対象 IP の実利用状況というより局所的な確認)。
+//
+// スペック §Instance 集約 不変条件2(チームにつき進行中の
+// creating/deleting は高々1件)は requestCreateInstance 側では
+// ProvisionInProgress で担保しているが、このセルフサービス削除経路は
+// 対象インスタンス自身の状態しか見ておらず、チームに他の
+// creating/deleting 行があっても素通りしていた(Task 6 レビュー #4)。
+// これだと「一方が作成中/削除中の間にもう一方を削除開始する」といった形で
+// 同一チームに複数の進行中行が生まれてしまうため、create 側と同じ
+// team-wide ガードをここにも課す。failed インスタンスの自己整理
+// (掃除)もこのガードで一時的にブロックされる形になるが、単に
+// 「進行中の1本が片付くまで待つ」だけで実害は無いため許容する。
 export const requestDeleteInstance = (args: { user: User; instanceId: InstanceId }) =>
   Effect.gen(function* () {
     const instances = yield* InstanceRepo
@@ -208,6 +231,14 @@ export const requestDeleteInstance = (args: { user: User; instanceId: InstanceId
       return yield* Effect.fail(
         new InvalidInstanceTransition({ instanceId: instance.id, from: instance.status, to: "deleting" })
       )
+    }
+
+    const teamInstances = yield* instances.listByTeam(instance.teamId)
+    const otherInProgress = teamInstances.some(
+      (x) => x.id !== instance.id && (x.status === "creating" || x.status === "deleting")
+    )
+    if (otherInProgress) {
+      return yield* Effect.fail(new ProvisionInProgress({ teamId: instance.teamId }))
     }
 
     const jobs = yield* BenchJobRepo

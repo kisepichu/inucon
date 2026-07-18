@@ -476,6 +476,52 @@ describe("DELETE /api/teams/:id/instances/:instanceId", () => {
     }).pipe(Effect.provide(TestLayer))
   )
 
+  it.effect("同一チームに他の進行中(creating)がある場合は409(ProvisionInProgress)", () =>
+    Effect.gen(function* () {
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+      const team = new Team({ id: TeamId.make("team-delteaminst-inprogress"), name: "InProgress", teamNumber: 95 })
+      yield* teams.create(team)
+      const target = new Instance({
+        id: InstanceId.make("inst-delteaminst-inprogress-target"),
+        teamId: team.id,
+        index: 1,
+        vmid: 1951,
+        privateIp: "10.100.95.10",
+        status: "running",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      const other = new Instance({
+        id: InstanceId.make("inst-delteaminst-inprogress-other"),
+        teamId: team.id,
+        index: 2,
+        vmid: 1952,
+        privateIp: "10.100.95.11",
+        status: "creating",
+        progress: [],
+        errorMessage: Option.none(),
+        createdAt: 0,
+        updatedAt: 0
+      })
+      yield* instances.create(target)
+      yield* instances.create(other)
+      const { user, cookieHeader } = yield* login({ githubLogin: "delteaminst-inprogress" })
+      yield* teams.setMembers(team.id, [user.id])
+
+      const res = yield* del(cookieHeader, team.id, target.id)
+      expect(res.status).toBe(409)
+      const body = yield* res.json
+      expect(body).toStrictEqual({ _tag: "ProvisionInProgress", teamId: team.id })
+
+      // 進行中ガードで弾かれ、対象は running のまま(deleting に遷移していない)。
+      const listed = yield* instances.listByTeam(team.id)
+      expect(listed.find((i) => i.id === target.id)?.status).toBe("running")
+    }).pipe(Effect.provide(TestLayer))
+  )
+
   it.effect("ベンチ対象中(queued)は409(InstanceInUse)", () =>
     Effect.gen(function* () {
       const teams = yield* TeamRepo

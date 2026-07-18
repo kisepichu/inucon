@@ -87,6 +87,7 @@ export const InstancesLive = HttpApiBuilder.group(api, "instances", (handlers) =
         Effect.asVoid,
         Effect.catchTags({
           Forbidden: () => Effect.fail(new Forbidden()),
+          ProvisionInProgress: (e) => Effect.fail(new ProvisionInProgress({ teamId: e.teamId })),
           InstanceInUse: (e) => Effect.fail(new InstanceInUse({ instanceId: e.instanceId })),
           InvalidInstanceTransition: (e) =>
             Effect.fail(new InvalidInstanceTransition({ instanceId: e.instanceId, from: e.from, to: e.to }))

@@ -44,6 +44,34 @@ active(creating/running)でないもっとも小さい `1..instanceQuota` の空
 理由を表示)。backend の `enqueueBenchJob` で instanceId 指定時に
 `status !== "running"` を拒否する明示エラー(例 `InstanceNotRunning`)を追加。
 
+## #4 self-service 削除がチーム全体の進行中1本ガードを見ていない【バグ(軽)・対応する】
+
+- スペック §Instance 集約 不変条件2(チームにつき進行中の creating/deleting は
+  高々1件)は `requestCreateInstance` 側では `ProvisionInProgress` で担保して
+  いる(`existing` から creating/deleting の有無を見て弾く)。
+- `portal/src/application/usecases/instances.ts` `requestDeleteInstance` は
+  削除対象インスタンス自身の状態(running/failed か)と bench 使用中
+  (`InstanceInUse`)しか見ておらず、同一チームの**他の**インスタンスが
+  creating/deleting でもチェックしていなかった。
+- 到達例: あるチームでインスタンス A が creating 中に、既に running の
+  インスタンス B に対して DELETE を叩くと B が deleting へ遷移し、A(creating)
+  と B(deleting)が同時に進行中になる。同様に片方が deleting 中にもう片方の
+  delete を連打しても複数の deleting 行が生まれ得る。
+
+**対応**: `requestDeleteInstance` に create 側と同じ team-wide ガードを追加。
+authz → 対象自身の状態ガード(`InvalidInstanceTransition`)→ チーム全体の
+進行中1本ガード(`ProvisionInProgress`、対象自身は除外して他の行だけを見る)→
+bench 使用中ガード(`InstanceInUse`)→ `beginDeleting` 遷移、の順で判定する
+(対象自身の状態ガードを先に置くのは、それだけで 409 が確定するケースで
+無駄な `listByTeam` を避けるため)。契約(`shared/src/api.ts`)の
+`deleteTeamInstance` エンドポイントに既存の `ProvisionInProgress`(create 側と
+共用、新規定義はしない)を `.addError` し、ハンドラの `catchTags` にも
+マッピングを追加。
+
+トレードオフ: failed インスタンスの自己整理(掃除目的の削除)も、チームに
+他の進行中行がある間は同様にブロックされる。これは意図的な許容
+(ユーザーは進行中の1本が片付くのを待てばよく、実害は無い)。
+
 ## 今度対応(このスコープ外)
 
 - コンテストが running でない間はインスタンス自体へアクセスできなくする仕組みは
