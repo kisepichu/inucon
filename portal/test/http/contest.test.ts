@@ -18,11 +18,11 @@ describe("GET /api/contest", () => {
     }).pipe(Effect.provide(TestLayer))
   )
 
-  it.effect("cookie なしは401", () =>
+  it.effect("cookie なしでも404(コンテスト未作成、公開エンドポイント)", () =>
     Effect.gen(function* () {
       const client = yield* HttpClient.HttpClient
       const res = yield* client.get("/api/contest")
-      expect(res.status).toBe(401)
+      expect(res.status).toBe(404)
     }).pipe(Effect.provide(TestLayer))
   )
 
