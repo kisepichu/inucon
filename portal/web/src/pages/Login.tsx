@@ -6,7 +6,7 @@ export function Login() {
   return (
     <div className="login-page">
       <h1>INUCON</h1>
-      <p>参加するには GitHub でログインしてください。</p>
+      <p>GitHub でログインすると、参加チームや管理画面の閲覧ができます(参加チームへの割り当ては主催者が行います)。</p>
       <button
         type="button"
         className="btn btn-github"

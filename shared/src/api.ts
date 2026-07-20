@@ -271,12 +271,11 @@ export const authGroup = HttpApiGroup.make("auth")
     HttpApiEndpoint.post("logout", "/api/auth/logout").addSuccess(HttpApiSchema.NoContent)
   )
 
-// GET /api/contest(セッション): 現在のコンテスト。無ければ 404。
+// GET /api/contest(公開): 現在のコンテスト。無ければ 404。
 export const contestGroup = HttpApiGroup.make("contest").add(
   HttpApiEndpoint.get("getContest", "/api/contest")
     .addSuccess(Contest)
     .addError(NotFound)
-    .middleware(Authentication)
 )
 
 export const teamsGroup = HttpApiGroup.make("teams")
@@ -441,12 +440,11 @@ export const benchGroup = HttpApiGroup.make("bench")
       .middleware(Authentication)
   )
 
-// GET /api/scoreboard(セッション): チームごとの最新/ベストスコア一覧
+// GET /api/scoreboard(公開): チームごとの最新/ベストスコア一覧
 // (BenchJobRepo.scoreboard をそのまま返す、Task 8)。
 export const scoreboardGroup = HttpApiGroup.make("scoreboard").add(
   HttpApiEndpoint.get("getScoreboard", "/api/scoreboard")
     .addSuccess(Schema.Array(ScoreboardEntry))
-    .middleware(Authentication)
 )
 
 // ランナー(benchvm 常駐)専用。RunnerAuth(shared token)で認可する。
