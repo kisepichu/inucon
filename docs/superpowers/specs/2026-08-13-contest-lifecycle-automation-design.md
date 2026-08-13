@@ -127,7 +127,8 @@ backend worker が各 step を実行する。
 
 Contest は次を持つ。
 
-- `edition`: 正の整数、一意。第1回は1、第2回は2。
+- `edition`: 正の整数。canceled を除いて一意(部分ユニーク制約)。cancel した開催回は
+  同じ番号で再発行できる。第1回は1、第2回は2。
 - `name`: 表示名。既定は `INUCON #<edition>`。
 - `problemKey`
 - `problemRevision`: 問題ソースの commit SHA または release 識別子。
@@ -138,6 +139,11 @@ Contest は次を持つ。
 - `accessClosesAt`: 外部 SSH を失効させる時刻。既定は scheduledEndAt。
 - `cleanupAt`: 自動 VM 撤収を明示 opt-in した場合だけ設定。既定は null。
 - `startedAt` / `finalizingAt` / `finishedAt` / `canceledAt`
+- `accessClosedAt` / `cleanupCompletedAt`: `revoke_access` / `cleanup` Operation の成功時に
+  同一トランザクションで打刻する。scheduler の due 判定を
+  `accessClosesAt <= now AND accessClosedAt IS NULL`(cleanup も同型)とすることで、
+  成功後に同じ Operation を毎 tick 再投入してグローバルロックを占有し続けるのを防ぐ。
+  第1回は accessClosesAt/cleanupAt とも null なので、両フィールドは null のまま残る。
 - `status`
 - `revision`: plan/apply 間の optimistic concurrency 用。
 
@@ -342,8 +348,10 @@ Cloudflare Tunnel ingress の catch-all と INUCON 以外の hostname は必ず�
 ### 開催一覧
 
 - edition、名前、状態、実開始/終了、チーム数を表示。
-- current/upcoming を先頭にし、finished/canceled をアーカイブとして参照可能にする。
+- current/upcoming を先頭にし、finished をアーカイブとして参照可能にする。canceled は
+  admin 一覧(`?includeCanceled=true`)でのみ参照でき、edition 番号の再発行監査に使う。
 - public 側にも開催回 selector を追加し、各回の contest 情報と scoreboard を表示する。
+  public 側は canceled を含めない(canceled ID の public GET は 404)。
 
 ### 開催詳細
 
@@ -460,7 +468,8 @@ migration だけで deleted に書き換えず、reconciliation operation の監
 ### Domain / repository
 
 - Contest の全正常遷移と不正遷移。
-- active Contest 最大1件、edition unique、schedule ordering。
+- active Contest 最大1件、edition unique(canceled 除く。cancel 後の同一 edition 再発行が
+  通ること)、schedule ordering。
 - 同一 user の開催回別所属と、同一開催回内の重複所属拒否。
 - Team/Instance/BenchJob の contest 不一致拒否。
 - 第1回 fixture を使った migration、行数、score 不変、rollback。
