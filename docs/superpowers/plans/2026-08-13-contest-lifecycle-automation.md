@@ -1233,7 +1233,9 @@ set -euo pipefail
 encrypt_age_rule() {
   local rule=$1 output=$2 recipient
   local -a recipients=() age_args=()
-  mapfile -t recipients < <(
+  while IFS= read -r recipient; do
+    recipients+=("$recipient")
+  done < <(
     nix eval --json --expr 'import ./secrets/secrets.nix' |
       jq -r --arg rule "$rule" '.[$rule].publicKeys[]'
   )
@@ -1364,7 +1366,7 @@ git commit --no-gpg-sign -m "feat(inucon): manage runtime credentials with ageni
 
 - [ ] **Step 1: Write runbooks by block condition**
 
-Document exact recovery for stale plan, ambiguous Cloudflare policy, duplicate DNS, missing VM, shutdown timeout, insufficient RAM, stale runner, backup unavailable, failed cleanup, migration rollback, and credential rotation. Normal flow references Admin Web and does not instruct direct SQL or routine dashboard edits.
+Document exact recovery for stale plan, ambiguous Cloudflare policy, duplicate DNS, missing VM, shutdown timeout, insufficient RAM, stale runner, backup unavailable, failed cleanup, migration rollback, credential rotation, and contest stuck in `finalizing` because a `blocked` Operation retains the global lock (recovery: cancel the blocking Operation so the scheduler enqueues the `finish` Operation on its next tick). Normal flow references Admin Web and does not instruct direct SQL or routine dashboard edits.
 
 - [ ] **Step 2: Run full local verification**
 
