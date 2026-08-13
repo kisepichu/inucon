@@ -174,7 +174,7 @@ Expected: FAIL on missing Contest fields/transitions and missing `0004_contest_l
 
 - [ ] **Step 3: Implement the forward-only Contest table rebuild**
 
-Rebuild only `contests` into the full Task1 shape with checked statuses, unique positive edition among non-canceled contests (partial unique index `WHERE status != 'canceled'` so that a canceled draft/preparing never permanently consumes an edition number), positive revision/template/quota, nullable `accessClosedAt`/`cleanupCompletedAt` (set by the successful `revoke_access` / `cleanup` Operations so scheduler `due` predicates are `accessClosesAt <= now AND accessClosedAt IS NULL` and `cleanupAt <= now AND cleanupCompletedAt IS NULL`; see Task12), and the partial single-operational index. Backfill the single legacy row exactly as edition1/template9100/`legacy-2026-07-08`; preserve its old status and nullable schedule; leave `accessClosedAt`/`cleanupCompletedAt` null (the reconciliation Operation records them later if it observes the legacy resources are already gone). Zero rows produce the empty new table. Count rows and run `PRAGMA foreign_key_check` before commit; more than one row or a mismatch throws a self-contained `MigrationDataError`.
+Rebuild only `contests` into the full Task1 shape with checked statuses, unique positive edition among non-canceled contests (partial unique index `WHERE status != 'canceled'` so that a canceled draft/preparing never permanently consumes an edition number), positive revision/template/quota, nullable `accessClosedAt`/`cleanupCompletedAt` (set by the successful `revoke_access` / `cleanup` Operations so scheduler `due` predicates are `accessClosesAt <= now AND accessClosedAt IS NULL` and `cleanupAt <= now AND cleanupCompletedAt IS NULL`; see Task12), and the partial single-operational index. Backfill the single legacy row exactly as edition1/template9100/`legacy-2026-07-08`; preserve its old status and nullable schedule. Because edition1's `accessClosesAt`/`cleanupAt` are null (they were never scheduled in Phase-2), the scheduler due predicates above trivially exclude it and no back-fill of `accessClosedAt`/`cleanupCompletedAt` is required — the legacy row stays null on both closed timestamps forever, and the first reconciliation (Task15 Step9-10) handles the historical Cloudflare/Proxmox residues without touching those fields. Zero rows produce the empty new table. Count rows and run `PRAGMA foreign_key_check` before commit; more than one row or a mismatch throws a self-contained `MigrationDataError`.
 
 - [ ] **Step 4: Implement lifecycle, schedule validation, and revision increment**
 
@@ -429,11 +429,11 @@ git commit --no-gpg-sign -m "feat(portal): scope repositories by contest"
 - Produces public endpoints:
 
 ```text
-GET /api/contests
-GET /api/contests/:contestId
+GET /api/contests                    # public, excludes status='canceled'
+GET /api/contests/:contestId         # public, 404 for canceled ID (audit path only via admin)
 GET /api/contests/:contestId/scoreboard
-GET /api/contest       # compatibility: ContestRepo.getDisplay
-GET /api/scoreboard    # compatibility: getDisplay then contest-scoped scoreboard
+GET /api/contest                     # compatibility: ContestRepo.getDisplay
+GET /api/scoreboard                  # compatibility: getDisplay then contest-scoped scoreboard
 ```
 
 `GET /api/contests` returns public metadata only and never Team member email, operation, or DB artifact information.
@@ -527,7 +527,7 @@ beginContestPreparation(contestId: ContestId, expectedRevision: number, actorUse
 cancelContest(contestId: ContestId, expectedRevision: number, actorUserId: UserId): Effect<Contest, ContestAdminError>
 ```
 
-Admin endpoints use the `/api/admin/contests/:contestId` prefix for update, roster copy, begin-preparation, and cancel actions; existing non-ID team admin routes become compatibility wrappers around the operational draft/preparing Contest and are removed from the Web client.
+Admin endpoints use the `/api/admin/contests/:contestId` prefix for update, roster copy, begin-preparation, and cancel actions; a parallel `GET /api/admin/contests?includeCanceled=true` returns every Contest including canceled rows (for audit / re-issue workflows the public `/api/contests` hides), and `GET /api/admin/contests/:contestId` returns canceled contests that public GET refuses. Existing non-ID team admin routes become compatibility wrappers around the operational draft/preparing Contest and are removed from the Web client.
 
 - [ ] **Step 1: Write failing draft, revision, roster-copy, and transition tests**
 
@@ -1266,14 +1266,24 @@ require_keys() {
   '
 }
 
-# encrypt_age_rule streams stdin directly to `age`, writing to
-# `${output}.tmp` first and atomic-renaming into place only on age success.
-# `set -o pipefail` propagates failures from producers or `require_keys`;
-# combined with the tmp-then-mv pattern, an incomplete ciphertext file is
-# never left in `secrets/` even if the pipeline is interrupted mid-write.
-# No plaintext ever hits disk here.
-encrypt_age_rule() {
+# seal_secret runs the payload pipeline `require_keys ... | age -o .tmp`
+# inside an `if` conditional so the pipeline's aggregate exit status
+# (with `set -o pipefail` in effect) actually gates the rename. This is
+# the essential difference from an earlier draft that placed `age` and
+# `mv` on consecutive statements of a single function: pipeline stages
+# run in parallel, so a failing upstream `require_keys` does NOT stop
+# `age` from receiving EOF-on-empty-stdin and exiting 0, and the
+# following `mv` therefore promotes an empty ciphertext into `secrets/`
+# even though `set -o pipefail` sets the shell's `$?` to non-zero.
+# `if <pipeline>; then mv; else rm -f; fi` observes the pipeline's
+# combined status BEFORE either mv or rm runs, and `set -e` is
+# specifically suppressed inside `if` conditions, so `require_keys`
+# failure lands in the `else` arm and `.tmp` is removed. No plaintext
+# ever hits disk.
+seal_secret() {
+  # seal_secret <rule> <output> <required-key>...   (payload is on stdin)
   local rule=$1 output=$2 recipient
+  shift 2
   local -a recipients=() age_args=()
   while IFS= read -r recipient; do
     recipients+=("$recipient")
@@ -1285,8 +1295,12 @@ encrypt_age_rule() {
   for recipient in "${recipients[@]}"; do
     age_args+=(-r "$recipient")
   done
-  age -a "${age_args[@]}" -o "${output}.tmp"
-  mv "${output}.tmp" "$output"
+  if require_keys "$@" | age -a "${age_args[@]}" -o "${output}.tmp"; then
+    mv "${output}.tmp" "$output"
+  else
+    rm -f "${output}.tmp"
+    return 1
+  fi
 }
 
 {
@@ -1302,13 +1316,13 @@ encrypt_age_rule() {
     '
   printf 'RUNNER_MAX_AGE_MILLIS=15000\n'
 } \
-  | require_keys GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET ADMIN_GITHUB_LOGINS RUNNER_TOKEN BASE_URL \
-                 PROXMOX_API_URL PROXMOX_TLS_FINGERPRINT CF_API_TOKEN CF_ACCOUNT_ID CF_ZONE_ID \
-                 CF_TUNNEL_ID RUNNER_MAX_AGE_MILLIS \
-  | encrypt_age_rule inucon-portal-env.age secrets/inucon-portal-env.age
+  | seal_secret inucon-portal-env.age secrets/inucon-portal-env.age \
+                GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET ADMIN_GITHUB_LOGINS RUNNER_TOKEN BASE_URL \
+                PROXMOX_API_URL PROXMOX_TLS_FINGERPRINT CF_API_TOKEN CF_ACCOUNT_ID CF_ZONE_ID \
+                CF_TUNNEL_ID RUNNER_MAX_AGE_MILLIS
 ```
 
-Do not use `set -x`, command substitution containing decoded values, terminal printing, or any plaintext tempfile (the earlier draft of this step buffered the payload with `mktemp` + `shred -u`, but that keeps decoded secrets on disk between the write and the shred and offers no guarantee on journaling / CoW filesystems). On any pipeline failure, `require_keys` withholds the payload and `set -o pipefail` aborts before `age` writes, so no `.tmp` file remains; if a `.tmp` from an earlier crash is present, delete only that exact stray file and retry from the live Secret.
+Do not use `set -x`, command substitution containing decoded values, terminal printing, or any plaintext tempfile (the earlier draft of this step buffered the payload with `mktemp` + `shred -u`, but that keeps decoded secrets on disk between the write and the shred and offers no guarantee on journaling / CoW filesystems). `seal_secret` writes `age` output to `${output}.tmp`, and — because pipeline stages run in parallel and `set -o pipefail` only reports aggregate status after every stage has already exited — the `mv` into `secrets/` is gated by an `if <require_keys | age>; then mv; else rm -f; fi` conditional so that a failing `require_keys` (missing/empty KEY) leaves `age` reading EOF from an empty stdin, produces a valid-looking but empty `.tmp`, and the `else` arm removes it before it can be committed. `set -e` is suppressed inside the `if` condition so this branch actually runs. On any pipeline failure `secrets/` remains unchanged; if a `.tmp` from an earlier hard crash (not a pipeline failure) is present, delete only that exact stray file and retry from the live Secret.
 
 - [ ] **Step 5: Implement a plan-first Proxmox credential bootstrap and stop before apply**
 
@@ -1341,8 +1355,8 @@ set -euo pipefail
   printf '\nBENCH_DIR=/home/kise/private-isu/benchmarker\n'
   printf 'RUNNER_ID=benchvm\n'
 } \
-  | require_keys PORTAL_URL RUNNER_TOKEN BENCH_DIR RUNNER_ID \
-  | encrypt_age_rule runner-env.age secrets/runner-env.age
+  | seal_secret runner-env.age secrets/runner-env.age \
+                PORTAL_URL RUNNER_TOKEN BENCH_DIR RUNNER_ID
 
 ssh -o BatchMode=yes apphost.kisen.one \
   "kubectl -n inucon exec deploy/inucon-portal -- node -e '
@@ -1359,11 +1373,10 @@ ssh -o BatchMode=yes apphost.kisen.one \
       })
       .catch(() => { process.exitCode = 1; });
   '" \
-  | require_keys TUNNEL_TOKEN \
-  | encrypt_age_rule inucon-tunnel-token.age secrets/inucon-tunnel-token.age
+  | seal_secret inucon-tunnel-token.age secrets/inucon-tunnel-token.age TUNNEL_TOKEN
 ```
 
-The outer `set -euo pipefail`, `require_keys`'s stdin gate (which withholds the payload entirely when a required KEY is missing or empty), and the tmp-then-mv in `encrypt_age_rule` together guarantee that a partial upstream fetch (empty `ssh`/`kubectl` output, node fetch error, missing `RUNNER_TOKEN` in the Secret) fails before any ciphertext lands in `secrets/`. Without this, the `printf 'RUNNER_TOKEN='` prefix would make the payload non-empty when the base64-decoded body is empty and `age` would happily encrypt `RUNNER_TOKEN=` alone, producing a syntactically valid ciphertext that hides the failure until Task15 Step7 fails to start benchvm services.
+The outer `set -euo pipefail` sets the shell's aggregate exit status, but pipeline stages run in parallel — `age` on the sink side of `require_keys | age` receives EOF-on-empty-stdin when `require_keys` withholds the payload and would otherwise happily write a valid-looking empty ciphertext, followed by an unconditional `mv` that promotes that empty file into `secrets/`. `seal_secret` avoids this by wrapping `require_keys | age -o .tmp` in an `if` conditional so the pipeline's aggregate status gates the rename: `require_keys` failure lands in the `else` arm and `rm -f "${output}.tmp"` removes the empty draft, and `set -e` is specifically suppressed inside `if` conditions so the branch actually executes. This closes the "empty but structurally-valid ciphertext lands in `secrets/`" hole for a partial upstream fetch (empty `ssh`/`kubectl` output, node fetch error, missing `RUNNER_TOKEN` in the Secret). The complementary case where `age` itself fails is already covered by `set -e` propagating to the `then` arm skip. Without this, the `printf 'RUNNER_TOKEN='` prefix would keep the payload non-empty on empty-base64 input and `age` would encrypt just `RUNNER_TOKEN=`, producing a ciphertext that only fails Task15 Step7 (benchvm service start).
 
 The connector response is never printed. Decoded token values flow only through pipes into age.
 
