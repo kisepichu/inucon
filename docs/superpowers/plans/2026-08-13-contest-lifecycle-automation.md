@@ -126,6 +126,8 @@ export class Contest extends Schema.Class<Contest>("Contest")({
   scheduledEndAt: Schema.OptionFromNullOr(Schema.Int),
   accessClosesAt: Schema.OptionFromNullOr(Schema.Int),
   cleanupAt: Schema.OptionFromNullOr(Schema.Int),
+  accessClosedAt: Schema.OptionFromNullOr(Schema.Int),
+  cleanupCompletedAt: Schema.OptionFromNullOr(Schema.Int),
   startedAt: Schema.OptionFromNullOr(Schema.Int),
   finalizingAt: Schema.OptionFromNullOr(Schema.Int),
   finishedAt: Schema.OptionFromNullOr(Schema.Int),
@@ -162,7 +164,7 @@ it("running -> finalizing -> finished records actual timestamps", () => {
 
 ```
 
-In `migration0004.test.ts`, build a 0001-0003 legacy database with one finished Contest and assert the migration preserves ID/name/problem/status/quota while adding edition1, template9100, `legacy-2026-07-08`, null schedules/timestamps, and revision1. Also cover a fresh zero-Contest database and rejection of more than one legacy Contest.
+In `migration0004.test.ts`, build a 0001-0003 legacy database with one finished Contest and assert the migration preserves ID/name/problem/status/quota while adding edition1, template9100, `legacy-2026-07-08`, null schedules/timestamps (including null `accessClosedAt`/`cleanupCompletedAt`), and revision1. Also cover a fresh zero-Contest database and rejection of more than one legacy Contest.
 
 - [ ] **Step 2: Run the focused tests and verify the new fields/migration are absent**
 
@@ -172,7 +174,7 @@ Expected: FAIL on missing Contest fields/transitions and missing `0004_contest_l
 
 - [ ] **Step 3: Implement the forward-only Contest table rebuild**
 
-Rebuild only `contests` into the full Task1 shape with checked statuses, unique positive edition among non-canceled contests (partial unique index `WHERE status != 'canceled'` so that a canceled draft/preparing never permanently consumes an edition number), positive revision/template/quota, and the partial single-operational index. Backfill the single legacy row exactly as edition1/template9100/`legacy-2026-07-08`; preserve its old status and nullable schedule. Zero rows produce the empty new table. Count rows and run `PRAGMA foreign_key_check` before commit; more than one row or a mismatch throws a self-contained `MigrationDataError`.
+Rebuild only `contests` into the full Task1 shape with checked statuses, unique positive edition among non-canceled contests (partial unique index `WHERE status != 'canceled'` so that a canceled draft/preparing never permanently consumes an edition number), positive revision/template/quota, nullable `accessClosedAt`/`cleanupCompletedAt` (set by the successful `revoke_access` / `cleanup` Operations so scheduler `due` predicates are `accessClosesAt <= now AND accessClosedAt IS NULL` and `cleanupAt <= now AND cleanupCompletedAt IS NULL`; see Task12), and the partial single-operational index. Backfill the single legacy row exactly as edition1/template9100/`legacy-2026-07-08`; preserve its old status and nullable schedule; leave `accessClosedAt`/`cleanupCompletedAt` null (the reconciliation Operation records them later if it observes the legacy resources are already gone). Zero rows produce the empty new table. Count rows and run `PRAGMA foreign_key_check` before commit; more than one row or a mismatch throws a self-contained `MigrationDataError`.
 
 - [ ] **Step 4: Implement lifecycle, schedule validation, and revision increment**
 
@@ -258,7 +260,7 @@ Expected: FAIL because `0005_multi_contest.ts` does not exist.
 
 - [ ] **Step 3: Implement table rebuild in dependency-safe order**
 
-Keep the Task1 `contests` table unchanged. Create `teams_new` and every scoped child `*_new` table first with composite `(team_id, contest_id)` foreign keys into `teams_new(id, contest_id)`. If there is one legacy Contest, copy all rows with `contest_id` obtained through their Team. If there are zero contests, require every scoped legacy table to be empty and build an empty new schema. Verify source/destination counts before dropping anything. Drop old child tables in this order: `bench_job_logs`, `team_members`, `team_invites`, `instances`, `bench_jobs`, then `teams`; rename `teams_new` before its child tables and recreate indexes. Throw `MigrationDataError` on a zero-contest database containing scoped rows, more than one legacy Contest, count mismatch, orphan relation, or `PRAGMA foreign_key_check` output.
+Keep the Task1 `contests` table unchanged. Create `teams_new` and every scoped child `*_new` table first with composite `(team_id, contest_id)` foreign keys into `teams_new(id, contest_id)`. If there is one legacy Contest, copy all rows with `contest_id` obtained through their Team. If there are zero contests, require every scoped legacy table to be empty and build an empty new schema. Before creating `idx_instances_vmid_active`, run a data pre-check `SELECT vmid, COUNT(*) FROM instances_new WHERE status != 'deleted' GROUP BY vmid HAVING COUNT(*) > 1` and, if any row is returned, throw a self-contained `MigrationDataError` listing the offending vmid(s) — the same pattern the migration 0003 review (#G) used for scoped slot duplicates. Otherwise a live duplicate would fire `SQLITE_CONSTRAINT` mid-index-creation and roll back the entire migration, leaving the pod unable to boot; the pre-check produces an actionable error before any DDL runs. Verify source/destination counts before dropping anything. Drop old child tables in this order: `bench_job_logs`, `team_members`, `team_invites`, `instances`, `bench_jobs`, then `teams`; rename `teams_new` before its child tables and recreate indexes. Throw `MigrationDataError` on a zero-contest database containing scoped rows, more than one legacy Contest, count mismatch, orphan child rows, or the duplicate-vmid case above.
 
 ```ts
 const [{ legacyContestCount }] = yield* sql<{ legacyContestCount: number }>`SELECT COUNT(*) AS legacyContestCount FROM contests`
@@ -382,7 +384,7 @@ Expected: FAIL until every repository and in-memory implementation accepts Conte
 
 - [ ] **Step 3: Implement ContestRepo selection and optimistic writes**
 
-`getDisplay` orders running/finalizing first, then the latest finished contest by edition, and only falls back to preparing when neither running/finalizing nor any finished contest exists. This keeps the public `/api/scoreboard` and `/api/contest` on the last stable result while a subsequent edition is being prepared for several days, instead of flipping to an empty preparing scoreboard the moment `beginPreparation` succeeds. `getOperational` sees only preparing/running/finalizing.
+`getDisplay` orders running/finalizing first, then the latest finished contest by edition (tie-breaking by `finishedAt DESC` when two contests share the same edition number, which is possible after Task2's partial unique index lets a canceled edition be re-issued and later finished), and only falls back to preparing when neither running/finalizing nor any finished contest exists. This keeps the public `/api/scoreboard` and `/api/contest` on the last stable result while a subsequent edition is being prepared for several days, instead of flipping to an empty preparing scoreboard the moment `beginPreparation` succeeds. `getOperational` sees only preparing/running/finalizing. The public listing `/api/contests` excludes `canceled` by default (they are internal-only archive rows for edition-number bookkeeping); an AdminOnly variant returns them for audit.
 
 - [ ] **Step 4: Scope Team/Invite/Instance/BenchJob SQL atomically**
 
@@ -390,7 +392,7 @@ Update compound INSERT/UPDATE guards so contest ID is part of every membership, 
 
 - [ ] **Step 5: Consume all compatible pending invitations on login**
 
-`auth.ts` obtains `InviteRepo.listByGithubLoginForLiveContests` (SQL join restricts to `contests.status IN ('draft', 'preparing', 'running')`; finished and canceled contests are read-only archives and their leftover invites are ignored — Task5 also deletes them on cancel), adds the user to each invite's contest-scoped Team, then deletes only the consumed `(contestId, githubLogin)` row. Reject invitation creation elsewhere if the login already has a different global Access email; do not silently remap identity email. Add regression tests asserting a pending invite for a canceled or finished contest is never consumed on login (this closes the "aged invite rewrites an archived roster" hole; today `pending invite = 0`, so no existing data is at risk).
+`auth.ts` obtains `InviteRepo.listByGithubLoginForLiveContests` (SQL join restricts to `contests.status IN ('draft', 'preparing', 'running', 'finalizing')` — finalizing is included so a first-login during the finalize-drain window still joins the team roster for the archive; finished and canceled contests are read-only archives and their leftover invites are ignored), adds the user to each invite's contest-scoped Team, then deletes only the consumed `(contestId, githubLogin)` row. Reject invitation creation elsewhere if the login already has a different global Access email; do not silently remap identity email. Task5's `cancel` and Task11's `finish_contest` step both delete every remaining `team_invites` row for that Contest in the same transaction that flips status, so no aged invite can ever be consumed against an archive. Add regression tests asserting a pending invite for a canceled or finished contest is never consumed on login (this closes the "aged invite rewrites an archived roster" hole; today `pending invite = 0`, so no existing data is at risk).
 
 - [ ] **Step 6: Run repository, auth, provisioning and bench tests**
 
@@ -543,7 +545,7 @@ Use one transaction-owning repository method for copy so partial Teams/members c
 
 - [ ] **Step 4: Implement the 5-step wizard**
 
-The steps are Metadata, Schedule, Teams and members, Capacity, Review. Persist only on final submission. Default edition is `max(edition)+1`; default quota is3; no default actual dates. When the operator enters scheduledEndAt and leaves access close unchanged, set accessClosesAt to that same instant; cleanupAt remains null unless explicitly enabled. The review screen shows computed duration and desired total VM count.
+The steps are Metadata, Schedule, Teams and members, Capacity, Review. Persist only on final submission. Default edition is `max(edition WHERE status != 'canceled') + 1` (canceled rows exist only for internal bookkeeping and must not push the default forward; matches the partial unique index in Task2 so re-issuing a canceled edition N produces the same default N, not N+1); default quota is3; no default actual dates. When the operator enters scheduledEndAt and leaves access close unchanged, set accessClosesAt to that same instant; cleanupAt remains null unless explicitly enabled. The review screen shows computed duration and desired total VM count.
 
 - [ ] **Step 5: Add Web component test support and wizard tests**
 
@@ -799,7 +801,7 @@ Split the client configuration into `PROXMOX_PROVISION_TOKEN_ID`/`PROXMOX_PROVIS
 
 - [ ] **Step 4: Implement readiness aggregation**
 
-Readiness never mutates Contest or provider state; the backup adapter may create, fsync, and immediately remove a server-generated zero-byte canary beneath its own root. It returns stable keys such as `portal_db`, `previous_cleanup`, `template`, `team_slots`, `isolation`, `memory`, `capacity_estimate`, `benchvm`, `cloudflare_token`, `cloudflare_inventory`, `cloudflare_write_proven`, `runner`, `backup`, `rehearsal`. `previous_cleanup` is defined as "for every Contest whose status is `finished` or `canceled`, count of Instance rows with `status != 'deleted'` equals 0"; this exactly matches the predicate of `idx_instances_vmid_active` and ensures a new edition never enters preparing while a prior edition still holds any vmid slot (running, creating, deleting, or failed). Every readiness key that quotes a raw memory value uses the same source as the existing `ProxmoxPort` inventory (Proxmox `/nodes/{node}/status`'s `memory.free`, which excludes reclaimable page cache and is therefore strictly more conservative than the Linux `/proc/meminfo` `MemAvailable`); spec and readiness copy that name so the 1 GiB reserve is compared against the same field the adapter reads. `CloudflarePort.probe` calls token verify and read inventories but does not grant the token API-Tokens-Read merely to introspect its own scopes; least-privilege permission issuance/rotation remains in the recovery runbook, while successful exact route/app convergence in Task 9 records `cloudflare_write_proven`. `capacity_estimate` warns when dedicated VM RAM sum plus host reserve exceeds physical memory but does not block preparation on its own.
+Readiness never mutates Contest or provider state; the backup adapter may create, fsync, and immediately remove a server-generated zero-byte canary beneath its own root. It returns stable keys such as `portal_db`, `previous_cleanup`, `template`, `team_slots`, `isolation`, `memory`, `capacity_estimate`, `benchvm`, `cloudflare_token`, `cloudflare_inventory`, `cloudflare_write_proven`, `runner`, `backup`, `rehearsal`. `previous_cleanup` is defined as "for every Contest whose status is `finished` or `canceled`, count of Instance rows with `status != 'deleted'` equals 0"; this exactly matches the predicate of `idx_instances_vmid_active` and ensures a new edition never enters preparing while a prior edition still holds any vmid slot (running, creating, deleting, or failed). Every readiness key that quotes a raw memory value uses the same source as the existing `ProxmoxPort` inventory (Proxmox `/nodes/{node}/status`'s `memory.free`, which excludes reclaimable page cache and is therefore strictly more conservative than the Linux `/proc/meminfo` `MemAvailable`); spec and readiness copy that name so the 1 GiB reserve is compared against the same field the adapter reads. `CloudflarePort.probe` calls token verify and read inventories but does not grant the token API-Tokens-Read merely to introspect its own scopes; least-privilege permission issuance/rotation remains in the recovery runbook, while successful exact route/app convergence in Task 9 records `cloudflare_write_proven`. `capacity_estimate` warns when dedicated totals exceed the pre-switch estimate; per-instance observed memory remains authoritative. Checks not implemented until later tasks return warn rather than pass; start requires explicit pass for all required keys except `capacity_estimate`, because start occurs only after all desired Instances are already running. Upgrade `beginContestPreparation` so its final pre-save check requires `previous_cleanup=pass`, no unfinished Operation, and no creating/deleting Instance; draft creation/editing remains available while cleanup is incomplete.
 
 - [ ] **Step 5: Implement enter-contest-mode steps**
 
@@ -1025,7 +1027,7 @@ Expected: FAIL before finalizer, scheduler, snapshot method/CLI, and endpoints e
 
 - [ ] **Step 4: Implement finalization steps**
 
-The scheduler/manual request first performs a revision-guarded `running -> finalizing` transition even when another global Operation currently owns the lock, so new competition enqueue stops at the deadline. It then keeps attempting to enqueue exactly one finish Operation after the lock is released. Its steps are `cancel_queued`, `wait_running`, `write_scoreboard_json`, `write_scoreboard_csv`, `write_db_snapshot`, `finish_contest`. `wait_running` returns retry until count zero; existing timeout sweeper remains authoritative for stuck jobs. A separate `backup` Operation for an already-finished Contest runs only the three idempotent artifact steps and supports edition1 closeout.
+The scheduler/manual request first performs a revision-guarded `running -> finalizing` transition even when another global Operation currently owns the lock, so new competition enqueue stops at the deadline. It then keeps attempting to enqueue exactly one finish Operation after the lock is released. Its steps are `cancel_queued`, `wait_running`, `write_scoreboard_json`, `write_scoreboard_csv`, `write_db_snapshot`, `finish_contest`. `wait_running` returns retry until count zero; existing timeout sweeper remains authoritative for stuck jobs. The `finish_contest` step, in the same transaction that flips Contest status to `finished` and sets `finishedAt`, also deletes every remaining `team_invites` row for that Contest so no pending invite can later be consumed against an archived roster (matches Task5's cancel path). A separate `backup` Operation for an already-finished Contest runs only the three idempotent artifact steps and supports edition1 closeout.
 
 - [ ] **Step 5: Implement secure backup and artifact download**
 
@@ -1076,7 +1078,7 @@ returnNormalMode(contestId: ContestId, actorUserId: UserId): Effect<Operation, C
 
 - [ ] **Step 1: Write failing access-close and cleanup tests**
 
-Assert accessClosesAt scheduling, idempotent route/app removal, VM cleanup one at a time, partial cleanup continues to the next independent resource, final reconciliation requirement, benchvm shutdown only after zero managed VMs, and devvm start only after memory guard. Add a "revoke_access due while finish holds the global lock" case: with the default `accessClosesAt == scheduledEndAt`, at the deadline the scheduler wants to enqueue `revoke_access` at exactly the instant the `finish` Operation is holding the global operation lock in `wait_running`. Assert the scheduler enqueues at most one `revoke_access` Operation per Contest across ticks (per-`(contest_id, kind='revoke_access')` uniqueness + pending / running lock check), keeps re-attempting each tick until the lock releases, and never double-issues after a partially-failed enqueue. Also assert the reverse: if `finish` becomes `blocked`/`failed` and retains the lock beyond `accessClosesAt`, `revoke_access` stays pending in the scheduler queue rather than being dropped, and enqueues cleanly once the operator cancels or retries the blocking Operation.
+Assert accessClosesAt scheduling, idempotent route/app removal, VM cleanup one at a time, partial cleanup continues to the next independent resource, final reconciliation requirement, benchvm shutdown only after zero managed VMs, and devvm start only after memory guard. Add a "revoke_access due while finish holds the global lock" case: with the default `accessClosesAt == scheduledEndAt`, at the deadline the scheduler wants to enqueue `revoke_access` at exactly the instant the `finish` Operation is holding the global operation lock in `wait_running`. Assert the scheduler enqueues at most one `revoke_access` Operation per Contest across ticks (per-`(contest_id, kind='revoke_access')` uniqueness + pending / running lock check), keeps re-attempting each tick until the lock releases, and never double-issues after a partially-failed enqueue. Also assert `revoke_access` is not re-enqueued once it succeeds: after the successful Operation sets `contests.accessClosedAt`, subsequent scheduler ticks find `accessClosesAt <= now AND accessClosedAt IS NULL` false and skip the Contest entirely (this is the reason for the new closed-timestamp field in Task1 — a NOT EXISTS guard that includes only `queued/running/blocked/failed` would let every tick re-enqueue after `succeeded`, permanently starving `cleanup` and `backup` of the global operation lock). The parallel `cleanupCompletedAt` case applies to opt-in scheduled cleanup. Also assert the reverse: if `finish` becomes `blocked`/`failed` and retains the lock beyond `accessClosesAt`, `revoke_access` stays pending in the scheduler queue rather than being dropped, and enqueues cleanly once the operator cancels or retries the blocking Operation.
 
 - [ ] **Step 2: Run focused tests and verify missing orchestration**
 
@@ -1086,11 +1088,11 @@ Expected: FAIL on missing cleanup operations.
 
 - [ ] **Step 3: Implement scheduled access close**
 
-Scheduler enqueues `revoke_access` when `accessClosesAt` is due, independent of Contest already being finished, using an at-most-once-per-Contest guard: an insertion condition `WHERE NOT EXISTS (SELECT 1 FROM operations WHERE contest_id=? AND kind='revoke_access' AND status IN ('queued','running','blocked','failed'))` prevents the scheduler from enqueuing a second copy while the first is unfinished, and the scheduler simply retries on subsequent ticks while the global operation lock is held by another Operation (typically `finish`, since default `accessClosesAt == scheduledEndAt` — see spec §6). `revoke_access` is a **separate Operation from `finish`** (not one of finish's steps `cancel_queued|wait_running|write_*|finish_contest`) because access closure and finalization have independent due times when the operator overrides `accessClosesAt`; a successful `revoke_access` records terminal `ResourceBinding` absence for the Access app/policy and does not delete VMs (VM lifecycle stays in the separate `cleanup` Operation). The scheduler's `revoke_access` and `finish` handlers both use the shared `sanitizeOperationError` allowlist and never log the Access email set.
+Scheduler enqueues `revoke_access` when `accessClosesAt <= now AND accessClosedAt IS NULL`, independent of Contest already being finished, using an at-most-once-per-Contest guard: the due predicate itself (`accessClosedAt IS NULL`) blocks re-enqueue after success, and a defensive insertion condition `WHERE NOT EXISTS (SELECT 1 FROM operations WHERE contest_id=? AND kind='revoke_access' AND status IN ('queued','running','blocked','failed'))` covers concurrent scheduler ticks while the first attempt is still in flight. The scheduler simply retries on subsequent ticks while the global operation lock is held by another Operation (typically `finish`, since default `accessClosesAt == scheduledEndAt` — see spec §6). `revoke_access` is a **separate Operation from `finish`** (not one of finish's steps `cancel_queued|wait_running|write_*|finish_contest`) because access closure and finalization have independent due times when the operator overrides `accessClosesAt`; a successful `revoke_access` records terminal `ResourceBinding` absence for the Access app/policy, sets `contests.accessClosedAt = now` in the same transaction so the scheduler stops considering the Contest due, and does not delete VMs (VM lifecycle stays in the separate `cleanup` Operation). The scheduler's `revoke_access` and `finish` handlers both use the shared `sanitizeOperationError` allowlist and never log the Access email set.
 
 - [ ] **Step 4: Implement explicit and opt-in scheduled cleanup**
 
-Default cleanupAt is null. Explicit admin apply or non-null due cleanupAt creates one cleanup Operation. Each retry observes Instance/provider state. Generate deterministic per-hostname resource steps with `continueOnError=true`; a failed resource is sanitized/summarized and remaining independent hostnames continue. The Operation ends failed after all runnable cleanup steps until reconciliation is clean and the operator retries only failed/incomplete steps.
+Default cleanupAt is null. Explicit admin apply, or a non-null `cleanupAt <= now AND cleanupCompletedAt IS NULL`, creates one cleanup Operation using the same due-predicate + `NOT EXISTS` guard as `revoke_access` so the scheduler does not re-enqueue after success and does not double-issue while an attempt is in flight. Each retry observes Instance/provider state. Generate deterministic per-hostname resource steps with `continueOnError=true`; a failed resource is sanitized/summarized and remaining independent hostnames continue. On a successful cleanup that leaves reconciliation clean, the final step sets `contests.cleanupCompletedAt = now` in the same transaction that flips the last binding to terminal absence. The Operation ends failed after all runnable cleanup steps until reconciliation is clean and the operator retries only failed/incomplete steps.
 
 - [ ] **Step 5: Implement normal-mode return**
 
@@ -1238,33 +1240,41 @@ Use recipient public keys from `secrets.nix`. Run from the sibling repository ro
 
 ```bash
 set -euo pipefail
+
+# require_keys reads stdin, verifies every named KEY appears as a non-empty
+# `KEY=...` line, and — only when all checks pass — re-emits the buffered
+# lines on stdout. On failure it writes only the offending KEY names to
+# stderr and exits non-zero WITHOUT emitting any payload, so the downstream
+# `age` process receives empty stdin (and the outer `set -o pipefail` then
+# aborts the whole pipeline before `age` writes the ciphertext file).
+# This keeps every decoded secret in-process only: nothing is written to
+# disk, unlike a tempfile-based buffer which is unrecoverable on journaling
+# / CoW filesystems even with `shred -u`.
+require_keys() {
+  awk -v keys="$*" '
+    { lines[NR] = $0 }
+    END {
+      n = split(keys, want, " ")
+      for (i = 1; i <= n; i++) {
+        found = 0
+        for (j = 1; j <= NR; j++)
+          if (index(lines[j], want[i] "=") == 1 && length(lines[j]) > length(want[i]) + 1) { found = 1; break }
+        if (!found) { printf "require_keys: missing or empty %s\n", want[i] > "/dev/stderr"; exit 1 }
+      }
+      for (j = 1; j <= NR; j++) print lines[j]
+    }
+  '
+}
+
+# encrypt_age_rule streams stdin directly to `age`, writing to
+# `${output}.tmp` first and atomic-renaming into place only on age success.
+# `set -o pipefail` propagates failures from producers or `require_keys`;
+# combined with the tmp-then-mv pattern, an incomplete ciphertext file is
+# never left in `secrets/` even if the pipeline is interrupted mid-write.
+# No plaintext ever hits disk here.
 encrypt_age_rule() {
   local rule=$1 output=$2 recipient
   local -a recipients=() age_args=()
-  local stdin_tmp
-  stdin_tmp=$(mktemp) || return 1
-  # Streamed stdin can be silently empty when an upstream ssh/kubectl/node fetch
-  # fails without honoring pipefail (Step 6 assembles multiple sources in one
-  # pipeline). Buffer to a tempfile so we can reject empty / obviously
-  # incomplete payloads before invoking age; age itself accepts zero-byte
-  # stdin and produces a valid-looking ciphertext that hides the failure until
-  # Task 15 Step 7 fails to start benchvm services.
-  trap 'shred -u "$stdin_tmp" 2>/dev/null || rm -f "$stdin_tmp"' RETURN
-  cat > "$stdin_tmp"
-  if [ ! -s "$stdin_tmp" ]; then
-    echo "encrypt_age_rule: refusing empty payload for $rule" >&2
-    return 1
-  fi
-  # Caller passes required KEY names as $3.. so we can verify every one appears
-  # as a `KEY=` prefix on its own line with a non-empty value.
-  local key
-  shift 2
-  for key in "$@"; do
-    if ! grep -qE "^${key}=..*" "$stdin_tmp"; then
-      echo "encrypt_age_rule: missing or empty $key in payload for $rule" >&2
-      return 1
-    fi
-  done
   while IFS= read -r recipient; do
     recipients+=("$recipient")
   done < <(
@@ -1275,7 +1285,8 @@ encrypt_age_rule() {
   for recipient in "${recipients[@]}"; do
     age_args+=(-r "$recipient")
   done
-  age -a "${age_args[@]}" -o "$output" < "$stdin_tmp"
+  age -a "${age_args[@]}" -o "${output}.tmp"
+  mv "${output}.tmp" "$output"
 }
 
 {
@@ -1290,13 +1301,14 @@ encrypt_age_rule() {
       end
     '
   printf 'RUNNER_MAX_AGE_MILLIS=15000\n'
-} | encrypt_age_rule inucon-portal-env.age secrets/inucon-portal-env.age \
-    GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET ADMIN_GITHUB_LOGINS RUNNER_TOKEN BASE_URL \
-    PROXMOX_API_URL PROXMOX_TLS_FINGERPRINT CF_API_TOKEN CF_ACCOUNT_ID CF_ZONE_ID \
-    CF_TUNNEL_ID RUNNER_MAX_AGE_MILLIS
+} \
+  | require_keys GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET ADMIN_GITHUB_LOGINS RUNNER_TOKEN BASE_URL \
+                 PROXMOX_API_URL PROXMOX_TLS_FINGERPRINT CF_API_TOKEN CF_ACCOUNT_ID CF_ZONE_ID \
+                 CF_TUNNEL_ID RUNNER_MAX_AGE_MILLIS \
+  | encrypt_age_rule inucon-portal-env.age secrets/inucon-portal-env.age
 ```
 
-Do not use `set -x`, command substitution containing decoded values, terminal printing, or a plaintext tempfile. On any pipeline failure, delete only the newly created incomplete ciphertext and retry from the live Secret.
+Do not use `set -x`, command substitution containing decoded values, terminal printing, or any plaintext tempfile (the earlier draft of this step buffered the payload with `mktemp` + `shred -u`, but that keeps decoded secrets on disk between the write and the shred and offers no guarantee on journaling / CoW filesystems). On any pipeline failure, `require_keys` withholds the payload and `set -o pipefail` aborts before `age` writes, so no `.tmp` file remains; if a `.tmp` from an earlier crash is present, delete only that exact stray file and retry from the live Secret.
 
 - [ ] **Step 5: Implement a plan-first Proxmox credential bootstrap and stop before apply**
 
@@ -1328,8 +1340,9 @@ set -euo pipefail
     base64 -d
   printf '\nBENCH_DIR=/home/kise/private-isu/benchmarker\n'
   printf 'RUNNER_ID=benchvm\n'
-} | encrypt_age_rule runner-env.age secrets/runner-env.age \
-    PORTAL_URL RUNNER_TOKEN BENCH_DIR RUNNER_ID
+} \
+  | require_keys PORTAL_URL RUNNER_TOKEN BENCH_DIR RUNNER_ID \
+  | encrypt_age_rule runner-env.age secrets/runner-env.age
 
 ssh -o BatchMode=yes apphost.kisen.one \
   "kubectl -n inucon exec deploy/inucon-portal -- node -e '
@@ -1345,10 +1358,12 @@ ssh -o BatchMode=yes apphost.kisen.one \
         process.stdout.write(\"TUNNEL_TOKEN=\" + body.result + \"\\n\");
       })
       .catch(() => { process.exitCode = 1; });
-  '" | encrypt_age_rule inucon-tunnel-token.age secrets/inucon-tunnel-token.age TUNNEL_TOKEN
+  '" \
+  | require_keys TUNNEL_TOKEN \
+  | encrypt_age_rule inucon-tunnel-token.age secrets/inucon-tunnel-token.age
 ```
 
-The outer `set -euo pipefail` and `encrypt_age_rule`'s required-KEY argument together guarantee that a partial upstream fetch (empty `ssh`/`kubectl` output, node fetch error, missing `RUNNER_TOKEN` in the Secret) fails before `age` runs. Without this, the `printf 'RUNNER_TOKEN='` prefix would still make the payload non-empty when the base64-decoded body is empty, producing a syntactically valid ciphertext that hides the failure until Task15 Step7 fails to start benchvm services.
+The outer `set -euo pipefail`, `require_keys`'s stdin gate (which withholds the payload entirely when a required KEY is missing or empty), and the tmp-then-mv in `encrypt_age_rule` together guarantee that a partial upstream fetch (empty `ssh`/`kubectl` output, node fetch error, missing `RUNNER_TOKEN` in the Secret) fails before any ciphertext lands in `secrets/`. Without this, the `printf 'RUNNER_TOKEN='` prefix would make the payload non-empty when the base64-decoded body is empty and `age` would happily encrypt `RUNNER_TOKEN=` alone, producing a syntactically valid ciphertext that hides the failure until Task15 Step7 fails to start benchvm services.
 
 The connector response is never printed. Decoded token values flow only through pipes into age.
 
