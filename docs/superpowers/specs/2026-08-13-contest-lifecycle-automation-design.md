@@ -225,7 +225,7 @@ reconciliation で `unmanaged orphan` として表示し、operator が対象を
 3. Proxmox、Cloudflare、DB の inventory を読み取り、差分 plan を表示する。
 4. 進行中ジョブ、実 VM、DNS、ingress、Access app、DB Instance 状態を照合する。
 5. operator が plan を確認して cleanup を適用する。
-6. `inucon-team*` の管理対象リソースが0件、active Instance が0件であることを再監査する。
+6. `inucon-team*` の管理対象リソースが0件、かつ過去 Contest の Instance 行のうち `status != 'deleted'` のもの(running/creating/deleting/failed を含む。`failed` 行は vmid/IP を保持し続けるため次回開催の `vmidFor(teamNumber, index)` と衝突する)が0件であることを再監査する。
 
 finished Contest とユーザー、チーム、ベンチ履歴は削除しない。
 
@@ -247,14 +247,14 @@ finished Contest とユーザー、チーム、ベンチ履歴は削除しない
 - 前回 cleanup が完了している。
 - apphost portal、k3s、PVC が正常。
 - eevee、template VMID、必要 bridge/subnet、隔離 service が正常。
-- desired RAM と現在の MemAvailable に安全余白がある。
+- desired RAM と現在の Proxmox node status `memory.free`(既存 ProxmoxPort が読む値。Linux `/proc/meminfo` の `MemAvailable` と違って reclaimable page cache を含まないため保守的側に倒している)に安全余白がある。
 - devvm と benchvm の状態が取得できる。
 - runner build/revision、benchmark directory、portal reachability が正常。
 - Cloudflare tunnel が healthy で API inventory を取得できる。
 - token permission が必要操作を満たす。
 
 operator が競技モード切替を明示確認すると、devvm を guest shutdown し、停止完了と
-MemAvailable を確認してから benchvm を起動する。force stop はしない。devvm が timeout した
+`memory.free` を確認してから benchvm を起動する。force stop はしない。devvm が timeout した
 場合は中断し、Web に復旧手順を出す。
 
 ### 4. インスタンスと外部経路の準備
@@ -268,13 +268,17 @@ Team ごとに desiredInstanceCount まで既存の idempotent provision saga �
 5. Access app と、その開催回のメンバー email だけを含む allow policy
 6. ResourceBinding の保存
 
-複数台は1台ずつ作り、各台の後に MemAvailable と KSM の安定を再確認する。quota が3でも
+複数台は1台ずつ作り、各台の後に `memory.free`(上述)と KSM の安定を再確認する。quota が3でも
 容量診断を通らなければ3台目を無理に起動しない。第2回の3台構成は実機診断を通過することを
 完了条件とし、物理メモリを根拠なく overcommit しない。
 
 Access policy は過去開催の email との和集合にしない。ポータルが作成・所有する app は、現在の
-Contest Team の正確な email 集合へ収束させる。未知の policy が同じ app に混在する場合は
-自動上書きせず drift として停止する。
+Contest Team の正確な email 集合(= 現メンバーで email 登録済みのもの ∪ 当該 Contest の pending
+`team_invites` の email。初ログイン前の招待者を締め出さないため union は Contest スコープ内で
+維持する)へ収束させる。desired が空集合になる場合はポータル所有の allow policy を PUT せず、
+ポリシー削除または deny-only の外殻に落として ResourceBinding にその状態を記録する(Cloudflare
+は空 `include` を 400 で拒否するため)。未知の policy が同じ app に混在する場合は自動上書き
+せず drift として停止する。
 
 ### 5. リハーサルと開始
 
@@ -299,7 +303,7 @@ scheduledEndAt 到達時、または admin の即時終了で finalizing へ遷�
 3. running job は既存 timeout まで完走を待つ。終了前に enqueue 済みなら結果へ含める。
 4. scoreboard artifact と checksum を確定する。
 5. DB snapshot を作る。
-6. accessClosesAt 到達済みなら外部 SSH 経路と Access app を撤収する。
+6. `accessClosesAt` に達していれば scheduler は独立した `revoke_access` Operation を投入して外部 SSH 経路と Access app を撤収する(この Operation は finalize の step 列 `cancel_queued|wait_running|write_*|finish_contest` の一部ではなく、finish がグローバルロックを握っている間は解放されるまで tick ごとにリトライする — plan Task 12 Step 3 の一意性ガードを参照)。VM 撤収は cleanup Operation に分離する。
 7. finished へ遷移する。
 
 snapshot の off-host 保存先が未設定の場合、Admin Web は「server snapshot 済み / off-host copy
@@ -312,7 +316,7 @@ VM cleanup は結果確定と分離する。既定では operator が plan を�
 
 cleanup は各 Instance の VM、DNS、Tunnel ingress、Access app/policy を冪等に撤収し、
 reconciliation が clean になってから DB 状態を確定する。すべての競技 VM が停止・削除済みなら
-benchvm を正常停止し、MemAvailable を確認して devvm を起動する。
+benchvm を正常停止し、`memory.free` を確認して devvm を起動する。
 
 ## Reconciliation
 
@@ -447,7 +451,7 @@ migration だけで deleted に書き換えず、reconciliation operation の監
 - Cloudflare `team1-1`: DB resource と対応付けて撤収。
 - Cloudflare `team2-1`: binding のない legacy orphan として表示し、operator 確認後に adopt + 撤収。
 - Tunnel catch-all、portal hostname、INUCON 以外の DNS/Access: 変更なし。
-- cleanup 後: active Instance 0、`inucon-team*` VM/DNS/ingress/Access app 0を確認。
+- cleanup 後: `inucon-team*` VM/DNS/ingress/Access app が0、かつ過去 Contest の Instance 行のうち `status != 'deleted'` のもの(failed 含む)が0であることを確認する。plan Task 8 の `previous_cleanup` readiness と同じ predicate。
 
 この clean gate を通るまで第2回を preparing にできない。
 
