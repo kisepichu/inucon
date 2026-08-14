@@ -181,8 +181,16 @@ export const ContestRepoLive: Layer.Layer<ContestRepo, never, SqlClient.SqlClien
             `
             if (updated.length > 0) return c
             const current = yield* sql<{ revision: number }>`SELECT revision FROM contests WHERE id = ${c.id}`
-            const actual = current.length > 0 ? current[0].revision : 0
-            return yield* Effect.fail(new ContestRevisionConflict({ expected: expectedRevision, actual }))
+            if (current.length === 0) {
+              // contest 行が消失した(hard-delete 経路は現状無いので defect)。
+              // ContestRevisionConflict{actual: 0} で誤魔化すと呼び出し元の
+              // 「別 admin が触った」判定と区別が付かず debug しにくいので
+              // Effect.dieMessage で明示的に落として原因調査を強制する。
+              return yield* Effect.dieMessage(`saveIfRevision: contest ${c.id} row disappeared`)
+            }
+            return yield* Effect.fail(
+              new ContestRevisionConflict({ expected: expectedRevision, actual: current[0].revision })
+            )
           })
         ).pipe(
           Effect.catchTag("SqlError", (cause) => Effect.fail(new RepoError({ cause })))

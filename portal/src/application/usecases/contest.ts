@@ -60,7 +60,11 @@ export const startContestUsecase = Effect.gen(function* () {
   // タイミングでこの非同期性は消える。
   yield* jobs.cancelQueuedRehearsalsForContest(contest.id)
   const saved = yield* repo.saveIfRevision(started, contest.revision).pipe(
-    Effect.catchTag("ContestRevisionConflict", (cause) => Effect.fail(new RepoError({ cause })))
+    Effect.catchTag("ContestRevisionConflict", (cause) =>
+      Effect.logWarning(
+        `startContestUsecase revision conflict: contestId=${contest.id} expected=${cause.expected} actual=${cause.actual}`
+      ).pipe(Effect.flatMap(() => Effect.fail(new RepoError({ cause }))))
+    )
   )
   // TOCTOU close: cancel と save の間に enqueue された rehearsal を確実に掃く。
   yield* jobs.cancelQueuedRehearsalsForContest(contest.id)
@@ -89,6 +93,10 @@ export const finishContestUsecase = Effect.gen(function* () {
     onRight: Effect.succeed
   })
   return yield* repo.saveIfRevision(finished, contest.revision).pipe(
-    Effect.catchTag("ContestRevisionConflict", (cause) => Effect.fail(new RepoError({ cause })))
+    Effect.catchTag("ContestRevisionConflict", (cause) =>
+      Effect.logWarning(
+        `finishContestUsecase revision conflict: contestId=${contest.id} expected=${cause.expected} actual=${cause.actual}`
+      ).pipe(Effect.flatMap(() => Effect.fail(new RepoError({ cause }))))
+    )
   )
 })
