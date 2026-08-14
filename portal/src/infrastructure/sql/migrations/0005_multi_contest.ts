@@ -137,6 +137,16 @@ export default Effect.gen(function* () {
       INSERT INTO team_members_new (contest_id, team_id, user_id)
       SELECT ${legacyContestId}, team_id, user_id FROM team_members
     `
+
+    const [{ src }] = yield* sql<{ src: number }>`SELECT COUNT(*) AS src FROM team_members`
+    const [{ dst }] = yield* sql<{ dst: number }>`SELECT COUNT(*) AS dst FROM team_members_new`
+    if (src !== dst) {
+      yield* Effect.fail(
+        new MigrationDataError({
+          message: `migration 0005: team_members (${src}) と team_members_new (${dst}) の行数が一致しません`
+        })
+      )
+    }
   }
 
   // --- team_invites ---
@@ -157,6 +167,16 @@ export default Effect.gen(function* () {
       INSERT INTO team_invites_new (contest_id, github_login, team_id, email, invited_at)
       SELECT ${legacyContestId}, github_login, team_id, email, invited_at FROM team_invites
     `
+
+    const [{ src }] = yield* sql<{ src: number }>`SELECT COUNT(*) AS src FROM team_invites`
+    const [{ dst }] = yield* sql<{ dst: number }>`SELECT COUNT(*) AS dst FROM team_invites_new`
+    if (src !== dst) {
+      yield* Effect.fail(
+        new MigrationDataError({
+          message: `migration 0005: team_invites (${src}) と team_invites_new (${dst}) の行数が一致しません`
+        })
+      )
+    }
   }
 
   // --- instances ---

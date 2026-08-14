@@ -11,13 +11,7 @@ import {
   recordProgress,
   startJob
 } from "../../src/domain/benchJob.js"
-import {
-  CannotCancelRunning,
-  ContestNotRunning,
-  InvalidJobTransition,
-  TargetIpOutOfSubnet,
-  TeamJobAlreadyQueued
-} from "../../src/domain/errors.js"
+import { CannotCancelRunning, ContestNotRunning, InvalidJobTransition, TargetIpOutOfSubnet } from "../../src/domain/errors.js"
 import { BenchJobId, ContestId, TeamId } from "../../src/domain/ids.js"
 import { makeContest } from "../support/factories.js"
 
@@ -29,7 +23,6 @@ const contestId = ContestId.make("44444444-4444-4444-4444-444444444444")
 const baseEnqueueArgs = {
   contest: makeContest({ status: "running" }),
   purpose: "competition" as const,
-  activeJobCountForTeam: 0,
   teamId,
   teamNumber: 1,
   targetIp: "10.100.1.11"
@@ -39,11 +32,6 @@ describe("checkEnqueueAllowed", () => {
   it("contest が preparing なら ContestNotRunning", () => {
     const result = checkEnqueueAllowed({ ...baseEnqueueArgs, contest: makeContest({ status: "preparing" }) })
     expect(result).toStrictEqual(Either.left(new ContestNotRunning({ status: "preparing" })))
-  })
-
-  it("チームに既に queued/running のジョブがあれば TeamJobAlreadyQueued", () => {
-    const result = checkEnqueueAllowed({ ...baseEnqueueArgs, activeJobCountForTeam: 1 })
-    expect(result).toStrictEqual(Either.left(new TeamJobAlreadyQueued({ teamId })))
   })
 
   it("targetIp がチームのサブネット外なら TargetIpOutOfSubnet", () => {

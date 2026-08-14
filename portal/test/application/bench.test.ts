@@ -22,6 +22,7 @@ import {
   reportProgress,
   sweepTimedOutJobs
 } from "../../src/application/usecases/bench.js"
+import { startContestUsecase } from "../../src/application/usecases/contest.js"
 import { DEFAULT_TEST_CONTEST_ID, makeContest, makeTeam } from "../support/factories.js"
 import {
   makeBenchJobRepoTest,
@@ -154,6 +155,41 @@ describe("enqueueBench", () => {
       const exit = yield* Effect.exit(enqueueBench({ user: noTeamUser, targetIp: "10.100.1.5", targetPort: 8080 }))
       expect(exit).toStrictEqual(Exit.fail(new NotInTeam()))
     }).pipe(Effect.provide(testLayer("running")))
+  )
+})
+
+// preparing→running 遷移で queued rehearsal を残してはならない (残すと
+// insertIfAllowed の NOT EXISTS が同一チームの competition enqueue を
+// 永久ブロックする)。startContestUsecase 内で
+// cancelQueuedRehearsalsForContest を呼ぶことで防いでいる。
+describe("startContestUsecase: preparing 中の queued rehearsal を running 遷移でキャンセルする", () => {
+  const admin1 = new User({ ...user1, isAdmin: true })
+
+  it.effect("admin の rehearsal が queued のまま start しても、member の competition enqueue が阻害されない", () =>
+    Effect.gen(function* () {
+      // 1. preparing: admin が rehearsal を enqueue → queued のまま runner が拾わない状態を模す。
+      const rehearsal = yield* enqueueBench({ user: admin1, targetIp: "10.100.1.5", targetPort: 8080 })
+      expect(rehearsal.status).toBe("queued")
+      expect(rehearsal.purpose).toBe("rehearsal")
+
+      // 2. startContestUsecase: preparing → running 遷移 + queued rehearsal を一括キャンセル。
+      yield* startContestUsecase
+
+      // 3. 同一チームの一般ユーザが competition を enqueue できる。
+      //    (rehearsal がキャンセルされていないと TeamJobAlreadyQueued で失敗する)。
+      const competition = yield* enqueueBench({ user: user1, targetIp: "10.100.1.5", targetPort: 8080 })
+      expect(competition.status).toBe("queued")
+      expect(competition.purpose).toBe("competition")
+      expect(competition.teamId).toBe(team1Id)
+
+      // 4. 元の rehearsal が canceled になっていることも直接確認する。
+      const jobs = yield* BenchJobRepo
+      const found = yield* jobs.findById(rehearsal.id)
+      expect(Option.isSome(found)).toBe(true)
+      if (Option.isSome(found)) {
+        expect(found.value.status).toBe("canceled")
+      }
+    }).pipe(Effect.provide(testLayer("preparing")))
   )
 })
 

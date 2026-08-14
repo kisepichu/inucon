@@ -51,8 +51,6 @@ export const enqueueBench = (args: {
       checkEnqueueAllowed({
         contest,
         purpose,
-        activeJobCountForTeam: 0,
-        teamId: team.id,
         teamNumber: team.teamNumber,
         targetIp: args.targetIp
       }),

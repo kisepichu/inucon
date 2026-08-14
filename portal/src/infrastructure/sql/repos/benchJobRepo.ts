@@ -275,6 +275,17 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
           )
         ),
 
+      // preparing→running 遷移直後に、まだ queued の rehearsal を一括で
+      // canceled にする。insertIfAllowed の NOT EXISTS(purpose 非依存)が
+      // 同一チームの competition enqueue を永久ブロックする footgun 対策。
+      cancelQueuedRehearsalsForContest: (contestId: ContestId) =>
+        wrapSqlError(
+          sql`
+            UPDATE bench_jobs SET status = 'canceled'
+            WHERE contest_id = ${contestId} AND status = 'queued' AND purpose = 'rehearsal'
+          `
+        ).pipe(Effect.asVoid),
+
       // Task 3: 集計対象は当該 contest かつ purpose='competition' の finished
       // のみ。rehearsal は表示しない。0 件チームも teams 列を LEFT で残す。
       scoreboard: (contestId: ContestId) =>

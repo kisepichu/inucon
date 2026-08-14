@@ -1,7 +1,7 @@
 import { Clock, Effect, Either, Option } from "effect"
 import { beginFinalization, finishContest, startContest } from "../../domain/contest.js"
 import { ContestNotFound } from "../errors.js"
-import { ContestRepo, RepoError } from "../ports.js"
+import { BenchJobRepo, ContestRepo, RepoError } from "../ports.js"
 
 // Task 3: 未指定の /api/contest は「今表示すべき contest」(getDisplay)を返す。
 // running/finalizing 優先、次に最新 finished、最後に preparing(準備中は
@@ -17,11 +17,19 @@ export const getCurrentContest = ContestRepo.pipe(
 // 状態を変えた)は RepoError に畳んで 500 にする(現行 UI は再取得で復旧)。
 export const startContestUsecase = Effect.gen(function* () {
   const repo = yield* ContestRepo
+  const jobs = yield* BenchJobRepo
   const contest = yield* repo.getOperational.pipe(
     Effect.flatMap(Option.match({ onNone: () => Effect.fail(new ContestNotFound()), onSome: Effect.succeed }))
   )
   const now = yield* Clock.currentTimeMillis
   const started = yield* Either.match(startContest(contest, now), { onLeft: Effect.fail, onRight: Effect.succeed })
+  // preparing 中に admin が enqueue した rehearsal が queued のまま残ると、
+  // running 遷移後の benchJobRepo.insertIfAllowed の NOT EXISTS (purpose
+  // 非依存) が同一チームの competition enqueue を永久にブロックする。
+  // saveIfRevision の前に一括キャンセルしておく (revision conflict で save
+  // が失敗し retry しても冪等)。Task 10 の guarded_start Operation が
+  // 正式化されたらこのフックは消える予定。
+  yield* jobs.cancelQueuedRehearsalsForContest(contest.id)
   return yield* repo.saveIfRevision(started, contest.revision).pipe(
     Effect.catchTag("ContestRevisionConflict", (cause) => Effect.fail(new RepoError({ cause })))
   )

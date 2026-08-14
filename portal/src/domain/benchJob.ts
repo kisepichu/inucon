@@ -33,22 +33,20 @@ export class BenchJob extends Schema.Class<BenchJob>("BenchJob")({
 // キュー不変条件のチェック(スペック §BenchJob、Task 3 更新):
 // - purpose='rehearsal' は Contest が preparing のときのみ許可
 // - purpose='competition' は Contest が running のときのみ許可
-// - チームごと queued+running 合計 1 本まで(呼び出し元が activeJobCountForTeam を数える)
 // - targetIp はチームサブネット内のみ
+// 「チームごと queued+running 合計 1 本」は TOCTOU-safe に強制する必要が
+// あるため、SQL レイヤの benchJobRepo.insertIfAllowed (NOT EXISTS) が
+// 唯一の enforcer。domain 側で件数を渡すと race で必ずずれるので、
+// ここでは扱わない。TeamJobAlreadyQueued は SQL 側からのみ発火する。
 export const checkEnqueueAllowed = (args: {
   contest: Contest
   purpose: BenchJobPurpose
-  activeJobCountForTeam: number
-  teamId: TeamId
   teamNumber: number
   targetIp: string
-}): Either.Either<void, ContestNotRunning | TeamJobAlreadyQueued | TargetIpOutOfSubnet> => {
+}): Either.Either<void, ContestNotRunning | TargetIpOutOfSubnet> => {
   const expectedStatus = args.purpose === "rehearsal" ? "preparing" : "running"
   if (args.contest.status !== expectedStatus) {
     return Either.left(new ContestNotRunning({ status: args.contest.status }))
-  }
-  if (args.activeJobCountForTeam > 0) {
-    return Either.left(new TeamJobAlreadyQueued({ teamId: args.teamId }))
   }
   if (!ipInTeamSubnet(args.targetIp, args.teamNumber)) {
     return Either.left(new TargetIpOutOfSubnet({ ip: args.targetIp, teamNumber: args.teamNumber }))

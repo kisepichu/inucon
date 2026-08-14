@@ -1,7 +1,6 @@
 import { Context, Effect, Either, Layer, Option, Ref } from "effect"
 import type { BenchJobPurpose } from "../../src/domain/benchJob.js"
-import { cancelJob, failJob, finishJob, recordProgress, startJob } from "../../src/domain/benchJob.js"
-import type { BenchJob } from "../../src/domain/benchJob.js"
+import { BenchJob, cancelJob, failJob, finishJob, recordProgress, startJob } from "../../src/domain/benchJob.js"
 import type { Contest } from "../../src/domain/contest.js"
 import {
   CannotCancelRunning,
@@ -635,6 +634,14 @@ export const makeBenchJobRepoTest = (
           atomicTransition(id, "failIfRunning", (job) => failJob(job, errorMessage, now)),
         cancelIfQueued: (id: BenchJobId) =>
           atomicTransition<CannotCancelRunning | InvalidJobTransition>(id, "cancelIfQueued", (job) => cancelJob(job)),
+        cancelQueuedRehearsalsForContest: (contestId: ContestId) =>
+          Ref.update(jobsRef, (jobs) =>
+            jobs.map((j) =>
+              j.contestId === contestId && j.status === "queued" && j.purpose === "rehearsal"
+                ? new BenchJob({ ...j, status: "canceled" })
+                : j
+            )
+          ),
         appendLog: (id: BenchJobId, chunk: string) =>
           Ref.update(logsRef, (logs) => ({ ...logs, [id]: (logs[id] ?? "") + chunk })),
         getLog: (id: BenchJobId) => Ref.get(logsRef).pipe(Effect.map((logs) => logs[id] ?? "")),
