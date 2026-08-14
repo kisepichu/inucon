@@ -17,6 +17,17 @@ export const getScoreboard = Effect.gen(function* () {
 
 // GET /api/contests/:contestId/scoreboard(Task 4)。ID 明示。canceled/未存在は
 // 404(getPublicContestById と同じ扱い)。
+//
+// TOCTOU note (review claude iter 2): findById(canceled 判定) と
+// jobs.scoreboard(contestId) は別クエリのため、間で admin が cancel すると
+// 抽象的には「canceled 済 contest のスコアを 200 で返す」window が開く。
+// ただし cancel は draft|preparing のみから遷移可能で (plan Global Constraints)、
+// preparing の contest は checkEnqueueAllowed により rehearsal しか enqueue
+// できず、BenchJobRepo.scoreboard は purpose='competition' filter のため、
+// cancel 可能な状態の scoreboard は常に「0 チーム 0 スコア」(空 array) にしか
+// ならない。つまり漏洩する情報は無い。加えて公開クライアントは 10 秒 poll で
+// 再取得するので次の tick で自然に 404 に収束する。以上より extra findById で
+// window を狭める必要は無いと判定し、シングル findById + scoreboard のままにする。
 export const getScoreboardOf = (contestId: ContestId) =>
   Effect.gen(function* () {
     const contests = yield* ContestRepo
