@@ -7,7 +7,7 @@ import { AuthConfig, ProvisioningConfig, RunnerConfig } from "../../src/applicat
 import { AdminLive } from "../../src/infrastructure/http/handlers/admin.js"
 import { AuthLive } from "../../src/infrastructure/http/handlers/auth.js"
 import { BenchLive } from "../../src/infrastructure/http/handlers/bench.js"
-import { ContestLive } from "../../src/infrastructure/http/handlers/contest.js"
+import { ContestLive, ContestsLive } from "../../src/infrastructure/http/handlers/contest.js"
 import { HealthLive } from "../../src/infrastructure/http/handlers/health.js"
 import { InstancesLive } from "../../src/infrastructure/http/handlers/instances.js"
 import { RunnerLive } from "../../src/infrastructure/http/handlers/runner.js"
@@ -101,6 +101,7 @@ export const makeAppTestLayer = (options?: {
             HealthLive,
             AuthLive,
             ContestLive,
+            ContestsLive,
             TeamsLive,
             InstancesLive,
             AdminLive,

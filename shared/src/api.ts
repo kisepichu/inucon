@@ -19,6 +19,7 @@ import {
   CreateTeamRequest,
   EnqueueBenchRequest,
   Instance,
+  ContestId,
   InstanceId,
   InstanceStatus,
   InviteRequest,
@@ -271,12 +272,35 @@ export const authGroup = HttpApiGroup.make("auth")
     HttpApiEndpoint.post("logout", "/api/auth/logout").addSuccess(HttpApiSchema.NoContent)
   )
 
-// GET /api/contest(公開): 現在のコンテスト。無ければ 404。
+// GET /api/contest(compat 公開): 現在表示すべきコンテスト(getDisplay)。
+// Task 4: この単一 endpoint に加えて、明示 ID の archive API を contestsGroup へ
+// 追加した。Web 側は Task 5 以降で contestsGroup に完全移行する。
 export const contestGroup = HttpApiGroup.make("contest").add(
   HttpApiEndpoint.get("getContest", "/api/contest")
     .addSuccess(Contest)
     .addError(NotFound)
 )
+
+// GET /api/contests / /api/contests/:contestId / /api/contests/:contestId/scoreboard
+// (公開 archive API、Task 4)。canceled は list/detail のいずれにも現れない
+// (admin は Task 5 の contestAdminGroup で includeCanceled=true 経由で参照する)。
+export const contestsGroup = HttpApiGroup.make("contests")
+  .add(
+    HttpApiEndpoint.get("listContests", "/api/contests")
+      .addSuccess(Schema.Array(Contest))
+  )
+  .add(
+    HttpApiEndpoint.get("getContestById")`/api/contests/${HttpApiSchema.param("contestId", ContestId)}`
+      .addSuccess(Contest)
+      .addError(NotFound)
+  )
+  .add(
+    HttpApiEndpoint.get(
+      "getContestScoreboard"
+    )`/api/contests/${HttpApiSchema.param("contestId", ContestId)}/scoreboard`
+      .addSuccess(Schema.Array(ScoreboardEntry))
+      .addError(NotFound)
+  )
 
 export const teamsGroup = HttpApiGroup.make("teams")
   // 参照はセッションのみ(全チームのメンバー情報込みで返す)。
@@ -473,6 +497,7 @@ export const api = HttpApi.make("inucon")
   .add(healthGroup)
   .add(authGroup)
   .add(contestGroup)
+  .add(contestsGroup)
   .add(teamsGroup)
   .add(instancesGroup)
   .add(adminGroup)

@@ -72,6 +72,11 @@ export const api = {
   logout: () => request<void>("/api/auth/logout", { method: "POST" }),
 
   getContest: () => request<Contest>("/api/contest"),
+  // Task 4: 公開 archive API。canceled は list/detail の両方から除外される。
+  listContests: () => request<Array<Contest>>("/api/contests"),
+  getContestById: (contestId: string) => request<Contest>(`/api/contests/${contestId}`),
+  getContestScoreboard: (contestId: string) =>
+    request<Array<ScoreboardEntry>>(`/api/contests/${contestId}/scoreboard`),
 
   getScoreboard: () => request<Array<ScoreboardEntry>>("/api/scoreboard"),
 
