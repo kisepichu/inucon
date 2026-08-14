@@ -28,6 +28,16 @@ export const startContestUsecase = Effect.gen(function* () {
   // 非依存) が同一チームの competition enqueue を永久にブロックする。
   // saveIfRevision の前に一括キャンセルしておく。
   //
+  // Scope of the cancel: この一括キャンセルは status='queued' の rehearsal
+  // のみに効く。既に running の rehearsal はここでは触らない(runner が
+  // 走行中のジョブを canceled にすると reportProgress/reportFinish が
+  // InvalidJobTransition で落ち、runner 側の遺物処理を汚す)。running な
+  // rehearsal が生き残ると、そのチームだけ rehearsal 完了/タイムアウト
+  // (RunnerConfig.jobTimeoutMillis)までは competition enqueue が
+  // TeamJobAlreadyQueued で弾かれる過渡状態が残る。Task 10 の guarded_start
+  // Operation は「in-flight rehearsal が無いこと」を readiness の前提条件
+  // として要求するので、その時点でこの過渡状態はそもそも観測不能になる。
+  //
   // Non-atomicity note: cancel と save は別トランザクションなので
   // saveIfRevision が revision conflict で失敗すると "rehearsal は
   // canceled だが contest はまだ preparing" という中間状態が残る。ただし

@@ -106,21 +106,6 @@ export const pollNextJobFor = (candidate: { contestId: ContestId; purpose: Bench
     return yield* jobs.dequeueNextQueued(candidate, now)
   })
 
-// pollNextJob(compat): operational な contest とその status に応じた purpose を
-// 解決してから pollNextJobFor に委譲する。0 contest/finalizing は None。
-export const pollNextJob = Effect.gen(function* () {
-  const contests = yield* ContestRepo
-  const contest = yield* contests.getOperational
-  if (Option.isNone(contest)) return Option.none<BenchJob>()
-  const purpose: BenchJobPurpose | null =
-    contest.value.status === "running"
-      ? "competition"
-      : contest.value.status === "preparing"
-        ? "rehearsal"
-        : null
-  if (purpose === null) return Option.none<BenchJob>()
-  return yield* pollNextJobFor({ contestId: contest.value.id, purpose })
-})
 
 // progress の logChunk 省略/空文字(ハートビートのみ)は appendLog 自体を
 // スキップして不要な DB 書き込みを避ける。

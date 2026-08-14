@@ -18,7 +18,7 @@ import {
   cancelBench,
   enqueueBench,
   listBenchJobs,
-  pollNextJob,
+  pollNextJobFor,
   reportFinish,
   reportProgress,
   sweepTimedOutJobs
@@ -240,16 +240,18 @@ describe("cancelBench", () => {
   )
 })
 
-describe("pollNextJob", () => {
+describe("pollNextJobFor: running contest + competition purpose", () => {
+  const runningCompetition = { contestId: DEFAULT_TEST_CONTEST_ID, purpose: "competition" as const }
+
   it.effect("queued 2 本(team1 が古い)→ team1 が running で返り、次は None", () =>
     Effect.gen(function* () {
-      const first = yield* pollNextJob
+      const first = yield* pollNextJobFor(runningCompetition)
       expect(Option.isSome(first)).toBe(true)
       if (Option.isSome(first)) {
         expect(first.value.teamId).toBe(team1Id)
         expect(first.value.status).toBe("running")
       }
-      const second = yield* pollNextJob
+      const second = yield* pollNextJobFor(runningCompetition)
       expect(second).toStrictEqual(Option.none())
     }).pipe(
       Effect.provide(
@@ -458,7 +460,7 @@ describe("状態遷移の競合(TOCTOU 回帰)", () => {
     Effect.gen(function* () {
       const queuedId = BenchJobId.make("99999999-aaaa-bbbb-cccc-dddddddddddd")
 
-      const dequeued = yield* pollNextJob
+      const dequeued = yield* pollNextJobFor({ contestId: DEFAULT_TEST_CONTEST_ID, purpose: "competition" })
       expect(Option.isSome(dequeued)).toBe(true)
       if (Option.isSome(dequeued)) {
         expect(dequeued.value.status).toBe("running")

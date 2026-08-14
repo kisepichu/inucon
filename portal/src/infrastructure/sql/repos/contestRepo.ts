@@ -82,27 +82,33 @@ export const ContestRepoLive: Layer.Layer<ContestRepo, never, SqlClient.SqlClien
       //   3. preparing(最大 1)
       // 準備中は最終スコアを消さないため running/finalizing より下位。canceled
       // は表示候補に含めない(admin list からのみ辿れる)。
-      getDisplay: Effect.gen(function* () {
-        // 1
-        const opRows = yield* wrapSqlError(
-          sql`SELECT ${sql.unsafe(columns)} FROM contests WHERE status IN ('running','finalizing') LIMIT 1`
-        )
-        if (opRows.length > 0) return yield* decodeRow(Contest, opRows[0]).pipe(Effect.map(Option.some))
+      // getDisplay は 3 段 SELECT (running/finalizing → 最新 finished →
+      // preparing) を順に読むため、間に concurrent write (preparing→running
+      // 等) が挟まると snapshot がずれて全部 miss = None → 404 になる narrow
+      // な race がある。sql.withTransaction で単一 snapshot に閉じ込める。
+      getDisplay: sql.withTransaction(
+        Effect.gen(function* () {
+          // 1
+          const opRows = yield* wrapSqlError(
+            sql`SELECT ${sql.unsafe(columns)} FROM contests WHERE status IN ('running','finalizing') LIMIT 1`
+          )
+          if (opRows.length > 0) return yield* decodeRow(Contest, opRows[0]).pipe(Effect.map(Option.some))
 
-        // 2
-        const finRows = yield* wrapSqlError(
-          sql`SELECT ${sql.unsafe(columns)} FROM contests WHERE status = 'finished' ORDER BY finished_at DESC, edition DESC LIMIT 1`
-        )
-        if (finRows.length > 0) return yield* decodeRow(Contest, finRows[0]).pipe(Effect.map(Option.some))
+          // 2
+          const finRows = yield* wrapSqlError(
+            sql`SELECT ${sql.unsafe(columns)} FROM contests WHERE status = 'finished' ORDER BY finished_at DESC, edition DESC LIMIT 1`
+          )
+          if (finRows.length > 0) return yield* decodeRow(Contest, finRows[0]).pipe(Effect.map(Option.some))
 
-        // 3
-        const prepRows = yield* wrapSqlError(
-          sql`SELECT ${sql.unsafe(columns)} FROM contests WHERE status = 'preparing' LIMIT 1`
-        )
-        if (prepRows.length > 0) return yield* decodeRow(Contest, prepRows[0]).pipe(Effect.map(Option.some))
+          // 3
+          const prepRows = yield* wrapSqlError(
+            sql`SELECT ${sql.unsafe(columns)} FROM contests WHERE status = 'preparing' LIMIT 1`
+          )
+          if (prepRows.length > 0) return yield* decodeRow(Contest, prepRows[0]).pipe(Effect.map(Option.some))
 
-        return Option.none<Contest>()
-      }),
+          return Option.none<Contest>()
+        })
+      ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new RepoError({ cause })))),
 
       // partial unique index 違反を型付きエラーへ分岐する。SqlError の cause から
       // メッセージを取り出して idx 名を突き合わせる(TeamRepo.create の
