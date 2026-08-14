@@ -115,57 +115,58 @@ export const ContestRepoLive: Layer.Layer<ContestRepo, never, SqlClient.SqlClien
       // メッセージ形式に依存して脆いため、UNIQUE 制約違反を検出したら
       // 診断 SELECT で「どの partial unique が発火したか」を明示的に判定する
       // (どちらも 0 件なら未知の SqlError として RepoError にする)。
+      // INSERT と診断 SELECT を同一 sql.withTransaction 内で走らせて、
+      // 途中で別 admin が競合行を削除しても snapshot が一貫することを保証する
+      // (iter 14 レビュー #2)。
       create: (c: Contest) =>
-        sql`
-          INSERT INTO contests (
-            id, edition, name, problem_key, problem_revision, template_vmid,
-            status, instance_quota,
-            scheduled_start_at, scheduled_end_at, access_closes_at, cleanup_at,
-            access_closed_at, cleanup_completed_at,
-            started_at, finalizing_at, finished_at, canceled_at,
-            revision
-          )
-          VALUES (
-            ${c.id}, ${c.edition}, ${c.name}, ${c.problemKey}, ${c.problemRevision}, ${c.templateVmid},
-            ${c.status}, ${c.instanceQuota},
-            ${Option.getOrNull(c.scheduledStartAt)}, ${Option.getOrNull(c.scheduledEndAt)},
-            ${Option.getOrNull(c.accessClosesAt)}, ${Option.getOrNull(c.cleanupAt)},
-            ${Option.getOrNull(c.accessClosedAt)}, ${Option.getOrNull(c.cleanupCompletedAt)},
-            ${Option.getOrNull(c.startedAt)}, ${Option.getOrNull(c.finalizingAt)},
-            ${Option.getOrNull(c.finishedAt)}, ${Option.getOrNull(c.canceledAt)},
-            ${c.revision}
-          )
-        `.pipe(
-          Effect.asVoid,
-          Effect.catchTag(
-            "SqlError",
-            (cause): Effect.Effect<void, RepoError | ContestEditionConflict | OperationalContestConflict> =>
-              Effect.gen(function* () {
-                const message = extractMessage(cause.cause)
-                if (!message.toUpperCase().includes("UNIQUE")) {
-                  return yield* Effect.fail(new RepoError({ cause }))
-                }
-                // idx_contests_edition_live: (edition) WHERE status != 'canceled'
-                if (c.status !== "canceled") {
-                  const editionHit = yield* sql<{ id: string }>`
-                    SELECT id FROM contests WHERE edition = ${c.edition} AND status != 'canceled' LIMIT 1
-                  `.pipe(Effect.catchTag("SqlError", () => Effect.succeed([])))
-                  if (editionHit.length > 0) {
-                    return yield* Effect.fail(new ContestEditionConflict({ edition: c.edition }))
-                  }
-                }
-                // idx_contests_single_operational: (1) WHERE status IN ('preparing','running','finalizing')
-                if (c.status === "preparing" || c.status === "running" || c.status === "finalizing") {
-                  const opHit = yield* sql<{ id: string }>`
-                    SELECT id FROM contests WHERE status IN ('preparing','running','finalizing') LIMIT 1
-                  `.pipe(Effect.catchTag("SqlError", () => Effect.succeed([])))
-                  if (opHit.length > 0) {
-                    return yield* Effect.fail(new OperationalContestConflict())
-                  }
-                }
-                return yield* Effect.fail(new RepoError({ cause }))
-              })
-          )
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const insertResult = yield* sql`
+              INSERT INTO contests (
+                id, edition, name, problem_key, problem_revision, template_vmid,
+                status, instance_quota,
+                scheduled_start_at, scheduled_end_at, access_closes_at, cleanup_at,
+                access_closed_at, cleanup_completed_at,
+                started_at, finalizing_at, finished_at, canceled_at,
+                revision
+              )
+              VALUES (
+                ${c.id}, ${c.edition}, ${c.name}, ${c.problemKey}, ${c.problemRevision}, ${c.templateVmid},
+                ${c.status}, ${c.instanceQuota},
+                ${Option.getOrNull(c.scheduledStartAt)}, ${Option.getOrNull(c.scheduledEndAt)},
+                ${Option.getOrNull(c.accessClosesAt)}, ${Option.getOrNull(c.cleanupAt)},
+                ${Option.getOrNull(c.accessClosedAt)}, ${Option.getOrNull(c.cleanupCompletedAt)},
+                ${Option.getOrNull(c.startedAt)}, ${Option.getOrNull(c.finalizingAt)},
+                ${Option.getOrNull(c.finishedAt)}, ${Option.getOrNull(c.canceledAt)},
+                ${c.revision}
+              )
+            `.pipe(
+              Effect.map(() => ({ ok: true as const })),
+              Effect.catchTag("SqlError", (cause) => Effect.succeed({ ok: false as const, cause }))
+            )
+            if (insertResult.ok) return
+            // idx_contests_edition_live: (edition) WHERE status != 'canceled'
+            if (c.status !== "canceled") {
+              const editionHit = yield* sql<{ id: string }>`
+                SELECT id FROM contests WHERE edition = ${c.edition} AND status != 'canceled' LIMIT 1
+              `.pipe(Effect.catchTag("SqlError", () => Effect.succeed([])))
+              if (editionHit.length > 0) {
+                return yield* Effect.fail(new ContestEditionConflict({ edition: c.edition }))
+              }
+            }
+            // idx_contests_single_operational: (1) WHERE status IN ('preparing','running','finalizing')
+            if (c.status === "preparing" || c.status === "running" || c.status === "finalizing") {
+              const opHit = yield* sql<{ id: string }>`
+                SELECT id FROM contests WHERE status IN ('preparing','running','finalizing') LIMIT 1
+              `.pipe(Effect.catchTag("SqlError", () => Effect.succeed([])))
+              if (opHit.length > 0) {
+                return yield* Effect.fail(new OperationalContestConflict())
+              }
+            }
+            return yield* Effect.fail(new RepoError({ cause: insertResult.cause }))
+          })
+        ).pipe(
+          Effect.catchTag("SqlError", (cause) => Effect.fail(new RepoError({ cause })))
         ),
 
       // 楽観ロック: WHERE revision = expected で条件付き UPDATE し、0 行なら

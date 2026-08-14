@@ -2478,3 +2478,43 @@ layer("TeamRepo: setMembers は別チーム所属の user を MemberConflict で
     })
   )
 })
+
+// Task 3: preparing contest で admin が enqueue した rehearsal を runner が
+// dequeue する経路の happy path 回帰。既存の purpose-gate テストは
+// 「新しい purpose を選ぶ」形の間接検証なので、単純に「rehearsal だけ
+// 存在する状態で dequeueNextQueued(rehearsal) が拾って running にする」
+// を明示テストする。
+layer("BenchJobRepo: dequeueNextQueued は preparing の rehearsal を拾って running にする", (it) => {
+  it.effect("queued rehearsal を purpose='rehearsal' で dequeue すると running へ遷移する", () =>
+    Effect.gen(function* () {
+      yield* seedContest("preparing")
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+      const team = makeTeam({ id: TeamId.make("team-prep-reh"), name: "PrepRehearsal", teamNumber: 91 })
+      yield* teams.create(team)
+
+      const rehearsal = newJob({
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        purpose: "rehearsal",
+        id: BenchJobId.make("bj-prep-reh-happy"),
+        teamId: team.id,
+        targetIp: "10.100.91.5",
+        targetPort: 8080,
+        now: 1000
+      })
+      yield* jobs.insertIfAllowed(rehearsal)
+
+      const picked = yield* jobs.dequeueNextQueued(
+        { contestId: DEFAULT_TEST_CONTEST_ID, purpose: "rehearsal" },
+        2000
+      )
+      expect(Option.isSome(picked)).toBe(true)
+      if (Option.isSome(picked)) {
+        expect(picked.value.id).toBe(rehearsal.id)
+        expect(picked.value.purpose).toBe("rehearsal")
+        expect(picked.value.status).toBe("running")
+        expect(Option.map(picked.value.startedAt, (x) => x)).toStrictEqual(Option.some(2000))
+      }
+    })
+  )
+})

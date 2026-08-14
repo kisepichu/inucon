@@ -44,6 +44,14 @@ export const enqueueBench = (args: {
       Effect.flatMap(Option.match({ onNone: () => Effect.fail(new NotInTeam()), onSome: Effect.succeed }))
     )
 
+    // finalizing はキューをクローズしている(scheduler が新規 dequeue しない)。
+    // ここで先に落とさないと下の三項演算で rehearsal 判定になり、admin が
+    // 通ってしまったあと checkEnqueueAllowed が「rehearsal は preparing のみ」
+    // で拒否するという遠回りな失敗経路になる。ユーザに直接理由を返す。
+    if (contest.status === "finalizing") {
+      return yield* Effect.fail(new ContestNotRunning({ status: "finalizing" }))
+    }
+
     // preparing での rehearsal は admin のみ許可(参加者は running まで待つ)。
     // ここでは「preparing 中の enqueue は admin のみ」で弾き、後段の checkEnqueue
     // Allowed が purpose と status の対応を最終判定する。

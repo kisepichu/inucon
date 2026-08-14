@@ -23,29 +23,30 @@ export const startContestUsecase = Effect.gen(function* () {
   )
   const now = yield* Clock.currentTimeMillis
   const started = yield* Either.match(startContest(contest, now), { onLeft: Effect.fail, onRight: Effect.succeed })
-  // preparing 中に admin が enqueue した rehearsal が queued のまま残ると、
-  // running 遷移後の benchJobRepo.insertIfAllowed の NOT EXISTS (purpose
-  // 非依存) が同一チームの competition enqueue を永久にブロックする。
-  // saveIfRevision の前に一括キャンセルしておく。
+  // preparing 中に admin が enqueue した rehearsal は、running 遷移後は
+  // pollNextRunnerJob が purpose='competition' でしか dequeue しないため、
+  // 永久に status='queued' のまま孤児化する(dashboards/履歴 UI で誤解を
+  // 招く)。insertIfAllowed は (contest_id, team_id, purpose) スコープなので
+  // 「同一チームの competition enqueue を阻害する」問題は既に無いが、
+  // 孤児レコードは掃除しておく方が運用上明快なので save の前後で一括
+  // キャンセルする。
   //
   // Scope of the cancel: この一括キャンセルは status='queued' の rehearsal
   // のみに効く。既に running の rehearsal はここでは触らない(runner が
   // 走行中のジョブを canceled にすると reportProgress/reportFinish が
   // InvalidJobTransition で落ち、runner 側の遺物処理を汚す)。running な
-  // rehearsal が生き残ると、そのチームだけ rehearsal 完了/タイムアウト
-  // (RunnerConfig.jobTimeoutMillis)までは competition enqueue が
-  // TeamJobAlreadyQueued で弾かれる過渡状態が残る。Task 10 の guarded_start
-  // Operation は「in-flight rehearsal が無いこと」を readiness の前提条件
-  // として要求するので、その時点でこの過渡状態はそもそも観測不能になる。
+  // rehearsal が生き残っても iter 13 で insertIfAllowed を purpose 別に
+  // したので同一チームの competition enqueue は阻害されない。純粋に
+  // benchmark 資源(runner slot)の観点で「rehearsal 完了/タイムアウトまで
+  // running に居座る」だけ。Task 10 の guarded_start Operation は
+  // 「in-flight rehearsal が無いこと」を readiness の前提条件として要求
+  // するので、その時点でこの居座りもそもそも観測不能になる。
   //
   // TOCTOU sweep: cancel と save は別トランザクションで、間に別 admin が
-  // rehearsal を enqueue すると orphan として残り(runner は
-  // dequeueNextQueued の purpose フィルタで拾わない、insertIfAllowed の
-  // team ガードは purpose 非依存で永久ブロック)、手動 UPDATE でしか
-  // 復旧できない状態になる。save 成功後にもう一度 cancel を呼んで
-  // window を閉じる(2 回目は冪等)。running 遷移後の enqueueBench は
-  // checkEnqueueAllowed が rehearsal を弾くので、post-save 以降に新規
-  // orphan が発生することはない。
+  // rehearsal を enqueue すると孤児として残るので、save 成功後にもう一度
+  // cancel を呼んで window を閉じる(2 回目は冪等)。running 遷移後の
+  // enqueueBench は checkEnqueueAllowed が rehearsal を弾くので、
+  // post-save 以降に新規 orphan が発生することはない。
   //
   // Non-atomicity note: cancel と save は別トランザクションなので
   // saveIfRevision が revision conflict で失敗すると "rehearsal は
