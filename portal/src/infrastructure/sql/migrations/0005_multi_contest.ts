@@ -270,6 +270,16 @@ export default Effect.gen(function* () {
 
   if (legacyContestId !== null) {
     yield* sql`INSERT INTO bench_job_logs_new (job_id, log) SELECT job_id, log FROM bench_job_logs`
+
+    const [{ src }] = yield* sql<{ src: number }>`SELECT COUNT(*) AS src FROM bench_job_logs`
+    const [{ dst }] = yield* sql<{ dst: number }>`SELECT COUNT(*) AS dst FROM bench_job_logs_new`
+    if (src !== dst) {
+      yield* Effect.fail(
+        new MigrationDataError({
+          message: `migration 0005: bench_job_logs (${src}) と bench_job_logs_new (${dst}) の行数が一致しません`
+        })
+      )
+    }
   }
 
   // 旧テーブル DROP → RENAME(child から順に。0002 の instances/contests 依存

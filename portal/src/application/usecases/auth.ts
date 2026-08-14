@@ -56,7 +56,20 @@ const consumeLiveInvitesOnLogin = (user: User): Effect.Effect<User, RepoError, U
     for (const invite of pending) {
       const currentTeam = yield* teams.findByUserId(invite.contestId, user.id)
       if (Option.isNone(currentTeam)) {
-        yield* teams.addMember(invite.contestId, invite.teamId, user.id)
+        const added = yield* teams.addMember(invite.contestId, invite.teamId, user.id)
+        // findByUserId=None なら add できる想定だが、scoped unique
+        // (contest_id, user_id) 制約下で並行 admin 操作が同一 contest 内の
+        // 別チームへ入れた場合のみ false になる。既に別チームに入っているの
+        // なら invite は obsolete で delete するのが正しいが、post-mortem の
+        // ため落ち先チームが invite と異なることを log で観測可能にしておく。
+        if (!added) {
+          const resolved = yield* teams.findByUserId(invite.contestId, user.id)
+          if (Option.isSome(resolved) && resolved.value.id !== invite.teamId) {
+            yield* Effect.logWarning(
+              `consumeLiveInvitesOnLogin: race - user ${user.id} landed in team ${resolved.value.id} instead of invite target ${invite.teamId} for contest ${invite.contestId}`
+            )
+          }
+        }
       }
       yield* invites.delete(invite.contestId, invite.githubLogin)
       lastEmail = invite.email

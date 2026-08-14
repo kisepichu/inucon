@@ -26,9 +26,19 @@ export const startContestUsecase = Effect.gen(function* () {
   // preparing 中に admin が enqueue した rehearsal が queued のまま残ると、
   // running 遷移後の benchJobRepo.insertIfAllowed の NOT EXISTS (purpose
   // 非依存) が同一チームの competition enqueue を永久にブロックする。
-  // saveIfRevision の前に一括キャンセルしておく (revision conflict で save
-  // が失敗し retry しても冪等)。Task 10 の guarded_start Operation が
-  // 正式化されたらこのフックは消える予定。
+  // saveIfRevision の前に一括キャンセルしておく。
+  //
+  // Non-atomicity note: cancel と save は別トランザクションなので
+  // saveIfRevision が revision conflict で失敗すると "rehearsal は
+  // canceled だが contest はまだ preparing" という中間状態が残る。ただし
+  // 次の startContestUsecase 呼び出しが cancel-first で再度 sweep するため
+  // eventually consistent で回復する:
+  //   - retry 1: cancel(no-op, 既に canceled)→ save(成功)
+  //   - retry 2: 別 admin が start 済みなら InvalidContestTransition で
+  //     早期 fail、その admin の cancel 処理が新規 rehearsal を掃除する
+  //   - どちらの経路でも admin は re-enqueue で復旧可能
+  // Task 10 の guarded_start Operation が durable step として置き換わる
+  // タイミングでこの非同期性は消える。
   yield* jobs.cancelQueuedRehearsalsForContest(contest.id)
   return yield* repo.saveIfRevision(started, contest.revision).pipe(
     Effect.catchTag("ContestRevisionConflict", (cause) => Effect.fail(new RepoError({ cause })))
