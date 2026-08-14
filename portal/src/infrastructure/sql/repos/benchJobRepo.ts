@@ -151,7 +151,13 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
         ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeBenchJob))),
 
       // Task 3: dequeue 対象は「候補の contest かつ candidate.purpose」に絞る。
-      // running 排他はテーブル全体で 1 本(Task 1 以前の設計を維持)。
+      // running 排他は現状「テーブル全体で 1 本」で表現している(Task 1 以前の
+      // 設計を維持)。これは 0004 の idx_contests_single_operational が
+      // preparing/running/finalizing の contest を全体で最大 1 件に制約する
+      // 前提に依存する外部不変条件で、この SQL 内には現れないので注意。
+      // Task 11 以降でこの制約が緩む(複数 contest が同時に running を許す)
+      // 場合、running 排他を `AND contest_id = ${candidate.contestId}` で
+      // scope し直すこと。
       dequeueNextQueued: (
         candidate: { contestId: ContestId; purpose: BenchJobPurpose },
         now: number
