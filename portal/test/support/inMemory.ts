@@ -487,6 +487,14 @@ export const makeInstanceRepoTest = (initial: ReadonlyArray<Instance> = []): Lay
               if (duplicate) {
                 return [Either.left(new DuplicateInstanceIndex({ teamId: i.teamId, index: i.index })), instances]
               }
+              // 0005 の idx_instances_vmid_active と同じく、非 deleted の
+              // vmid はエディション跨いで一意。SQL 側の SqlError→500 を避け
+              // るため in-memory でも同じセマンティクスで DuplicateInstanceIndex
+              // に落とす(handler で 409 として通す)。
+              const vmidClash = instances.some((x) => x.vmid === i.vmid && x.status !== "deleted")
+              if (vmidClash) {
+                return [Either.left(new DuplicateInstanceIndex({ teamId: i.teamId, index: i.index })), instances]
+              }
               return [Either.right(i), [...instances, i]]
             }
           ).pipe(Effect.flatMap(Either.match({ onLeft: Effect.fail, onRight: Effect.succeed }))),
@@ -529,6 +537,10 @@ export const makeInstanceRepoTest = (initial: ReadonlyArray<Instance> = []): Lay
                   x.status !== "deleted"
               )
               if (duplicate) {
+                return [Either.left(new DuplicateInstanceIndex({ teamId: i.teamId, index: i.index })), instances]
+              }
+              const vmidClash = instances.some((x) => x.vmid === i.vmid && x.status !== "deleted")
+              if (vmidClash) {
                 return [Either.left(new DuplicateInstanceIndex({ teamId: i.teamId, index: i.index })), instances]
               }
               return [Either.right(i), [...instances, i]]
@@ -639,8 +651,13 @@ export const makeBenchJobRepoTest = (
           Ref.modify(
             jobsRef,
             (jobs): readonly [Option.Option<BenchJob>, ReadonlyArray<BenchJob>] => {
-              const contestRunning = jobs.some((j) => j.status === "running" && j.contestId === candidate.contestId)
-              if (contestRunning) return [Option.none(), jobs]
+              const purposeRunning = jobs.some(
+                (j) =>
+                  j.status === "running" &&
+                  j.contestId === candidate.contestId &&
+                  j.purpose === candidate.purpose
+              )
+              if (purposeRunning) return [Option.none(), jobs]
               const queued = jobs
                 .filter(
                   (j) =>

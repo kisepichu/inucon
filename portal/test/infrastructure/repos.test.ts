@@ -2144,3 +2144,127 @@ layer("TeamRepo: findByUserId は contest ごとに独立して解決する", (i
     })
   )
 })
+
+// Task 2/3 レビュー: 別 contest が非 deleted の同一 vmid を掴んでいる場合、
+// createIfAllowed は idx_instances_vmid_active(0005)の一意違反を素通しさせ
+// て 500 化してはいけない。SELECT 側の NOT EXISTS 事前ガードで typed
+// DuplicateInstanceIndex に落とすことを検証する。
+layer("InstanceRepo: createIfAllowed は cross-contest vmid 衝突を typed error に落とす", (it) => {
+  it.effect("旧 contest の非 deleted 行と同じ vmid の instance は DuplicateInstanceIndex", () =>
+    Effect.gen(function* () {
+      const contests = yield* ContestRepo
+      const teams = yield* TeamRepo
+      const instances = yield* InstanceRepo
+
+      const oldContestId = ContestId.make("00000000-0000-0000-0000-cccccccdaea1")
+      const newContestId = ContestId.make("00000000-0000-0000-0000-cccccccdaea2")
+      // 旧 contest は finished、新 contest を draft で作って cross-contest 状態を再現。
+      yield* contests.create(
+        makeContest({ id: oldContestId, edition: 81, status: "finished", finishedAt: Option.some(1_000_000) })
+      )
+      yield* contests.create(makeContest({ id: newContestId, edition: 82, status: "draft" }))
+
+      const oldTeam = makeTeam({ id: TeamId.make("team-vmid-old"), contestId: oldContestId, name: "Old", teamNumber: 41 })
+      const newTeam = makeTeam({ id: TeamId.make("team-vmid-new"), contestId: newContestId, name: "New", teamNumber: 42 })
+      yield* teams.create(oldTeam)
+      yield* teams.create(newTeam)
+
+      const sharedVmid = 9241
+      // 旧 contest 側: running のまま残っている(掃除漏れ)ケースを模す。
+      yield* instances.create(
+        makeInstance({
+          id: InstanceId.make("inst-old-vmid"),
+          teamId: oldTeam.id,
+          contestId: oldContestId,
+          index: 1,
+          vmid: sharedVmid,
+          privateIp: "10.100.41.5",
+          status: "running",
+          createdAt: 0,
+          updatedAt: 0
+        })
+      )
+
+      // 新 contest から同じ vmid で createIfAllowed → DuplicateInstanceIndex(500 化しない)。
+      const attempt = makeInstance({
+        id: InstanceId.make("inst-new-vmid"),
+        teamId: newTeam.id,
+        contestId: newContestId,
+        index: 1,
+        vmid: sharedVmid,
+        privateIp: "10.100.42.5",
+        status: "creating",
+        createdAt: 100,
+        updatedAt: 100
+      })
+      const err = yield* Effect.flip(instances.createIfAllowed(attempt, 3))
+      expect(err).toStrictEqual(new DuplicateInstanceIndex({ teamId: newTeam.id, index: attempt.index }))
+    })
+  )
+})
+
+// Task 2/3 レビュー: dequeueNextQueued の running 排他は (contest_id, purpose)
+// で持つ。同一 contest でも rehearsal と competition は独立キューで、
+// preparing→running 遷移直後に旧 rehearsal がまだ running でも competition
+// dequeue が即時に開始できることを検証する。
+layer("BenchJobRepo: dequeueNextQueued は同一 contest でも purpose 別に排他する", (it) => {
+  it.effect("running rehearsal が居ても queued competition を dequeue できる", () =>
+    Effect.gen(function* () {
+      yield* seedContest("running")
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+      const rehearsalTeam = makeTeam({ id: TeamId.make("team-par-reh"), name: "PurposeParReh", teamNumber: 51 })
+      const competitionTeam = makeTeam({ id: TeamId.make("team-par-com"), name: "PurposeParCom", teamNumber: 52 })
+      yield* teams.create(rehearsalTeam)
+      yield* teams.create(competitionTeam)
+
+      // rehearsal を enqueue → dequeue で running 状態にする。
+      const rehearsalJob = newJob({
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        purpose: "rehearsal",
+        id: BenchJobId.make("bj-par-reh"),
+        teamId: rehearsalTeam.id,
+        targetIp: "10.100.51.5",
+        targetPort: 8080,
+        now: 1000
+      })
+      yield* jobs.insertIfAllowed(rehearsalJob)
+      const startedRehearsal = yield* jobs.dequeueNextQueued(
+        { contestId: DEFAULT_TEST_CONTEST_ID, purpose: "rehearsal" },
+        2000
+      )
+      expect(Option.isSome(startedRehearsal)).toBe(true)
+      if (Option.isSome(startedRehearsal)) expect(startedRehearsal.value.status).toBe("running")
+
+      // rehearsal が running のまま competition を enqueue。
+      const competitionJob = newJob({
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        purpose: "competition",
+        id: BenchJobId.make("bj-par-com"),
+        teamId: competitionTeam.id,
+        targetIp: "10.100.52.5",
+        targetPort: 8080,
+        now: 3000
+      })
+      yield* jobs.insertIfAllowed(competitionJob)
+
+      // rehearsal が running でも competition dequeue が即時に成功する。
+      const startedCompetition = yield* jobs.dequeueNextQueued(
+        { contestId: DEFAULT_TEST_CONTEST_ID, purpose: "competition" },
+        4000
+      )
+      expect(Option.isSome(startedCompetition)).toBe(true)
+      if (Option.isSome(startedCompetition)) {
+        expect(startedCompetition.value.id).toBe(competitionJob.id)
+        expect(startedCompetition.value.purpose).toBe("competition")
+      }
+
+      // 同一 purpose の 2 本目は running が居るので None(排他は同一 purpose に閉じる)。
+      const secondCompetition = yield* jobs.dequeueNextQueued(
+        { contestId: DEFAULT_TEST_CONTEST_ID, purpose: "competition" },
+        5000
+      )
+      expect(secondCompetition).toStrictEqual(Option.none())
+    })
+  )
+})

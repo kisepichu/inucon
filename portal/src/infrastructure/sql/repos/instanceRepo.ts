@@ -64,9 +64,11 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
           )
         ),
 
-      // 台帳取り込み(admin)。(contest_id, team_id, idx) の重複判定は
-      // migration 0005 の部分ユニーク index(status != 'deleted')と同条件で
-      // WHERE NOT EXISTS ... RETURNING の単一原子的操作で行う。
+      // 台帳取り込み(admin)。(contest_id, team_id, idx) の重複判定と
+      // vmid の重複判定はどちらも migration 0005 の部分ユニーク index
+      // (status != 'deleted')と同条件で WHERE NOT EXISTS で先取りする。
+      // vmid ガードを SELECT 側で持たないと idx_instances_vmid_active の
+      // 一意制約違反が SqlError → 500 に化ける。
       create: (i: Instance) =>
         Effect.gen(function* () {
           const rows = yield* wrapSqlError(
@@ -81,10 +83,26 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
                 WHERE contest_id = ${i.contestId} AND team_id = ${i.teamId} AND idx = ${i.index}
                   AND status != 'deleted'
               )
+              AND NOT EXISTS (
+                SELECT 1 FROM instances
+                WHERE vmid = ${i.vmid} AND status != 'deleted'
+              )
               RETURNING ${columns}
             `
           )
           if (rows.length === 0) {
+            // vmid 側の衝突なら旧 contest の残骸を掃除する必要があることが
+            // わかるよう log に残す。返す型は DuplicateInstanceIndex を維持
+            // (409 のまま — API 契約変更なし)。
+            const vmidConflict = yield* wrapSqlError(sql<{ contestId: string }>`
+              SELECT contest_id AS contestId FROM instances
+              WHERE vmid = ${i.vmid} AND status != 'deleted'
+            `)
+            if (vmidConflict.length > 0) {
+              yield* Effect.logWarning(
+                `create: vmid ${i.vmid} is held by a non-deleted instance in contest ${vmidConflict[0].contestId}; cannot provision for contest ${i.contestId}`
+              )
+            }
             return yield* Effect.fail(new DuplicateInstanceIndex({ teamId: i.teamId, index: i.index }))
           }
           return yield* decodeInstance(rows[0])
@@ -93,7 +111,12 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
       remove: (id: InstanceId) => wrapSqlError(sql`DELETE FROM instances WHERE id = ${id}`).pipe(Effect.asVoid),
 
       // (1) quota 判定・(2) 同 contest 同 team の進行中 1 本ガード・(3) 重複 idx
-      // ガードすべて contest スコープに絞った条件で単一原子的 INSERT を組み立てる。
+      // ガード・(4) 重複 vmid ガード をすべて単一原子的 INSERT に組み立てる。
+      // (4) は 0005 で追加した idx_instances_vmid_active(非 deleted 全域で
+      // vmid ユニーク)を SELECT 側でも先取りするためのもの。読取ガードなしに
+      // 走らせるとエディション跨ぎの vmid 衝突(旧エディションの failed 行が
+      // vmid を掴んだままなど)が SqlError→ 500 に化けてハンドラの
+      // catchTags を素通りするので、SELECT で 0 行にして typed error に落とす。
       createIfAllowed: (i: Instance, quota: number) =>
         wrapSqlError(
           sql.withTransaction(
@@ -120,6 +143,10 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
                     WHERE contest_id = ${i.contestId} AND team_id = ${i.teamId} AND idx = ${i.index}
                       AND status != 'deleted'
                   )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM instances
+                    WHERE vmid = ${i.vmid} AND status != 'deleted'
+                  )
                 RETURNING ${columns}
               `
               if (rows.length > 0) {
@@ -141,6 +168,20 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
               `
               if (inProgressRows.length > 0) {
                 return yield* Effect.fail(new ProvisionInProgress({ teamId: i.teamId }))
+              }
+
+              // idx 側の衝突と vmid 側の衝突を診断で区別する。vmid 側なら
+              // クロスエディションの残骸(旧 contest の failed/running 行など)
+              // を掃除する必要があることが operator に伝わるよう log にも残す。
+              const vmidConflictRows = yield* sql<{ contestId: string }>`
+                SELECT contest_id AS contestId FROM instances
+                WHERE vmid = ${i.vmid} AND status != 'deleted'
+              `
+              if (vmidConflictRows.length > 0) {
+                yield* Effect.logWarning(
+                  `createIfAllowed: vmid ${i.vmid} is held by a non-deleted instance in contest ${vmidConflictRows[0].contestId}; cannot provision for contest ${i.contestId}`
+                )
+                return yield* Effect.fail(new DuplicateInstanceIndex({ teamId: i.teamId, index: i.index }))
               }
 
               return yield* Effect.fail(new DuplicateInstanceIndex({ teamId: i.teamId, index: i.index }))
