@@ -2,9 +2,8 @@ import { it } from "@effect/vitest"
 import { Effect, Either, Exit, Layer, Option } from "effect"
 import { describe, expect } from "vitest"
 import { newJob, startJob } from "../../src/domain/benchJob.js"
-import { Contest } from "../../src/domain/contest.js"
 import { InvalidInstanceTransition } from "../../src/domain/errors.js"
-import { BenchJobId, ContestId, InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
+import { BenchJobId, InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
 import { Instance, ipFor, newInstance, vmidFor } from "../../src/domain/instance.js"
 import type { ProvisionStep } from "../../src/domain/instance.js"
 import { Team } from "../../src/domain/team.js"
@@ -31,6 +30,7 @@ import {
   ProvisioningConfigTest,
   UuidGenTest
 } from "../support/inMemory.js"
+import { makeContest } from "../support/factories.js"
 
 const team1Id = TeamId.make("11111111-1111-1111-1111-111111111111")
 const team2Id = TeamId.make("22222222-2222-2222-2222-222222222222")
@@ -98,9 +98,7 @@ const inviteRepoLayer = makeInviteRepoTest([])
 
 const contestLayer = (instanceQuota = 3) =>
   makeContestRepoTest(
-    Option.some(
-      new Contest({ id: ContestId.make("contest-1"), name: "INUCON", problemKey: "p", status: "running", instanceQuota })
-    )
+    Option.some(makeContest({ status: "running", instanceQuota }))
   )
 
 const hostname1 = "inucon-team1-1.kisen.one"

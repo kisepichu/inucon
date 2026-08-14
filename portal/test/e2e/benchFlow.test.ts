@@ -1,8 +1,7 @@
 import { it } from "@effect/vitest"
 import { Effect } from "effect"
 import { describe, expect } from "vitest"
-import { Contest } from "../../src/domain/contest.js"
-import { ContestId } from "../../src/domain/ids.js"
+import { makeContest } from "../support/factories.js"
 import { ContestRepo } from "../../src/application/ports.js"
 import { asAdmin, makeApiClient, makeRunnerApiClient, TestLayer } from "../support/apiTestHelpers.js"
 import { login } from "../support/login.js"
@@ -19,15 +18,7 @@ describe("E2E: チーム作成からベンチ実行・スコアボード反映�
       const teamNumber = 90
 
       const contests = yield* ContestRepo
-      yield* contests.save(
-        new Contest({
-          id: ContestId.make("contest-e2e-1"),
-          name: "INUCON",
-          problemKey: "private-isu",
-          status: "preparing",
-          instanceQuota: 3
-        })
-      )
+      yield* contests.save(makeContest({ status: "preparing" }))
 
       // 1. admin がチームを作る。
       const { cookieHeader: adminCookie } = yield* asAdmin()

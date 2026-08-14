@@ -2,7 +2,6 @@ import { it } from "@effect/vitest"
 import { Effect, Exit, Layer, Option } from "effect"
 import { expect } from "vitest"
 import { newJob } from "../../src/domain/benchJob.js"
-import { Contest } from "../../src/domain/contest.js"
 import { Instance } from "../../src/domain/instance.js"
 import { Team } from "../../src/domain/team.js"
 import { User } from "../../src/domain/user.js"
@@ -12,7 +11,7 @@ import {
   InvalidJobTransition,
   TeamJobAlreadyQueued
 } from "../../src/domain/errors.js"
-import { BenchJobId, ContestId, InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
+import { BenchJobId, InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
 import { InstanceNotRunning } from "../../src/application/errors.js"
 import {
   BenchJobRepo,
@@ -31,6 +30,7 @@ import { TeamRepoLive } from "../../src/infrastructure/sql/repos/teamRepo.js"
 import { UserRepoLive } from "../../src/infrastructure/sql/repos/userRepo.js"
 import { UuidGenLive } from "../../src/infrastructure/sql/uuid.js"
 import { MigratorTest, SqlTest } from "../support/sqlTest.js"
+import { makeContest } from "../support/factories.js"
 
 // `:memory:` SQLite + 本番と同一マイグレーションを適用した Layer。it.layer(...)
 // の呼び出し単位(= 下の each `layer("...", ...)` ブロック単位)で独立した
@@ -58,13 +58,7 @@ layer("ContestRepo", (it) => {
       const before = yield* repo.getCurrent
       expect(before).toStrictEqual(Option.none())
 
-      const contest = new Contest({
-        id: ContestId.make("contest-1"),
-        name: "INUCON",
-        problemKey: "problem-1",
-        status: "preparing",
-        instanceQuota: 3
-      })
+      const contest = makeContest({ status: "preparing", name: "INUCON", problemKey: "problem-1" })
       yield* repo.save(contest)
       const after = yield* repo.getCurrent
       expect(after).toStrictEqual(Option.some(contest))
@@ -74,20 +68,8 @@ layer("ContestRepo", (it) => {
   it.effect("save は既存の現在コンテストを置き換える", () =>
     Effect.gen(function* () {
       const repo = yield* ContestRepo
-      const first = new Contest({
-        id: ContestId.make("contest-a"),
-        name: "A",
-        problemKey: "p1",
-        status: "preparing",
-        instanceQuota: 3
-      })
-      const second = new Contest({
-        id: ContestId.make("contest-b"),
-        name: "B",
-        problemKey: "p2",
-        status: "running",
-        instanceQuota: 3
-      })
+      const first = makeContest({ status: "preparing", name: "A", problemKey: "p1" })
+      const second = makeContest({ status: "running", name: "B", problemKey: "p2" })
       yield* repo.save(first)
       yield* repo.save(second)
       const current = yield* repo.getCurrent

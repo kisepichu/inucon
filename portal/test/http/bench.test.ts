@@ -2,8 +2,8 @@ import { HttpBody, HttpClient } from "@effect/platform"
 import { it } from "@effect/vitest"
 import { Effect, Option } from "effect"
 import { describe, expect } from "vitest"
-import { Contest } from "../../src/domain/contest.js"
-import { ContestId, InstanceId, TeamId } from "../../src/domain/ids.js"
+import { makeContest } from "../support/factories.js"
+import { InstanceId, TeamId } from "../../src/domain/ids.js"
 import { Instance } from "../../src/domain/instance.js"
 import { Team } from "../../src/domain/team.js"
 import { ContestRepo, InstanceRepo, TeamRepo } from "../../src/application/ports.js"
@@ -16,7 +16,6 @@ import { RUNNER_TOKEN_TEST } from "../support/testApi.js"
 // 407/403 やキュー不変条件の分岐と合わせてここに集約する。
 
 let teamSeq = 0
-let contestSeq = 0
 
 // 各テストで running な Contest + 1 チーム + そのメンバーを用意する。
 // TestLayer は it.effect ごとに新しい :memory: SQLite で fresh に build される
@@ -24,15 +23,8 @@ let contestSeq = 0
 const setup = (options?: { teamNumber?: number }) =>
   Effect.gen(function* () {
     teamSeq++
-    contestSeq++
     const contests = yield* ContestRepo
-    const contest = new Contest({
-      id: ContestId.make(`contest-bench-${contestSeq}`),
-      name: "INUCON",
-      problemKey: "private-isu",
-      status: "running",
-      instanceQuota: 3
-    })
+    const contest = makeContest({ status: "running" })
     yield* contests.save(contest)
 
     const teams = yield* TeamRepo
@@ -199,7 +191,7 @@ describe("POST /api/runner/jobs/poll", () => {
       expect(enqueueRes.status).toBe(200)
 
       const contests = yield* ContestRepo
-      yield* contests.save(new Contest({ ...contest, status: "finished" }))
+      yield* contests.save(makeContest({ ...contest, status: "finished" }))
 
       const pollRes = yield* poll()
       expect(pollRes.status).toBe(200)
