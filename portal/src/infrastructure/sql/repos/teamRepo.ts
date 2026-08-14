@@ -4,7 +4,8 @@ import type { ContestId, TeamId, UserId } from "../../../domain/ids.js"
 import { Team } from "../../../domain/team.js"
 import { User } from "../../../domain/user.js"
 import { TeamNumberConflict } from "../../../domain/errors.js"
-import { TeamRepo } from "../../../application/ports.js"
+import { MemberConflict } from "../../../application/errors.js"
+import { RepoError, TeamRepo } from "../../../application/ports.js"
 import { decodeRow, nullableIntToBool, wrapSqlError } from "./support.js"
 
 interface TeamRow {
@@ -91,9 +92,17 @@ export const TeamRepoLive: Layer.Layer<TeamRepo, never, SqlClient.SqlClient> = L
           }
         }),
 
+      // Task 2/3 レビュー: usecases 側の pre-check (findByUserId) と
+      // setMembers の書き込みは別トランザクションなので、その間に
+      // concurrent addMember (consumeLiveInvitesOnLogin 等) が同一 contest
+      // 内の別チームに user を入れた場合、INSERT が UNIQUE(contest_id,
+      // user_id) で落ちる。素の SqlError → RepoError → 500 は誤解を招く
+      // (実態は MemberConflict の 409 相当)ので、UNIQUE 違反を検出したら
+      // 診断 SELECT で衝突していた user の github_login を集めて
+      // MemberConflict に落とす。
       setMembers: (contestId: ContestId, teamId: TeamId, userIds: ReadonlyArray<UserId>) =>
-        wrapSqlError(
-          sql.withTransaction(
+        sql
+          .withTransaction(
             Effect.gen(function* () {
               yield* sql`
                 DELETE FROM team_members
@@ -111,7 +120,33 @@ export const TeamRepoLive: Layer.Layer<TeamRepo, never, SqlClient.SqlClient> = L
               }
             })
           )
-        ),
+          .pipe(
+            Effect.catchTag(
+              "SqlError",
+              (cause): Effect.Effect<void, RepoError | MemberConflict> =>
+                Effect.gen(function* () {
+                  // SqlError の cause 連鎖形式は driver 依存で fragile なので、
+                  // 常に診断 SELECT を走らせて MemberConflict か否かを判定する。
+                  // 対象 userIds のうち、当該 contest 内で teamId 以外に所属して
+                  // いるものを github_login 付きで拾う。0 件なら未知の SQL エラー
+                  // として RepoError にする(呼び出し元は 500 に畳む)。
+                  const conflicts = yield* sql<{ githubLogin: string }>`
+                    SELECT u.github_login AS githubLogin
+                    FROM team_members tm
+                    JOIN users u ON u.id = tm.user_id
+                    WHERE tm.contest_id = ${contestId}
+                      AND tm.team_id <> ${teamId}
+                      AND tm.user_id IN ${sql.in(userIds)}
+                  `.pipe(Effect.catchTag("SqlError", () => Effect.succeed([])))
+                  if (conflicts.length > 0) {
+                    return yield* Effect.fail(
+                      new MemberConflict({ logins: conflicts.map((row) => row.githubLogin) })
+                    )
+                  }
+                  return yield* Effect.fail(new RepoError({ cause }))
+                })
+            )
+          ),
 
       // scoped unique(contest_id, user_id)を TOCTOU なく判定する。同じ user が
       // 別 contest には所属可能。0 行挿入なら false(既に同一 contest 内の

@@ -88,6 +88,7 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
                 WHERE NOT EXISTS (
                   SELECT 1 FROM bench_jobs
                   WHERE contest_id = ${job.contestId} AND team_id = ${job.teamId}
+                    AND purpose = ${job.purpose}
                     AND status IN ('queued', 'running')
                 )
                 AND NOT EXISTS (
@@ -103,6 +104,7 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
                 const teamQueueRows = yield* sql<{ id: string }>`
                   SELECT id FROM bench_jobs
                   WHERE contest_id = ${job.contestId} AND team_id = ${job.teamId}
+                    AND purpose = ${job.purpose}
                     AND status IN ('queued', 'running')
                 `
                 if (teamQueueRows.length > 0) {

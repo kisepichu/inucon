@@ -16,7 +16,7 @@ import type { Instance } from "../domain/instance.js"
 import type { Team } from "../domain/team.js"
 import type { TeamInvite } from "../domain/teamInvite.js"
 import type { User } from "../domain/user.js"
-import { InstanceNotRunning, ProvisionInProgress, QuotaExceeded } from "./errors.js"
+import { InstanceNotRunning, MemberConflict, ProvisionInProgress, QuotaExceeded } from "./errors.js"
 
 // リポジトリ層(infrastructure、Task 4 が実装)の失敗はすべてこれに包む。
 export class RepoError extends Data.TaggedError("RepoError")<{ cause: unknown }> {}
@@ -125,7 +125,7 @@ export class TeamRepo extends Context.Tag("app/TeamRepo")<
       contestId: ContestId,
       teamId: TeamId,
       userIds: ReadonlyArray<UserId>
-    ) => Effect.Effect<void, RepoError>
+    ) => Effect.Effect<void, RepoError | MemberConflict>
     // 単一メンバー追加(招待/初ログイン)。scoped unique(contest_id, user_id)
     // で TOCTOU 判定する。true = 追加成功、false = そのユーザーは既に当該
     // contest 内のどこかのチームへ所属していて追加されなかった。

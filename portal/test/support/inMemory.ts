@@ -17,7 +17,7 @@ import { Instance } from "../../src/domain/instance.js"
 import { User } from "../../src/domain/user.js"
 import type { Team } from "../../src/domain/team.js"
 import type { TeamInvite } from "../../src/domain/teamInvite.js"
-import { ProvisionInProgress, QuotaExceeded } from "../../src/application/errors.js"
+import { MemberConflict, ProvisionInProgress, QuotaExceeded } from "../../src/application/errors.js"
 import {
   BenchJobRepo,
   CloudflareError,
@@ -170,11 +170,32 @@ export const makeTeamRepoTest = (args: {
             )
           }),
         create: (t: Team) => Ref.update(teamsRef, (teams) => [...teams, t]),
+        // Task 2/3 レビュー: 別チーム所属の user を含む userIds が渡された場合
+        // (usecases 側 pre-check と concurrent addMember の race で起こり得る)、
+        // SQL 版は UNIQUE(contest_id, user_id) 違反を MemberConflict に変換する。
+        // in-memory 版も同じ契約で失敗する。
         setMembers: (contestId: ContestId, teamId: TeamId, userIds: ReadonlyArray<UserId>) =>
-          Ref.update(membersRef, (members) => [
-            ...members.filter((m) => !(m.contestId === contestId && m.teamId === teamId)),
-            ...userIds.map((userId) => ({ contestId, teamId, userId }))
-          ]),
+          Effect.gen(function* () {
+            const membersBefore = yield* Ref.get(membersRef)
+            const users = yield* Ref.get(usersRef)
+            const existingInTarget = new Set(
+              membersBefore
+                .filter((m) => m.contestId === contestId && m.teamId === teamId)
+                .map((m) => m.userId)
+            )
+            const incomingIds = new Set(userIds.filter((id) => !existingInTarget.has(id)))
+            const conflicts = membersBefore
+              .filter((m) => m.contestId === contestId && m.teamId !== teamId && incomingIds.has(m.userId))
+              .map((m) => users.find((u) => u.id === m.userId)?.githubLogin)
+              .filter((login): login is string => login !== undefined)
+            if (conflicts.length > 0) {
+              return yield* Effect.fail(new MemberConflict({ logins: conflicts }))
+            }
+            yield* Ref.update(membersRef, (members) => [
+              ...members.filter((m) => !(m.contestId === contestId && m.teamId === teamId)),
+              ...userIds.map((userId) => ({ contestId, teamId, userId }))
+            ])
+          }),
         // 単一メンバー追加(招待フロー)。scoped unique(contest_id, user_id)は
         // 同一 contest 内でのみユニーク。異 contest には並行して所属可能。
         addMember: (contestId: ContestId, teamId: TeamId, userId: UserId) =>
@@ -373,10 +394,29 @@ export const makeInviteReposTest = (args: {
           }),
         create: (t) => Ref.update(teamsRef, (teams) => [...teams, t]),
         setMembers: (contestId, teamId, userIds) =>
-          Ref.update(membersRef, (members) => [
-            ...members.filter((m) => !(m.contestId === contestId && m.teamId === teamId)),
-            ...userIds.map((userId) => ({ contestId, teamId, userId }))
-          ]),
+          Effect.gen(function* () {
+            const membersBefore = yield* Ref.get(membersRef)
+            const users = yield* Ref.get(usersRef)
+            const existingInTarget = new Set(
+              membersBefore
+                .filter((m) => m.contestId === contestId && m.teamId === teamId)
+                .map((m) => m.userId)
+            )
+            const incomingIds = new Set(userIds.filter((id) => !existingInTarget.has(id)))
+            const conflicts = membersBefore
+              .filter(
+                (m) => m.contestId === contestId && m.teamId !== teamId && incomingIds.has(m.userId)
+              )
+              .map((m) => users.find((u) => u.id === m.userId)?.githubLogin)
+              .filter((login): login is string => login !== undefined)
+            if (conflicts.length > 0) {
+              return yield* Effect.fail(new MemberConflict({ logins: conflicts }))
+            }
+            yield* Ref.update(membersRef, (members) => [
+              ...members.filter((m) => !(m.contestId === contestId && m.teamId === teamId)),
+              ...userIds.map((userId) => ({ contestId, teamId, userId }))
+            ])
+          }),
         addMember: (contestId, teamId, userId) =>
           Ref.modify(membersRef, (members): readonly [boolean, ReadonlyArray<ScopedMember>] => {
             if (members.some((m) => m.contestId === contestId && m.userId === userId)) {
@@ -625,6 +665,7 @@ export const makeBenchJobRepoTest = (
                 (j) =>
                   j.contestId === job.contestId &&
                   j.teamId === job.teamId &&
+                  j.purpose === job.purpose &&
                   (j.status === "queued" || j.status === "running")
               )
               if (hasActiveForTeam) {

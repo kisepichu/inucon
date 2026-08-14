@@ -2387,3 +2387,94 @@ layer("ContestRepo: create の partial unique index 違反を typed error に落
     })
   )
 })
+
+// Task 2/3 レビュー: insertIfAllowed の NOT EXISTS は (contest_id, team_id,
+// purpose) の 3 軸で「1 チーム 1 purpose 1 active」を強制する。同一チームで
+// も rehearsal と competition は独立キューになる(runner は単一で serialize
+// するが、DB 制約は purpose 単位)。
+layer("BenchJobRepo: insertIfAllowed は purpose ごとに独立して active を持てる", (it) => {
+  it.effect("同一チームで rehearsal 走行中でも competition を enqueue できる", () =>
+    Effect.gen(function* () {
+      yield* seedContest("running")
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+      const team = makeTeam({ id: TeamId.make("team-parallel-purpose"), name: "ParallelPurpose", teamNumber: 71 })
+      yield* teams.create(team)
+
+      // rehearsal を running へ遷移。
+      const rehearsal = newJob({
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        purpose: "rehearsal",
+        id: BenchJobId.make("bj-par-purpose-reh"),
+        teamId: team.id,
+        targetIp: "10.100.71.5",
+        targetPort: 8080,
+        now: 1000
+      })
+      yield* jobs.insertIfAllowed(rehearsal)
+      yield* jobs.dequeueNextQueued({ contestId: DEFAULT_TEST_CONTEST_ID, purpose: "rehearsal" }, 2000)
+
+      // 同一 team で competition を enqueue できる(purpose が違うので通る)。
+      const competition = newJob({
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        purpose: "competition",
+        id: BenchJobId.make("bj-par-purpose-com"),
+        teamId: team.id,
+        targetIp: "10.100.71.6",
+        targetPort: 8080,
+        now: 3000
+      })
+      const inserted = yield* jobs.insertIfAllowed(competition)
+      expect(inserted.id).toBe(competition.id)
+      expect(inserted.status).toBe("queued")
+
+      // 同一 (team, purpose) で 2 本目の competition は依然 TeamJobAlreadyQueued。
+      const dup = newJob({
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        purpose: "competition",
+        id: BenchJobId.make("bj-par-purpose-com2"),
+        teamId: team.id,
+        targetIp: "10.100.71.7",
+        targetPort: 8080,
+        now: 4000
+      })
+      const err = yield* Effect.flip(jobs.insertIfAllowed(dup))
+      expect(err._tag).toBe("TeamJobAlreadyQueued")
+    })
+  )
+})
+
+// Task 2/3 レビュー: setMembers は usecases 側 pre-check(findByUserId)と
+// 別 tx で走るので、間に concurrent addMember が別チームへ入れた user を含む
+// userIds が渡された場合、UNIQUE(contest_id, user_id) 違反を MemberConflict
+// に変換する。
+layer("TeamRepo: setMembers は別チーム所属の user を MemberConflict で拒否する", (it) => {
+  it.effect("別チームに既にいる user を含む setMembers は MemberConflict で失敗する", () =>
+    Effect.gen(function* () {
+      yield* seedContest("preparing")
+      const teams = yield* TeamRepo
+      const users = yield* UserRepo
+
+      const teamA = makeTeam({ id: TeamId.make("team-mconf-a"), name: "MConfA", teamNumber: 81 })
+      const teamB = makeTeam({ id: TeamId.make("team-mconf-b"), name: "MConfB", teamNumber: 82 })
+      yield* teams.create(teamA)
+      yield* teams.create(teamB)
+
+      const user = yield* users.upsertByGithub({
+        githubId: 9401,
+        githubLogin: "conflict-user",
+        displayName: "Conflict User",
+        isAdmin: false
+      })
+      // user を先に teamA に addMember する(concurrent race を模す)。
+      yield* teams.addMember(DEFAULT_TEST_CONTEST_ID, teamA.id, user.id)
+
+      // teamB に対して user を含む setMembers を呼ぶと MemberConflict。
+      const err = yield* Effect.flip(teams.setMembers(DEFAULT_TEST_CONTEST_ID, teamB.id, [user.id]))
+      expect(err._tag).toBe("MemberConflict")
+      if (err._tag === "MemberConflict") {
+        expect(err.logins).toStrictEqual(["conflict-user"])
+      }
+    })
+  )
+})
