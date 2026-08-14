@@ -2,7 +2,7 @@ import { it } from "@effect/vitest"
 import { Effect, Exit, Layer, Option } from "effect"
 import { describe, expect } from "vitest"
 import { ContestId, TeamId, UserId } from "../../src/domain/ids.js"
-import { AuthConfig, OAuthFailed, SessionRepo, TeamRepo, UserRepo } from "../../src/application/ports.js"
+import { AuthConfig, InviteRepo, OAuthFailed, SessionRepo, TeamRepo, UserRepo } from "../../src/application/ports.js"
 import {
   getMe,
   handleOAuthCallback,
@@ -123,10 +123,18 @@ describe("getMe", () => {
 describe("handleOAuthCallback: multi-contest invite consumption", () => {
   const contestAId = ContestId.make("00000000-0000-0000-0000-cccccccdaaa1")
   const contestBId = ContestId.make("00000000-0000-0000-0000-cccccccdaaa2")
+  const contestFinishedId = ContestId.make("00000000-0000-0000-0000-cccccccdaaa3")
   const teamAId = TeamId.make("team-multi-a")
   const teamBId = TeamId.make("team-multi-b")
+  const teamFinishedId = TeamId.make("team-multi-fin")
   const teamA = makeTeam({ id: teamAId, contestId: contestAId, name: "MultiTeamA", teamNumber: 11 })
   const teamB = makeTeam({ id: teamBId, contestId: contestBId, name: "MultiTeamB", teamNumber: 12 })
+  const teamFinished = makeTeam({
+    id: teamFinishedId,
+    contestId: contestFinishedId,
+    name: "MultiTeamFinished",
+    teamNumber: 13
+  })
 
   const inviteA = makeInvite({
     contestId: contestAId,
@@ -142,37 +150,66 @@ describe("handleOAuthCallback: multi-contest invite consumption", () => {
     email: "taro-b@example.com",
     invitedAt: 2000
   })
+  // finished contest への招待は「read-only アーカイブに残る過去の招待」
+  // 相当。listByGithubLoginForLiveContests の status IN フィルタで除外
+  // されるべき(消費すると spurious な membership が発生する)。
+  const inviteFinished = makeInvite({
+    contestId: contestFinishedId,
+    teamId: teamFinishedId,
+    githubLogin: "taro",
+    email: "taro-stale@example.com",
+    invitedAt: 3000
+  })
 
   // makeInviteReposTest は UserRepo/SessionRepo/TeamRepo/InviteRepo を単一 Ref で
   // 共有する。contests を渡すと listByGithubLoginForLiveContests が
   // draft/preparing/running/finalizing のみに絞る (SQL 実装と同じ契約)。
   const multiLayer = Layer.mergeAll(
     makeInviteReposTest({
-      teams: [teamA, teamB],
+      teams: [teamA, teamB, teamFinished],
       contests: [
         makeContest({ id: contestAId, edition: 91, status: "running" }),
-        makeContest({ id: contestBId, edition: 92, status: "draft" })
+        makeContest({ id: contestBId, edition: 92, status: "draft" }),
+        makeContest({
+          id: contestFinishedId,
+          edition: 93,
+          status: "finished",
+          finishedAt: Option.some(2500)
+        })
       ],
-      invites: [inviteA, inviteB]
+      invites: [inviteA, inviteB, inviteFinished]
     }),
     makeGithubOAuthStub(stubCodes),
     Layer.succeed(AuthConfig, { adminGithubLogins: [] })
   )
 
-  it.effect("2 live contest の invite が両方消費され、user.email は invitedAt が新しい方の invite で上書きされる", () =>
+  it.effect("live contest の invite のみ消費し、finished contest の invite は無視される", () =>
     Effect.gen(function* () {
       const { user } = yield* handleOAuthCallback({ code: "code-taro" })
 
-      // 1. 両 contest の team に所属している (findByUserId が contest 別に解決)。
+      // 1. 両 live contest の team に所属している (findByUserId が contest 別に解決)。
       const teams = yield* TeamRepo
       const inA = yield* teams.findByUserId(contestAId, user.id)
       const inB = yield* teams.findByUserId(contestBId, user.id)
       expect(Option.map(inA, (t) => t.id)).toStrictEqual(Option.some(teamAId))
       expect(Option.map(inB, (t) => t.id)).toStrictEqual(Option.some(teamBId))
 
-      // 2. users.email は invitedAt=2000 の inviteB (=最後にループで見た invite) で決まる。
-      //    SQL 側の ORDER BY invited_at ASC と for-of ループの「最後が勝つ」が
-      //    連携することで決定論的に taro-b になる。
+      // 2. finished contest の team には所属していない (status IN フィルタで除外)。
+      const inFinished = yield* teams.findByUserId(contestFinishedId, user.id)
+      expect(inFinished).toStrictEqual(Option.none())
+
+      // 3. finished contest の招待は残っている (=消費されていない)。live のは消えている。
+      const invites = yield* InviteRepo
+      const stillFinished = yield* invites.findByGithubLogin(contestFinishedId, "taro")
+      expect(Option.isSome(stillFinished)).toBe(true)
+      const consumedA = yield* invites.findByGithubLogin(contestAId, "taro")
+      const consumedB = yield* invites.findByGithubLogin(contestBId, "taro")
+      expect(consumedA).toStrictEqual(Option.none())
+      expect(consumedB).toStrictEqual(Option.none())
+
+      // 4. users.email は invitedAt=2000 の inviteB (=最新の *live* invite) で決まる。
+      //    finished contest の invitedAt=3000 は候補外なので、それが users.email
+      //    を上書きしないことを暗黙に確認する。
       const users = yield* UserRepo
       const found = yield* users.findById(user.id)
       expect(Option.isSome(found)).toBe(true)

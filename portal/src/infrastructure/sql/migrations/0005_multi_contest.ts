@@ -302,9 +302,15 @@ export default Effect.gen(function* () {
   yield* sql`ALTER TABLE bench_job_logs_new RENAME TO bench_job_logs`
 
   // 部分ユニークインデックス(0003 と同条件で「非 deleted」を対象とする)。
+  // Task 2/3 レビュー: 0004 の idx_instances_team_idx_active は
+  // (team_id, idx) だけを対象にしていた。teams の PK は (id, contest_id)
+  // で「id」単独ユニークではないため、リポジトリ側の NOT EXISTS ガードが
+  // contest_id を条件に含むのと非対称だった。idx にも contest_id を含めて
+  // ガードと index 定義を一致させる(実 UUID は衝突しないので影響は表面化
+  // していなかったが、DB 側の invariant を明示するために揃える)。
   yield* sql`
     CREATE UNIQUE INDEX idx_instances_team_idx_active
-    ON instances (team_id, idx)
+    ON instances (contest_id, team_id, idx)
     WHERE status != 'deleted'
   `
 

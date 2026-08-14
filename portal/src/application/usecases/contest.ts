@@ -67,7 +67,17 @@ export const startContestUsecase = Effect.gen(function* () {
     )
   )
   // TOCTOU close: cancel と save の間に enqueue された rehearsal を確実に掃く。
-  yield* jobs.cancelQueuedRehearsalsForContest(contest.id)
+  // 既に save で running へ commit しているので、この 2 回目の cancel が
+  // 転移的な IO エラーで落ちても admin に 500 を返すべきではない(retry
+  // すると startContest が「既に running」で InvalidContestTransition を
+  // 出し、orphan は残る)。log に残して呑む方が recovery しやすい。
+  yield* jobs.cancelQueuedRehearsalsForContest(contest.id).pipe(
+    Effect.catchTag("RepoError", (cause) =>
+      Effect.logWarning(
+        `startContestUsecase post-save cancel failed: contestId=${contest.id} cause=${String(cause.cause)}`
+      )
+    )
+  )
   return saved
 })
 

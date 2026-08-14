@@ -110,9 +110,11 @@ export const ContestRepoLive: Layer.Layer<ContestRepo, never, SqlClient.SqlClien
         })
       ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new RepoError({ cause })))),
 
-      // partial unique index 違反を型付きエラーへ分岐する。SqlError の cause から
-      // メッセージを取り出して idx 名を突き合わせる(TeamRepo.create の
-      // SqlError 分類と同型)。
+      // partial unique index 違反を型付きエラーへ分岐する。SqlError の
+      // メッセージ文字列から index 名を掘る従来手法は SQLite ドライバの
+      // メッセージ形式に依存して脆いため、UNIQUE 制約違反を検出したら
+      // 診断 SELECT で「どの partial unique が発火したか」を明示的に判定する
+      // (どちらも 0 件なら未知の SqlError として RepoError にする)。
       create: (c: Contest) =>
         sql`
           INSERT INTO contests (
@@ -137,16 +139,32 @@ export const ContestRepoLive: Layer.Layer<ContestRepo, never, SqlClient.SqlClien
           Effect.asVoid,
           Effect.catchTag(
             "SqlError",
-            (cause): Effect.Effect<void, RepoError | ContestEditionConflict | OperationalContestConflict> => {
-              const message = extractMessage(cause.cause)
-              if (message.includes("idx_contests_edition_live")) {
-                return Effect.fail(new ContestEditionConflict({ edition: c.edition }))
-              }
-              if (message.includes("idx_contests_single_operational")) {
-                return Effect.fail(new OperationalContestConflict())
-              }
-              return Effect.fail(new RepoError({ cause }))
-            }
+            (cause): Effect.Effect<void, RepoError | ContestEditionConflict | OperationalContestConflict> =>
+              Effect.gen(function* () {
+                const message = extractMessage(cause.cause)
+                if (!message.toUpperCase().includes("UNIQUE")) {
+                  return yield* Effect.fail(new RepoError({ cause }))
+                }
+                // idx_contests_edition_live: (edition) WHERE status != 'canceled'
+                if (c.status !== "canceled") {
+                  const editionHit = yield* sql<{ id: string }>`
+                    SELECT id FROM contests WHERE edition = ${c.edition} AND status != 'canceled' LIMIT 1
+                  `.pipe(Effect.catchTag("SqlError", () => Effect.succeed([])))
+                  if (editionHit.length > 0) {
+                    return yield* Effect.fail(new ContestEditionConflict({ edition: c.edition }))
+                  }
+                }
+                // idx_contests_single_operational: (1) WHERE status IN ('preparing','running','finalizing')
+                if (c.status === "preparing" || c.status === "running" || c.status === "finalizing") {
+                  const opHit = yield* sql<{ id: string }>`
+                    SELECT id FROM contests WHERE status IN ('preparing','running','finalizing') LIMIT 1
+                  `.pipe(Effect.catchTag("SqlError", () => Effect.succeed([])))
+                  if (opHit.length > 0) {
+                    return yield* Effect.fail(new OperationalContestConflict())
+                  }
+                }
+                return yield* Effect.fail(new RepoError({ cause }))
+              })
           )
         ),
 

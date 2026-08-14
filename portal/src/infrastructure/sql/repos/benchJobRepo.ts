@@ -206,7 +206,7 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
       // Task 2/3: 意図的に (contest_id, purpose) でフィルタしない。
       // dequeueNextQueued は (contest_id, purpose) で排他するので、旧 contest
       // の running 行は「今は誰も掴んでいない stale 行」として timeout sweep
-      // で失敗にして掃きたい。purpose を分けても実 running は seep 対象で
+      // で失敗にして掃きたい。purpose を分けても実 running は sweep 対象で
       // 同じ扱いになるので、フィルタは付けない。
       failTimedOutJobs: (cutoff: number, now: number) =>
         wrapSqlError(

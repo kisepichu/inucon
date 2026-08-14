@@ -2339,3 +2339,51 @@ layer("BenchJobRepo: cancelQueuedRehearsalsForContest", (it) => {
     })
   )
 })
+
+// Task 2/3 レビュー: ContestRepo.create の error classification は SqlError
+// メッセージから partial unique index 名を掘る fragile な実装なので、
+// 契約が壊れないことを SQL レイヤで直接検証する。
+layer("ContestRepo: create の partial unique index 違反を typed error に落とす", (it) => {
+  it.effect("同じ edition の live contest 2 件目は ContestEditionConflict", () =>
+    Effect.gen(function* () {
+      const contests = yield* ContestRepo
+      const first = makeContest({
+        id: ContestId.make("00000000-0000-0000-0000-cccccccdbbb1"),
+        edition: 111,
+        status: "draft"
+      })
+      yield* contests.create(first)
+
+      const second = makeContest({
+        id: ContestId.make("00000000-0000-0000-0000-cccccccdbbb2"),
+        edition: 111,
+        status: "draft"
+      })
+      const err = yield* Effect.flip(contests.create(second))
+      expect(err._tag).toBe("ContestEditionConflict")
+      if (err._tag === "ContestEditionConflict") {
+        expect(err.edition).toBe(111)
+      }
+    })
+  )
+
+  it.effect("同時に 2 件目の operational contest を作ろうとすると OperationalContestConflict", () =>
+    Effect.gen(function* () {
+      const contests = yield* ContestRepo
+      const first = makeContest({
+        id: ContestId.make("00000000-0000-0000-0000-cccccccdccc1"),
+        edition: 121,
+        status: "running"
+      })
+      yield* contests.create(first)
+
+      const second = makeContest({
+        id: ContestId.make("00000000-0000-0000-0000-cccccccdccc2"),
+        edition: 122,
+        status: "preparing"
+      })
+      const err = yield* Effect.flip(contests.create(second))
+      expect(err._tag).toBe("OperationalContestConflict")
+    })
+  )
+})
