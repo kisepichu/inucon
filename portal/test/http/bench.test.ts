@@ -206,6 +206,49 @@ describe("POST /api/runner/jobs/poll", () => {
       expect(body).toStrictEqual({ job: null })
     }).pipe(Effect.provide(TestLayer))
   )
+
+  // Task 3: pollNextRunnerJob は preparing 契約で purpose='rehearsal' を
+  // 選ぶ。HTTP 経由での poll→rehearsal dequeue 経路を integration で押さえる。
+  it.effect("preparing contest: admin queued rehearsal を poll で受け取れる", () =>
+    Effect.gen(function* () {
+      teamSeq++
+      const contests = yield* ContestRepo
+      // fresh :memory: SQLite なので preparing で seed する。
+      const contest = makeContest({ id: DEFAULT_TEST_CONTEST_ID, status: "preparing" })
+      yield* contests.create(contest)
+
+      const teams = yield* TeamRepo
+      const teamNumber = 90 + teamSeq
+      const team = makeTeam({
+        id: TeamId.make(`team-poll-prep-${teamSeq}`),
+        name: `PrepTeam ${teamSeq}`,
+        teamNumber
+      })
+      yield* teams.create(team)
+
+      // admin ユーザーとして login し、そのチームに所属させる(admin かつ
+      // team member であることで rehearsal enqueue が通る)。
+      const { user, cookieHeader } = yield* asAdmin()
+      yield* teams.setMembers(DEFAULT_TEST_CONTEST_ID, team.id, [user.id])
+
+      const enqueueRes = yield* enqueue(cookieHeader, {
+        targetIp: `10.100.${teamNumber}.5`,
+        targetPort: 8080
+      })
+      expect(enqueueRes.status).toBe(200)
+      const enqueued = (yield* enqueueRes.json) as { id: string; purpose: string }
+      expect(enqueued.purpose).toBe("rehearsal")
+
+      const pollRes = yield* poll()
+      expect(pollRes.status).toBe(200)
+      const body = (yield* pollRes.json) as { job: { id: string; targetIp: string } | null }
+      expect(body.job).not.toBeNull()
+      if (body.job !== null) {
+        expect(body.job.id).toBe(enqueued.id)
+        expect(body.job.targetIp).toBe(`10.100.${teamNumber}.5`)
+      }
+    }).pipe(Effect.provide(TestLayer))
+  )
 })
 
 describe("POST /api/runner/jobs/:id/progress", () => {

@@ -38,6 +38,15 @@ export const startContestUsecase = Effect.gen(function* () {
   // Operation は「in-flight rehearsal が無いこと」を readiness の前提条件
   // として要求するので、その時点でこの過渡状態はそもそも観測不能になる。
   //
+  // TOCTOU sweep: cancel と save は別トランザクションで、間に別 admin が
+  // rehearsal を enqueue すると orphan として残り(runner は
+  // dequeueNextQueued の purpose フィルタで拾わない、insertIfAllowed の
+  // team ガードは purpose 非依存で永久ブロック)、手動 UPDATE でしか
+  // 復旧できない状態になる。save 成功後にもう一度 cancel を呼んで
+  // window を閉じる(2 回目は冪等)。running 遷移後の enqueueBench は
+  // checkEnqueueAllowed が rehearsal を弾くので、post-save 以降に新規
+  // orphan が発生することはない。
+  //
   // Non-atomicity note: cancel と save は別トランザクションなので
   // saveIfRevision が revision conflict で失敗すると "rehearsal は
   // canceled だが contest はまだ preparing" という中間状態が残る。ただし
@@ -50,9 +59,12 @@ export const startContestUsecase = Effect.gen(function* () {
   // Task 10 の guarded_start Operation が durable step として置き換わる
   // タイミングでこの非同期性は消える。
   yield* jobs.cancelQueuedRehearsalsForContest(contest.id)
-  return yield* repo.saveIfRevision(started, contest.revision).pipe(
+  const saved = yield* repo.saveIfRevision(started, contest.revision).pipe(
     Effect.catchTag("ContestRevisionConflict", (cause) => Effect.fail(new RepoError({ cause })))
   )
+  // TOCTOU close: cancel と save の間に enqueue された rehearsal を確実に掃く。
+  yield* jobs.cancelQueuedRehearsalsForContest(contest.id)
+  return saved
 })
 
 // POST /api/admin/contest/finish は Task 1 の互換ブリッジ層。running ->

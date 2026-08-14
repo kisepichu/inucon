@@ -2268,3 +2268,74 @@ layer("BenchJobRepo: dequeueNextQueued は同一 contest でも purpose 別に�
     })
   )
 })
+
+// Task 2/3 レビュー: startContestUsecase の TOCTOU sweep で使う bulk cancel。
+// WHERE contest_id=? AND status='queued' AND purpose='rehearsal' が SQL 上で
+// 正しく効き、competition や running rehearsal を汚さないことを検証する。
+layer("BenchJobRepo: cancelQueuedRehearsalsForContest", (it) => {
+  it.effect("queued rehearsal のみ canceled にし、他 purpose / 他 status は無傷", () =>
+    Effect.gen(function* () {
+      yield* seedContest("preparing")
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+
+      const rehQueuedTeam = makeTeam({ id: TeamId.make("team-crq-reh-q"), name: "RehQueued", teamNumber: 61 })
+      const rehRunningTeam = makeTeam({ id: TeamId.make("team-crq-reh-r"), name: "RehRunning", teamNumber: 62 })
+      const compQueuedTeam = makeTeam({ id: TeamId.make("team-crq-com-q"), name: "CompQueued", teamNumber: 63 })
+      yield* teams.create(rehQueuedTeam)
+      yield* teams.create(rehRunningTeam)
+      yield* teams.create(compQueuedTeam)
+
+      // 1. running rehearsal を先に用意する:古い enqueuedAt で挿入 →
+      //    dequeueNextQueued(rehearsal) で running へ遷移させる。
+      const rehRunning = newJob({
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        purpose: "rehearsal",
+        id: BenchJobId.make("bj-crq-reh-r"),
+        teamId: rehRunningTeam.id,
+        targetIp: "10.100.62.5",
+        targetPort: 8080,
+        now: 1000
+      })
+      yield* jobs.insertIfAllowed(rehRunning)
+      yield* jobs.dequeueNextQueued({ contestId: DEFAULT_TEST_CONTEST_ID, purpose: "rehearsal" }, 1500)
+
+      // 2. queued rehearsal(掃除対象)。上の running より新しい enqueuedAt。
+      const rehQueued = newJob({
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        purpose: "rehearsal",
+        id: BenchJobId.make("bj-crq-reh-q"),
+        teamId: rehQueuedTeam.id,
+        targetIp: "10.100.61.5",
+        targetPort: 8080,
+        now: 2000
+      })
+      yield* jobs.insertIfAllowed(rehQueued)
+
+      // 3. queued competition(purpose が違うので掃除対象外)。
+      //    preparing でも DB 側は insertIfAllowed に competition purpose を渡せる
+      //    (checkEnqueueAllowed は domain 層で、リポジトリは purpose を保存するだけ)。
+      const compQueued = newJob({
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        purpose: "competition",
+        id: BenchJobId.make("bj-crq-com-q"),
+        teamId: compQueuedTeam.id,
+        targetIp: "10.100.63.5",
+        targetPort: 8080,
+        now: 4000
+      })
+      yield* jobs.insertIfAllowed(compQueued)
+
+      yield* jobs.cancelQueuedRehearsalsForContest(DEFAULT_TEST_CONTEST_ID)
+
+      const afterRehQ = yield* jobs.findById(rehQueued.id)
+      expect(Option.map(afterRehQ, (j) => j.status)).toStrictEqual(Option.some("canceled"))
+
+      const afterRehR = yield* jobs.findById(rehRunning.id)
+      expect(Option.map(afterRehR, (j) => j.status)).toStrictEqual(Option.some("running"))
+
+      const afterCompQ = yield* jobs.findById(compQueued.id)
+      expect(Option.map(afterCompQ, (j) => j.status)).toStrictEqual(Option.some("queued"))
+    })
+  )
+})

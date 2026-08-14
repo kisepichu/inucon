@@ -2,6 +2,7 @@ import { Clock, Effect, Either, Option } from "effect"
 import type { BenchJob, BenchJobPurpose } from "../../domain/benchJob.js"
 import { checkEnqueueAllowed, newJob } from "../../domain/benchJob.js"
 import { ContestNotRunning } from "../../domain/errors.js"
+import type { Contest } from "../../domain/contest.js"
 import type { User } from "../../domain/user.js"
 import type { ContestId } from "../../domain/ids.js"
 import { BenchJobId, InstanceId, TeamId } from "../../domain/ids.js"
@@ -19,18 +20,24 @@ export const enqueueBench = (args: {
   targetIp: string
   targetPort: number
   requireRunningInstance?: { instanceId: InstanceId }
+  // enqueueBenchJob が既に operational contest を解決している場合は流用して
+  // getOperational の二重呼びを避ける(caller-defined snapshot を使うことで
+  // running→finalizing 過渡でも同じ contest.status を判定に使える)。
+  contest?: Contest
 }) =>
   Effect.gen(function* () {
     // 0 contest の状態は「未作成 = 準備中」として ContestNotRunning。
-    const contest = yield* ContestRepo.pipe(
-      Effect.flatMap((r) => r.getOperational),
-      Effect.flatMap(
-        Option.match({
-          onNone: () => Effect.fail(new ContestNotRunning({ status: "preparing" })),
-          onSome: Effect.succeed
-        })
-      )
-    )
+    const contest =
+      args.contest ??
+      (yield* ContestRepo.pipe(
+        Effect.flatMap((r) => r.getOperational),
+        Effect.flatMap(
+          Option.match({
+            onNone: () => Effect.fail(new ContestNotRunning({ status: "preparing" })),
+            onSome: Effect.succeed
+          })
+        )
+      ))
 
     const team = yield* TeamRepo.pipe(
       Effect.flatMap((r) => r.findByUserId(contest.id, args.user.id)),
@@ -186,7 +193,8 @@ export const enqueueBenchJob = (args: {
         user: args.user,
         targetIp: instance.privateIp,
         targetPort: 80,
-        requireRunningInstance: { instanceId: instance.id }
+        requireRunningInstance: { instanceId: instance.id },
+        contest
       })
     }
     return yield* enqueueBench({
