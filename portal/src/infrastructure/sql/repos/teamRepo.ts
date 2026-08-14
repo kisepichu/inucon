@@ -1,16 +1,19 @@
 import { SqlClient } from "@effect/sql"
 import { Clock, Effect, Layer, Option } from "effect"
-import type { TeamId, UserId } from "../../../domain/ids.js"
+import type { ContestId, TeamId, UserId } from "../../../domain/ids.js"
 import { Team } from "../../../domain/team.js"
 import { User } from "../../../domain/user.js"
 import { TeamNumberConflict } from "../../../domain/errors.js"
-import { TeamRepo } from "../../../application/ports.js"
+import { MemberConflict } from "../../../application/errors.js"
+import { RepoError, TeamRepo } from "../../../application/ports.js"
 import { decodeRow, nullableIntToBool, wrapSqlError } from "./support.js"
 
 interface TeamRow {
   readonly id: string
+  readonly contestId: string
   readonly name: string
   readonly teamNumber: number
+  readonly desiredInstanceCount: number
 }
 
 interface UserRow {
@@ -22,53 +25,65 @@ interface UserRow {
   readonly email: string | null
 }
 
-const decodeTeam = (row: TeamRow) => decodeRow(Team, row)
-const decodeUser = (row: UserRow) => decodeRow(User, { ...row, isAdmin: nullableIntToBool(row.isAdmin) })
+const TEAM_COLUMNS = `id, contest_id AS contestId, name, team_number AS teamNumber,
+  desired_instance_count AS desiredInstanceCount`
 
 export const TeamRepoLive: Layer.Layer<TeamRepo, never, SqlClient.SqlClient> = Layer.effect(
   TeamRepo,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient
+    const columns = sql.literal(TEAM_COLUMNS)
 
     return {
-      list: wrapSqlError(
-        sql<TeamRow>`SELECT id, name, team_number AS teamNumber FROM teams ORDER BY team_number`
-      ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeTeam))),
-
-      findById: (id: TeamId) =>
+      listByContest: (contestId: ContestId) =>
         wrapSqlError(
-          sql<TeamRow>`SELECT id, name, team_number AS teamNumber FROM teams WHERE id = ${id}`
+          sql<TeamRow>`SELECT ${columns} FROM teams WHERE contest_id = ${contestId} ORDER BY team_number`
+        ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, (row) => decodeRow(Team, row)))),
+
+      findById: (contestId: ContestId, id: TeamId) =>
+        wrapSqlError(
+          sql<TeamRow>`SELECT ${columns} FROM teams WHERE id = ${id} AND contest_id = ${contestId}`
         ).pipe(
           Effect.flatMap((rows) =>
-            rows.length === 0 ? Effect.succeed(Option.none<Team>()) : decodeTeam(rows[0]).pipe(Effect.map(Option.some))
+            rows.length === 0
+              ? Effect.succeed(Option.none<Team>())
+              : decodeRow(Team, rows[0]).pipe(Effect.map(Option.some))
           )
         ),
 
-      findByUserId: (userId: UserId) =>
+      // scoped unique(contest_id, user_id)を辿って対象 contest 内の所属チーム
+      // を返す。異なる contest では同じ user が別チームに所属できる。
+      findByUserId: (contestId: ContestId, userId: UserId) =>
         wrapSqlError(
           sql<TeamRow>`
-            SELECT teams.id AS id, teams.name AS name, teams.team_number AS teamNumber
+            SELECT teams.id AS id, teams.contest_id AS contestId, teams.name AS name,
+                   teams.team_number AS teamNumber,
+                   teams.desired_instance_count AS desiredInstanceCount
             FROM team_members
-            JOIN teams ON teams.id = team_members.team_id
-            WHERE team_members.user_id = ${userId}
+            JOIN teams ON teams.id = team_members.team_id AND teams.contest_id = team_members.contest_id
+            WHERE team_members.user_id = ${userId} AND team_members.contest_id = ${contestId}
           `
         ).pipe(
           Effect.flatMap((rows) =>
-            rows.length === 0 ? Effect.succeed(Option.none<Team>()) : decodeTeam(rows[0]).pipe(Effect.map(Option.some))
+            rows.length === 0
+              ? Effect.succeed(Option.none<Team>())
+              : decodeRow(Team, rows[0]).pipe(Effect.map(Option.some))
           )
         ),
 
-      // team_number の UNIQUE 制約は「INSERT ... SELECT ... WHERE NOT EXISTS
-      // ... RETURNING」の単一原子的操作で検出する(benchJobRepo.insertIfAllowed
-      // と同じ形。SQL エラーメッセージの文字列判定より TOCTOU 安全)。
+      // (contest_id, team_number) の UNIQUE 制約は「INSERT ... SELECT ... WHERE
+      // NOT EXISTS ... RETURNING」の単一原子的操作で TOCTOU なく検出する
+      // (benchJobRepo.insertIfAllowed と同型)。
       create: (t: Team) =>
         Effect.gen(function* () {
           const now = yield* Clock.currentTimeMillis
           const rows = yield* wrapSqlError(
             sql<{ id: string }>`
-              INSERT INTO teams (id, name, team_number, created_at)
-              SELECT ${t.id}, ${t.name}, ${t.teamNumber}, ${now}
-              WHERE NOT EXISTS (SELECT 1 FROM teams WHERE team_number = ${t.teamNumber})
+              INSERT INTO teams (id, contest_id, name, team_number, desired_instance_count, created_at)
+              SELECT ${t.id}, ${t.contestId}, ${t.name}, ${t.teamNumber}, ${t.desiredInstanceCount}, ${now}
+              WHERE NOT EXISTS (
+                SELECT 1 FROM teams WHERE contest_id = ${t.contestId} AND team_number = ${t.teamNumber}
+              )
               RETURNING id
             `
           )
@@ -77,49 +92,89 @@ export const TeamRepoLive: Layer.Layer<TeamRepo, never, SqlClient.SqlClient> = L
           }
         }),
 
-      // 既存メンバーを全消しして渡された userIds で置き換える(全量置換)。
-      setMembers: (teamId: TeamId, userIds: ReadonlyArray<UserId>) =>
-        wrapSqlError(
-          sql.withTransaction(
-            Effect.gen(function* () {
-              yield* sql`DELETE FROM team_members WHERE team_id = ${teamId}`
+      // Task 2/3 レビュー: usecases 側の pre-check (findByUserId) と
+      // setMembers の書き込みは別トランザクションなので、その間に
+      // concurrent addMember (consumeLiveInvitesOnLogin 等) が同一 contest
+      // 内の別チームに user を入れた場合、INSERT が UNIQUE(contest_id,
+      // user_id) で落ちる。素の SqlError → RepoError → 500 は誤解を招く
+      // (実態は MemberConflict の 409 相当)ので、UNIQUE 違反を検出したら
+      // 診断 SELECT で衝突していた user の github_login を集めて
+      // MemberConflict に落とす。DELETE + INSERT + 診断 SELECT を同一
+      // sql.withTransaction 内で走らせて INSERT 失敗後の snapshot も
+      // 一貫させる(iter 16 レビュー #1)。
+      setMembers: (contestId: ContestId, teamId: TeamId, userIds: ReadonlyArray<UserId>) =>
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const writeResult = yield* Effect.gen(function* () {
+              yield* sql`
+                DELETE FROM team_members
+                WHERE contest_id = ${contestId} AND team_id = ${teamId}
+              `
               if (userIds.length > 0) {
                 yield* sql`
                   INSERT INTO team_members
-                  ${sql.insert(userIds.map((userId) => ({ team_id: teamId, user_id: userId })))}
+                  ${sql.insert(userIds.map((userId) => ({
+                    contest_id: contestId,
+                    team_id: teamId,
+                    user_id: userId
+                  })))}
                 `
               }
-            })
-          )
-        ),
+              return { ok: true as const }
+            }).pipe(
+              Effect.catchTag("SqlError", (cause) => Effect.succeed({ ok: false as const, cause }))
+            )
+            if (writeResult.ok) return
 
-      // 単一メンバーの追加(Phase 3 招待フロー)。team_members.user_id は
-      // UNIQUE。TOCTOU 回避のため「INSERT ... SELECT ... WHERE NOT EXISTS
-      // ... RETURNING」の単一原子的操作で判定する(TeamRepo.create /
-      // benchJobRepo.insertIfAllowed と同型)。0 行挿入(= 既に何らかのチーム
-      // に所属済み)なら false を返す。他チームからの横取り防止・冪等判定
-      // (要求チームと同じか異なるか)は呼び出し元
-      // (application/usecases/invites.ts・auth.ts)が false を見て行う責務。
-      addMember: (teamId: TeamId, userId: UserId) =>
+            // INSERT 失敗後、同一 tx 内で診断 SELECT を走らせる。呼び出し元の
+            // pre-check が「別チーム所属じゃない」と判定した user のうち、
+            // 実際は別チームに存在しているものを github_login 付きで拾う。
+            const conflicts = yield* sql<{ githubLogin: string }>`
+              SELECT u.github_login AS githubLogin
+              FROM team_members tm
+              JOIN users u ON u.id = tm.user_id
+              WHERE tm.contest_id = ${contestId}
+                AND tm.team_id <> ${teamId}
+                AND tm.user_id IN ${sql.in(userIds)}
+            `.pipe(Effect.catchTag("SqlError", () => Effect.succeed([])))
+            if (conflicts.length > 0) {
+              return yield* Effect.fail(
+                new MemberConflict({ logins: conflicts.map((row) => row.githubLogin) })
+              )
+            }
+            return yield* Effect.fail(new RepoError({ cause: writeResult.cause }))
+          })
+        ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new RepoError({ cause })))),
+
+      // scoped unique(contest_id, user_id)を TOCTOU なく判定する。同じ user が
+      // 別 contest には所属可能。0 行挿入なら false(既に同一 contest 内の
+      // どこかのチームへ所属している)。
+      addMember: (contestId: ContestId, teamId: TeamId, userId: UserId) =>
         wrapSqlError(
           sql<{ userId: string }>`
-            INSERT INTO team_members (team_id, user_id)
-            SELECT ${teamId}, ${userId}
-            WHERE NOT EXISTS (SELECT 1 FROM team_members WHERE user_id = ${userId})
+            INSERT INTO team_members (contest_id, team_id, user_id)
+            SELECT ${contestId}, ${teamId}, ${userId}
+            WHERE NOT EXISTS (
+              SELECT 1 FROM team_members WHERE contest_id = ${contestId} AND user_id = ${userId}
+            )
             RETURNING user_id AS "userId"
           `
         ).pipe(Effect.map((rows) => rows.length > 0)),
 
-      listMembers: (teamId: TeamId) =>
+      listMembers: (contestId: ContestId, teamId: TeamId) =>
         wrapSqlError(
           sql<UserRow>`
             SELECT users.id AS id, users.github_id AS githubId, users.github_login AS githubLogin,
                    users.display_name AS displayName, users.is_admin AS isAdmin, users.email AS email
             FROM team_members
             JOIN users ON users.id = team_members.user_id
-            WHERE team_members.team_id = ${teamId}
+            WHERE team_members.contest_id = ${contestId} AND team_members.team_id = ${teamId}
           `
-        ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeUser)))
+        ).pipe(
+          Effect.flatMap((rows) =>
+            Effect.forEach(rows, (row) => decodeRow(User, { ...row, isAdmin: nullableIntToBool(row.isAdmin) }))
+          )
+        )
     }
   })
 )

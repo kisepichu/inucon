@@ -1,48 +1,71 @@
 import { Effect, Option } from "effect"
-import { TeamId } from "../../domain/ids.js"
+import type { ContestId, TeamId } from "../../domain/ids.js"
+import { TeamId as TeamIdBrand } from "../../domain/ids.js"
 import { Team } from "../../domain/team.js"
 import type { User } from "../../domain/user.js"
-import { MemberConflict, TeamNotFound, UnknownGithubLogins } from "../errors.js"
-import { TeamRepo, UserRepo, UuidGen } from "../ports.js"
+import { ContestNotFound, MemberConflict, TeamNotFound, UnknownGithubLogins } from "../errors.js"
+import { ContestRepo, TeamRepo, UserRepo, UuidGen } from "../ports.js"
 
-// GET /api/teams: 一覧 + 各チームのメンバー(githubLogin 込み)。チーム数は
-// 小規模(コンテスト運営規模)前提で N+1 のまま素直に書く。
+// Task 3: compat handler は「今 operational な contest」を解決してから scoped
+// repo を呼ぶ。0 contest 状態(admin が draft を作る前)は ContestNotFound。
+// Task 5 で明示 contestId を受ける path が入り、この resolveOperationalContestId
+// はそのまま /api/contests/:contestId/... 系の下敷きになる。
+const resolveOperationalContestId = ContestRepo.pipe(
+  Effect.flatMap((repo) => repo.getOperational),
+  Effect.flatMap(Option.match({ onNone: () => Effect.fail(new ContestNotFound()), onSome: Effect.succeed })),
+  Effect.map((c) => c.id)
+)
+
+// GET /api/teams: operational な contest のチーム一覧 + メンバー(githubLogin
+// 込み)。チーム数は小規模(コンテスト運営規模)前提で N+1 のまま素直に書く。
 export const listTeamsWithMembers = Effect.gen(function* () {
+  const contestId = yield* resolveOperationalContestId
   const teams = yield* TeamRepo
-  const all = yield* teams.list
+  const all = yield* teams.listByContest(contestId)
   return yield* Effect.forEach(all, (team) =>
-    teams.listMembers(team.id).pipe(Effect.map((members) => ({ team, members })))
+    teams.listMembers(contestId, team.id).pipe(Effect.map((members) => ({ team, members })))
   )
 })
 
-// POST /api/teams: 重複 teamNumber は TeamRepo.create が TeamNumberConflict
-// で返す(呼び出し元のハンドラが 409 にマップする)。
+// POST /api/teams: 現在の operational contest に新規チームを作る。desiredInstance
+// Count は現状 admin UI 未対応のため既定 3(Task 5 で wizard から明示指定)。
+// 重複 teamNumber は TeamRepo.create が TeamNumberConflict(409)。
 export const createTeam = (args: { name: string; teamNumber: number }) =>
   Effect.gen(function* () {
+    const contestId = yield* resolveOperationalContestId
     const uuidGen = yield* UuidGen
-    const id = TeamId.make(yield* uuidGen.next)
-    const team = new Team({ id, name: args.name, teamNumber: args.teamNumber })
+    const id = TeamIdBrand.make(yield* uuidGen.next)
+    const team = new Team({
+      id,
+      contestId,
+      name: args.name,
+      teamNumber: args.teamNumber,
+      desiredInstanceCount: 3
+    })
     const teams = yield* TeamRepo
     yield* teams.create(team)
     return team
   })
 
-// PUT /api/teams/:id/members: 全量置換。
-// 1. 対象チームが存在するか(NotFound)
-// 2. 渡された githubLogins が全員 users に実在するか(未ログインは
-//    UnknownGithubLogins、422)
-// 3. 実在する場合、既に他チームに所属していないか(他チーム所属を黙って
-//    横取りしないよう MemberConflict、409)
-// を順にチェックしてから setMembers する。
+// PUT /api/teams/:id/members(scoped 全量置換)。
 export const setTeamMembers = (args: { teamId: TeamId; githubLogins: ReadonlyArray<string> }) =>
   Effect.gen(function* () {
-    // ペイロード内の重複 login はそのまま INSERT すると team_members の
-    // PRIMARY KEY (team_id, user_id) 違反(RepoError → 500)になるため、
-    // 先頭出現順を保って重複排除する。
+    const contestId = yield* resolveOperationalContestId
+    return yield* setTeamMembersScoped({ contestId, teamId: args.teamId, githubLogins: args.githubLogins })
+  })
+
+// contestId 明示版(Task 5 の contest-scoped admin endpoint 実装で直接呼ぶ)。
+export const setTeamMembersScoped = (args: {
+  contestId: ContestId
+  teamId: TeamId
+  githubLogins: ReadonlyArray<string>
+}) =>
+  Effect.gen(function* () {
+    // ペイロード内の重複 login は team_members の PK 違反(500)を招くので排除。
     const logins = [...new Set(args.githubLogins)]
 
     const teams = yield* TeamRepo
-    const team = yield* teams.findById(args.teamId).pipe(
+    const team = yield* teams.findById(args.contestId, args.teamId).pipe(
       Effect.flatMap(Option.match({ onNone: () => Effect.fail(new TeamNotFound()), onSome: Effect.succeed }))
     )
 
@@ -58,7 +81,7 @@ export const setTeamMembers = (args: { teamId: TeamId; githubLogins: ReadonlyArr
     const conflicts: Array<string> = []
     for (const login of logins) {
       const user = foundByLogin.get(login)!
-      const currentTeam = yield* teams.findByUserId(user.id)
+      const currentTeam = yield* teams.findByUserId(args.contestId, user.id)
       if (Option.isSome(currentTeam) && currentTeam.value.id !== args.teamId) {
         conflicts.push(login)
       }
@@ -68,9 +91,8 @@ export const setTeamMembers = (args: { teamId: TeamId; githubLogins: ReadonlyArr
     }
 
     const userIds = logins.map((login) => foundByLogin.get(login)!.id)
-    yield* teams.setMembers(args.teamId, userIds)
+    yield* teams.setMembers(args.contestId, args.teamId, userIds)
 
-    const members = yield* teams.listMembers(args.teamId)
+    const members = yield* teams.listMembers(args.contestId, args.teamId)
     return { team, members }
   })
-

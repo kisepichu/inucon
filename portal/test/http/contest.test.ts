@@ -43,7 +43,7 @@ describe("GET /api/contest", () => {
         templateVmid: 9100,
         instanceQuota: 3
       })
-      yield* contests.save(contest)
+      yield* contests.create(contest)
 
       const { cookieHeader } = yield* login()
       const client = yield* HttpClient.HttpClient
@@ -85,7 +85,7 @@ describe("POST /api/admin/contest/start", () => {
   it.effect("非 admin は403", () =>
     Effect.gen(function* () {
       const contests = yield* ContestRepo
-      yield* contests.save(makeContest({ status: "preparing" }))
+      yield* contests.create(makeContest({ status: "preparing" }))
       const { cookieHeader } = yield* login({ isAdmin: false })
       const res = yield* start(cookieHeader)
       expect(res.status).toBe(403)
@@ -103,7 +103,7 @@ describe("POST /api/admin/contest/start", () => {
   it.effect("preparing からは running になり startedAt が刻まれる", () =>
     Effect.gen(function* () {
       const contests = yield* ContestRepo
-      yield* contests.save(makeContest({ status: "preparing" }))
+      yield* contests.create(makeContest({ status: "preparing" }))
       const { cookieHeader } = yield* asAdmin()
       const res = yield* start(cookieHeader)
       expect(res.status).toBe(200)
@@ -117,7 +117,7 @@ describe("POST /api/admin/contest/start", () => {
   it.effect("running からの start は409(不正遷移)", () =>
     Effect.gen(function* () {
       const contests = yield* ContestRepo
-      yield* contests.save(makeContest({ status: "running", startedAt: Option.some(1) }))
+      yield* contests.create(makeContest({ status: "running", startedAt: Option.some(1) }))
       const { cookieHeader } = yield* asAdmin()
       const res = yield* start(cookieHeader)
       expect(res.status).toBe(409)
@@ -137,7 +137,7 @@ describe("POST /api/admin/contest/finish (compat bridge: running -> finalizing -
   it.effect("非 admin は403", () =>
     Effect.gen(function* () {
       const contests = yield* ContestRepo
-      yield* contests.save(makeContest({ status: "running" }))
+      yield* contests.create(makeContest({ status: "running" }))
       const { cookieHeader } = yield* login({ isAdmin: false })
       const res = yield* finish(cookieHeader)
       expect(res.status).toBe(403)
@@ -155,7 +155,7 @@ describe("POST /api/admin/contest/finish (compat bridge: running -> finalizing -
   it.effect("running からは finalizing -> finished を 1 save で通過し、finalizingAt/finishedAt が刻まれる", () =>
     Effect.gen(function* () {
       const contests = yield* ContestRepo
-      yield* contests.save(makeContest({ status: "running" }))
+      yield* contests.create(makeContest({ status: "running" }))
       const { cookieHeader } = yield* asAdmin()
       const res = yield* finish(cookieHeader)
       expect(res.status).toBe(200)
@@ -176,7 +176,7 @@ describe("POST /api/admin/contest/finish (compat bridge: running -> finalizing -
   it.effect("preparing からの finish は409(beginFinalization が拒否)", () =>
     Effect.gen(function* () {
       const contests = yield* ContestRepo
-      yield* contests.save(makeContest({ status: "preparing" }))
+      yield* contests.create(makeContest({ status: "preparing" }))
       const { cookieHeader } = yield* asAdmin()
       const res = yield* finish(cookieHeader)
       expect(res.status).toBe(409)

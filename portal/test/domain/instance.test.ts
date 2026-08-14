@@ -12,14 +12,16 @@ import {
   vmidFor
 } from "../../src/domain/instance.js"
 import { InvalidInstanceTransition } from "../../src/domain/errors.js"
-import { InstanceId, TeamId } from "../../src/domain/ids.js"
+import { ContestId, InstanceId, TeamId } from "../../src/domain/ids.js"
 
 const instanceId = InstanceId.make("11111111-1111-1111-1111-111111111111")
 const teamId = TeamId.make("22222222-2222-2222-2222-222222222222")
+const contestId = ContestId.make("33333333-3333-3333-3333-333333333333")
 
 const makeInstance = (status: Instance["status"], progress: Instance["progress"] = []) =>
   new Instance({
     id: instanceId,
+    contestId,
     teamId,
     index: 1,
     vmid: 1101,
@@ -47,7 +49,7 @@ describe("vmidFor / ipFor", () => {
 
 describe("newInstance", () => {
   it("status=creating, progress=[], vmid/ip 計算済みで生成する", () => {
-    const instance = newInstance({ id: instanceId, teamId, index: 1, teamNumber: 1, now: 1000 })
+    const instance = newInstance({ id: instanceId, contestId, teamId, index: 1, teamNumber: 1, now: 1000 })
     expect(instance.status).toBe("creating")
     expect(instance.vmid).toBe(1101)
     expect(instance.privateIp).toBe("10.100.1.11")

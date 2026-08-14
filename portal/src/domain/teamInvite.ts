@@ -1,10 +1,11 @@
 import { Schema } from "effect"
-import { TeamId } from "./ids.js"
+import { ContestId, TeamId } from "./ids.js"
 
-// team_invites の 1 行(スペック §Invite): 未ログインユーザーへの事前割当。
-// githubLogin が PK(migration 0002)。本人が初ログインしたとき自動で
-// teamId のチームに所属し、この行は消費(削除)される。
+// Task 3: team_invites の 1 行は contest スコープ。(contestId, githubLogin) が
+// PK(migration 0005)。同じ login が異なる contest に招待されうる。同一
+// contest 内での再招待は upsert(team/email 上書き)。
 export class TeamInvite extends Schema.Class<TeamInvite>("TeamInvite")({
+  contestId: ContestId,
   githubLogin: Schema.String,
   teamId: TeamId,
   email: Schema.String,

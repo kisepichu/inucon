@@ -2,8 +2,8 @@ import { it } from "@effect/vitest"
 import { Effect, Layer, Option, TestClock } from "effect"
 import { describe, expect } from "vitest"
 import { InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
-import { Instance, ipFor, vmidFor } from "../../src/domain/instance.js"
-import { Team } from "../../src/domain/team.js"
+import { ipFor, vmidFor } from "../../src/domain/instance.js"
+import type { Instance } from "../../src/domain/instance.js"
 import { User } from "../../src/domain/user.js"
 import { InstanceRepo } from "../../src/application/ports.js"
 import { ProvisionerLive } from "../../src/infrastructure/worker/provisioner.js"
@@ -16,6 +16,7 @@ import {
   makeTeamRepoTest,
   ProvisioningConfigTest
 } from "../support/inMemory.js"
+import { DEFAULT_TEST_CONTEST_ID, makeInstance, makeTeam } from "../support/factories.js"
 
 // ProvisionerLive は「Layer として動く」ことが要点(TimeoutSweeper と同型):
 // 2 秒ごとに creating/deleting の instance を 1 件拾って saga を進める。ここでは
@@ -28,8 +29,8 @@ const team2Id = TeamId.make("22222222-2222-2222-2222-222222222222")
 const aliceId = UserId.make("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 const carolId = UserId.make("cccccccc-cccc-cccc-cccc-cccccccccccc")
 
-const team1 = new Team({ id: team1Id, name: "team1", teamNumber: 1 })
-const team2 = new Team({ id: team2Id, name: "team2", teamNumber: 2 })
+const team1 = makeTeam({ id: team1Id, name: "team1", teamNumber: 1 })
+const team2 = makeTeam({ id: team2Id, name: "team2", teamNumber: 2 })
 const alice = new User({
   id: aliceId,
   githubId: 1,
@@ -50,8 +51,8 @@ const carol = new User({
 const teamRepoLayer = makeTeamRepoTest({
   teams: [team1, team2],
   memberships: [
-    { userId: aliceId, teamId: team1Id },
-    { userId: carolId, teamId: team2Id }
+    { contestId: DEFAULT_TEST_CONTEST_ID, userId: aliceId, teamId: team1Id },
+    { contestId: DEFAULT_TEST_CONTEST_ID, userId: carolId, teamId: team2Id }
   ],
   users: [alice, carol]
 })
@@ -62,7 +63,7 @@ const githubKeysLayer = makeGithubKeysPortTest({
 })
 
 const creating = (args: { id: string; teamId: TeamId; index: number; teamNumber: number; createdAt: number }) =>
-  new Instance({
+  makeInstance({
     id: InstanceId.make(args.id),
     teamId: args.teamId,
     index: args.index,
@@ -70,9 +71,7 @@ const creating = (args: { id: string; teamId: TeamId; index: number; teamNumber:
     privateIp: ipFor(args.teamNumber, args.index),
     status: "creating",
     progress: [],
-    errorMessage: Option.none(),
-    createdAt: args.createdAt,
-    updatedAt: args.createdAt
+    createdAt: args.createdAt
   })
 
 const workerWith = (instances: ReadonlyArray<Instance>) => {
@@ -134,17 +133,14 @@ describe("ProvisionerLive", () => {
 
   it.effect("deleting の instance を deleted まで進める", () =>
     Effect.gen(function* () {
-      const inst = new Instance({
+      const inst = makeInstance({
         id: InstanceId.make("w-del"),
         teamId: team1Id,
         index: 1,
         vmid: vmidFor(1, 1),
         privateIp: ipFor(1, 1),
         status: "deleting",
-        progress: ["clone_done", "configured", "started", "route_done", "access_done"],
-        errorMessage: Option.none(),
-        createdAt: 0,
-        updatedAt: 0
+        progress: ["clone_done", "configured", "started", "route_done", "access_done"]
       })
       yield* Effect.gen(function* () {
         yield* TestClock.adjust("1 millis")

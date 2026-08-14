@@ -47,8 +47,10 @@ export type User = typeof User.Type
 
 export const Team = Schema.Struct({
   id: TeamId,
+  contestId: ContestId,
   name: Schema.String,
-  teamNumber: Schema.Int.pipe(Schema.between(1, 254))
+  teamNumber: Schema.Int.pipe(Schema.between(1, 254)),
+  desiredInstanceCount: Schema.Int.pipe(Schema.nonNegative())
 })
 export type Team = typeof Team.Type
 
@@ -127,6 +129,7 @@ export type ProvisionStep = typeof ProvisionStep.Type
 // 同じ方針)。
 export const Instance = Schema.Struct({
   id: InstanceId,
+  contestId: ContestId,
   teamId: TeamId,
   index: Schema.Int.pipe(Schema.positive()),
   vmid: Schema.Int,
@@ -182,6 +185,7 @@ export type InviteRequest = typeof InviteRequest.Type
 
 // GET /api/admin/teams/:id/invites: 招待中(未消費)の team_invites 行。
 export const TeamInvite = Schema.Struct({
+  contestId: ContestId,
   githubLogin: Schema.String,
   teamId: TeamId,
   email: Schema.String,
@@ -221,15 +225,20 @@ export type BenchJobId = typeof BenchJobId.Type
 export const BenchJobStatus = Schema.Literal("queued", "running", "finished", "canceled", "failed")
 export type BenchJobStatus = typeof BenchJobStatus.Type
 
+export const BenchJobPurpose = Schema.Literal("rehearsal", "competition")
+export type BenchJobPurpose = typeof BenchJobPurpose.Type
+
 // domain の BenchJob(Option フィールド)は境界を跨がないため、ハンドラが
 // Option.getOrNull で変換してこの Struct(null 許容)に合わせる(teams.ts の
 // toTeamMember と同じ方針)。
 export const BenchJob = Schema.Struct({
   id: BenchJobId,
+  contestId: ContestId,
   teamId: TeamId,
   targetIp: Schema.String,
   targetPort: Schema.Int.pipe(Schema.between(1, 65535)),
   status: BenchJobStatus,
+  purpose: BenchJobPurpose,
   score: Schema.NullOr(Schema.Int),
   passed: Schema.NullOr(Schema.Boolean),
   errorMessage: Schema.NullOr(Schema.String),

@@ -1,7 +1,7 @@
 import { Clock, Effect, Either, Option } from "effect"
 import { addStep, markDeleted, markFailed, markProvisioned } from "../../domain/instance.js"
 import type { Instance, ProvisionStep } from "../../domain/instance.js"
-import type { TeamId } from "../../domain/ids.js"
+import type { ContestId, TeamId } from "../../domain/ids.js"
 import { InsufficientMemory } from "../errors.js"
 import {
   CloudflareError,
@@ -66,6 +66,7 @@ export const describeError = (e: unknown): string => {
 //   のではなく warning として可視化する)。招待中(team_invites)は admin が
 //   email を必須入力しているため、この意味での欠落は起こらない。
 export const collectTeamAccess = (
+  contestId: ContestId,
   teamId: TeamId
 ): Effect.Effect<
   {
@@ -80,8 +81,8 @@ export const collectTeamAccess = (
     const teams = yield* TeamRepo
     const githubKeys = yield* GithubKeysPort
     const invites = yield* InviteRepo
-    const members = yield* teams.listMembers(teamId)
-    const pending = yield* invites.listByTeam(teamId)
+    const members = yield* teams.listMembers(contestId, teamId)
+    const pending = yield* invites.listByTeam(contestId, teamId)
 
     const fetchKeysOrEmpty = (login: string) =>
       githubKeys
@@ -132,7 +133,7 @@ export const runProvisioning = (
     // instance は creating のまま次 tick で再試行される(BenchJob 側の
     // 「ジョブ行が無ければ die」と同じ、状態を DB に残したままの retryable
     // な畳み方)。
-    const team = yield* teams.findById(initial.teamId).pipe(
+    const team = yield* teams.findById(initial.contestId, initial.teamId).pipe(
       Effect.orDie,
       Effect.flatMap(
         Option.match({
@@ -210,7 +211,7 @@ export const runProvisioning = (
       }
 
       if (!instance.progress.includes("configured")) {
-        const access = yield* collectTeamAccess(instance.teamId)
+        const access = yield* collectTeamAccess(instance.contestId, instance.teamId)
         yield* proxmox.setVnet({ vmid: instance.vmid, bridge: bridgeFor(team.teamNumber) })
         yield* proxmox.configureCloudInit({
           vmid: instance.vmid,
@@ -233,7 +234,7 @@ export const runProvisioning = (
       }
 
       if (!instance.progress.includes("access_done")) {
-        const access = yield* collectTeamAccess(instance.teamId)
+        const access = yield* collectTeamAccess(instance.contestId, instance.teamId)
         yield* cloudflare.ensureAccessApp({ hostname, emails: access.emails })
         instance = yield* persistStep(instance, "access_done")
       }
@@ -289,7 +290,7 @@ export const runTeardown = (
     const proxmox = yield* ProxmoxPort
     const cloudflare = yield* CloudflarePort
 
-    const team = yield* teams.findById(instance.teamId).pipe(
+    const team = yield* teams.findById(instance.contestId, instance.teamId).pipe(
       Effect.orDie,
       Effect.flatMap(
         Option.match({

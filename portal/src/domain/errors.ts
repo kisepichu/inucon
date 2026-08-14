@@ -26,6 +26,20 @@ export class InvalidContestSchedule extends Data.TaggedError("InvalidContestSche
   reason: InvalidContestScheduleReason
 }> {}
 
+// Task 3: Contest ライフサイクル関連のリポジトリ由来 conflict。ContestRepo.create /
+// saveIfRevision が SQLite の partial unique index / 楽観ロックで検出して返す
+// (TeamNumberConflict と同じ「リポジトリが原子的に検出」形式)。
+export class ContestEditionConflict extends Data.TaggedError("ContestEditionConflict")<{
+  edition: number
+}> {}
+
+export class OperationalContestConflict extends Data.TaggedError("OperationalContestConflict")<{}> {}
+
+export class ContestRevisionConflict extends Data.TaggedError("ContestRevisionConflict")<{
+  expected: number
+  actual: number
+}> {}
+
 export type JobAction = "start" | "recordProgress" | "finish" | "fail" | "cancel"
 
 export class InvalidJobTransition extends Data.TaggedError("InvalidJobTransition")<{

@@ -1,5 +1,5 @@
 import { Either, Option, Schema } from "effect"
-import { InstanceId, TeamId } from "./ids.js"
+import { ContestId, InstanceId, TeamId } from "./ids.js"
 import { InvalidInstanceTransition } from "./errors.js"
 
 export type InstanceStatus = "creating" | "running" | "deleting" | "deleted" | "failed"
@@ -9,6 +9,7 @@ export type ProvisionStep = "clone_done" | "configured" | "started" | "route_don
 
 export class Instance extends Schema.Class<Instance>("Instance")({
   id: InstanceId,
+  contestId: ContestId,
   teamId: TeamId,
   index: Schema.Int.pipe(Schema.positive()),
   vmid: Schema.Int,
@@ -32,6 +33,7 @@ export const ipFor = (teamNumber: number, index: number): string => `10.100.${te
 // progress は空から始まる。
 export const newInstance = (args: {
   id: InstanceId
+  contestId: ContestId
   teamId: TeamId
   index: number
   teamNumber: number
@@ -39,6 +41,7 @@ export const newInstance = (args: {
 }): Instance =>
   new Instance({
     id: args.id,
+    contestId: args.contestId,
     teamId: args.teamId,
     index: args.index,
     vmid: vmidFor(args.teamNumber, args.index),

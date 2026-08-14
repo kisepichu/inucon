@@ -1,68 +1,71 @@
 import { Clock, Effect, Either, Option } from "effect"
+import type { BenchJob, BenchJobPurpose } from "../../domain/benchJob.js"
 import { checkEnqueueAllowed, newJob } from "../../domain/benchJob.js"
 import { ContestNotRunning } from "../../domain/errors.js"
+import type { Contest } from "../../domain/contest.js"
 import type { User } from "../../domain/user.js"
+import type { ContestId } from "../../domain/ids.js"
 import { BenchJobId, InstanceId, TeamId } from "../../domain/ids.js"
 import { Forbidden, InstanceNotFound, InstanceNotRunning, NotInTeam } from "../errors.js"
 import { BenchJobRepo, ContestRepo, InstanceRepo, RunnerConfig, TeamRepo, UuidGen } from "../ports.js"
 
-// enqueue は「repo 取得 → domain 遷移関数(Either.match で E チャネルへ)→
-// insertIfAllowed」の形。状態遷移系(cancel/reportProgress/reportFinish/sweep)
-// は判定と更新を単一の原子的操作にまとめた port メソッド(cancelIfQueued 等)
-// に委譲し、ユースケース側は findById による authz チェックの後にそれを
-// 呼ぶだけの薄い形にしている(TOCTOU 回避)。
-// ports.ts の各メソッドの R はいずれも never だが、ユースケース自体は
-// Context.Tag(ContestRepo/TeamRepo/BenchJobRepo/UuidGen/RunnerConfig)と
-// Clock を環境として要求する(Layer 合成は main.ts の 1 箇所に集約する)。
+// Task 3: enqueue は「operational な contest を取得 → その contest スコープで
+// team/instance を突き合わせる」形。preparing なら rehearsal、running なら
+// competition の purpose を自動で決める(現行 UI は purpose を選ばない)。
+// enqueueBench 内部で domain.checkEnqueueAllowed が purpose と contest.status
+// の整合を最終判定する。
 
-// requireRunningInstance(Task 6 レビュー #D): instanceId 起点の enqueue
-// (enqueueBenchJob)だけが渡す。BenchJobRepo.insertIfAllowed のアトミック
-// INSERT に「対象 instance が id で今も running であること」を追加ガードさせる
-// ためのフィールドで、渡された場合は 0 行挿入時(team のキュー不変条件・
-// 下記 universal ガードのどちらも原因でない場合)に InstanceNotRunning を返す。
-// 手動 IP:port 指定の enqueue は対応する instance 行が無いのが通常なので
-// 渡さない(挙動不変)。
-//
-// 【Task 6 レビュー #I】ただし手動 IP:port 指定でも targetIp が自チームの
-// managed instance の private_ip と一致することはあり得る(スペックはこの
-// フォームを禁止していない)。その場合に備え、insertIfAllowed 側は
-// requireRunningInstance の有無に関わらず常に「targetIp が
-// creating/deleting な自チームの managed instance を指していないこと」を
-// 同じ原子的 INSERT で検証する(instanceId パス専用の instanceGuard とは別の
-// 独立したガード)。これにより、削除中/払い出し中の VM への直接 IP enqueue も
-// フォームを問わず一貫して弾かれる。
 export const enqueueBench = (args: {
   user: User
   targetIp: string
   targetPort: number
   requireRunningInstance?: { instanceId: InstanceId }
+  // enqueueBenchJob が既に operational contest を解決している場合は流用して
+  // getOperational の二重呼びを避ける(caller-defined snapshot を使うことで
+  // running→finalizing 過渡でも同じ contest.status を判定に使える)。
+  contest?: Contest
 }) =>
   Effect.gen(function* () {
-    // Contest が未作成(getCurrent = None)の場合も「準備中」として扱う。
-    const contest = yield* ContestRepo.pipe(
-      Effect.flatMap((r) => r.getCurrent),
-      Effect.flatMap(
-        Option.match({
-          onNone: () => Effect.fail(new ContestNotRunning({ status: "preparing" })),
-          onSome: Effect.succeed
-        })
-      )
-    )
+    // 0 contest の状態は「未作成 = 準備中」として ContestNotRunning。
+    const contest =
+      args.contest ??
+      (yield* ContestRepo.pipe(
+        Effect.flatMap((r) => r.getOperational),
+        Effect.flatMap(
+          Option.match({
+            onNone: () => Effect.fail(new ContestNotRunning({ status: "preparing" })),
+            onSome: Effect.succeed
+          })
+        )
+      ))
 
     const team = yield* TeamRepo.pipe(
-      Effect.flatMap((r) => r.findByUserId(args.user.id)),
+      Effect.flatMap((r) => r.findByUserId(contest.id, args.user.id)),
       Effect.flatMap(Option.match({ onNone: () => Effect.fail(new NotInTeam()), onSome: Effect.succeed }))
     )
 
+    // finalizing はキューをクローズしている(scheduler が新規 dequeue しない)。
+    // ここで先に落とさないと下の三項演算で rehearsal 判定になり、admin が
+    // 通ってしまったあと checkEnqueueAllowed が「rehearsal は preparing のみ」
+    // で拒否するという遠回りな失敗経路になる。ユーザに直接理由を返す。
+    if (contest.status === "finalizing") {
+      return yield* Effect.fail(new ContestNotRunning({ status: "finalizing" }))
+    }
+
+    // preparing での rehearsal は admin のみ許可(参加者は running まで待つ)。
+    // ここでは「preparing 中の enqueue は admin のみ」で弾き、後段の checkEnqueue
+    // Allowed が purpose と status の対応を最終判定する。
+    const purpose: BenchJobPurpose = contest.status === "running" ? "competition" : "rehearsal"
+    if (purpose === "rehearsal" && !args.user.isAdmin) {
+      return yield* Effect.fail(new ContestNotRunning({ status: contest.status }))
+    }
+
     const jobs = yield* BenchJobRepo
 
-    // activeJobCountForTeam の最終判定は insertIfAllowed がトランザクション内
-    // で行う(ここでの 0 は contest/subnet 検証のためだけの呼び出し)。
     yield* Either.match(
       checkEnqueueAllowed({
         contest,
-        activeJobCountForTeam: 0,
-        teamId: team.id,
+        purpose,
         teamNumber: team.teamNumber,
         targetIp: args.targetIp
       }),
@@ -73,42 +76,51 @@ export const enqueueBench = (args: {
     const id = BenchJobId.make(yield* uuidGen.next)
     const now = yield* Clock.currentTimeMillis
     return yield* jobs.insertIfAllowed(
-      newJob({ id, teamId: team.id, targetIp: args.targetIp, targetPort: args.targetPort, now }),
+      newJob({
+        id,
+        contestId: contest.id,
+        teamId: team.id,
+        targetIp: args.targetIp,
+        targetPort: args.targetPort,
+        purpose,
+        now
+      }),
       args.requireRunningInstance === undefined
         ? undefined
-        : {
-            instanceId: args.requireRunningInstance.instanceId,
-            teamId: team.id
-          }
+        : { instanceId: args.requireRunningInstance.instanceId, teamId: team.id }
     )
   })
 
 export const cancelBench = (args: { user: User; jobId: BenchJobId }) =>
   Effect.gen(function* () {
-    const team = yield* TeamRepo.pipe(
-      Effect.flatMap((r) => r.findByUserId(args.user.id)),
-      Effect.flatMap(Option.match({ onNone: () => Effect.fail(new NotInTeam()), onSome: Effect.succeed }))
-    )
-
     const jobs = yield* BenchJobRepo
     const job = yield* jobs.findById(args.jobId).pipe(
-      // 存在しないジョブは「他チームのジョブ」と同じ Forbidden として扱う
-      // (ジョブ ID の存在有無を漏らさない)。
       Effect.flatMap(Option.match({ onNone: () => Effect.fail(new Forbidden()), onSome: Effect.succeed }))
     )
 
-    if (job.teamId !== team.id) {
-      return yield* Effect.fail(new Forbidden())
+    // 対象 Job の contest scope で team 所属を再判定(admin は素通り)。
+    if (!args.user.isAdmin) {
+      const teams = yield* TeamRepo
+      const team = yield* teams.findByUserId(job.contestId, args.user.id).pipe(
+        Effect.flatMap(Option.match({ onNone: () => Effect.fail(new NotInTeam()), onSome: Effect.succeed }))
+      )
+      if (job.teamId !== team.id) {
+        return yield* Effect.fail(new Forbidden())
+      }
     }
 
     return yield* jobs.cancelIfQueued(args.jobId)
   })
 
-export const pollNextJob = Effect.gen(function* () {
-  const jobs = yield* BenchJobRepo
-  const now = yield* Clock.currentTimeMillis
-  return yield* jobs.dequeueNextQueued(now)
-})
+// pollNextJob は runner から呼ばれる古い経路(現在は pollNextRunnerJob 経由)。
+// contestId + purpose を渡す形に絞り込む(candidate 決定はこの Effect 外側で行う)。
+export const pollNextJobFor = (candidate: { contestId: ContestId; purpose: BenchJobPurpose }) =>
+  Effect.gen(function* () {
+    const jobs = yield* BenchJobRepo
+    const now = yield* Clock.currentTimeMillis
+    return yield* jobs.dequeueNextQueued(candidate, now)
+  })
+
 
 // progress の logChunk 省略/空文字(ハートビートのみ)は appendLog 自体を
 // スキップして不要な DB 書き込みを避ける。
@@ -125,9 +137,7 @@ export const reportProgress = (args: { jobId: BenchJobId; logChunk?: string }) =
   })
 
 // errorMessage が付いている(実行自体の失敗: バイナリ異常終了等)場合は
-// failIfRunning、無ければ finishIfRunning(score/passed を保存)。どちらも
-// running でなければ InvalidJobTransition。logTail の省略/空文字は
-// appendLog 自体をスキップする。
+// failIfRunning、無ければ finishIfRunning(score/passed を保存)。
 export const reportFinish = (args: {
   jobId: BenchJobId
   score: number
@@ -156,50 +166,43 @@ export const sweepTimedOutJobs = Effect.gen(function* () {
   return yield* jobs.failTimedOutJobs(now - config.jobTimeoutMillis, now)
 })
 
-// POST /api/bench-jobs: instanceId 指定時は InstanceRepo で privateIp を解決し
-// targetPort=80 固定にする(スペック §2 bench)。キュー不変条件の判定・INSERT
-// は既存の enqueueBench(targetIp/targetPort ベース、Task 3 実装済み)に委譲し
-// 対象解決のみをここで追加する(二重実装を避ける)。
+// POST /api/bench-jobs
 export const enqueueBenchJob = (args: {
   user: User
   target: { instanceId: InstanceId } | { targetIp: string; targetPort: number }
 }) =>
   Effect.gen(function* () {
     if ("instanceId" in args.target) {
+      const contest = yield* ContestRepo.pipe(
+        Effect.flatMap((r) => r.getOperational),
+        Effect.flatMap(
+          Option.match({
+            onNone: () => Effect.fail(new ContestNotRunning({ status: "preparing" })),
+            onSome: Effect.succeed
+          })
+        )
+      )
       const team = yield* TeamRepo.pipe(
-        Effect.flatMap((r) => r.findByUserId(args.user.id)),
+        Effect.flatMap((r) => r.findByUserId(contest.id, args.user.id)),
         Effect.flatMap(Option.match({ onNone: () => Effect.fail(new NotInTeam()), onSome: Effect.succeed }))
       )
       const instances = yield* InstanceRepo
       const instance = yield* instances.findById(args.target.instanceId).pipe(
         Effect.flatMap(Option.match({ onNone: () => Effect.fail(new InstanceNotFound()), onSome: Effect.succeed }))
       )
-      // 他チームのインスタンス指定をそのまま enqueueBench の subnet 検証に
-      // 流すと、TargetIpOutOfSubnet のエラーボディに解決済みの他チーム
-      // privateIp が載って漏れる。解決結果を使う前にチーム所属を突き合わせ、
-      // 不一致は Forbidden で落とす(privateIp は返さない)。
-      if (instance.teamId !== team.id) {
+      // instance が別 contest / 別チームなら privateIp を漏らさず Forbidden。
+      if (instance.contestId !== contest.id || instance.teamId !== team.id) {
         return yield* Effect.fail(new Forbidden())
       }
-      // running でない(creating/deleting/deleted/failed)VM へは enqueue しない
-      // (Task 6 レビュー #3)。deleted/failed な対象へ投げても接続失敗で
-      // ジョブ枠を浪費するだけなので事前に明示エラーで弾く(共通ケースの
-      // fail-fast)。所有権確認の「後」に判定することで privateIp 漏洩防止の
-      // 順序は変えない。
       if (instance.status !== "running") {
         return yield* Effect.fail(new InstanceNotRunning({ instanceId: instance.id }))
       }
-      // Task 6 レビュー #D: 上の事前チェックは非アトミック(TOCTOU あり)。
-      // ここから enqueueBench→insertIfAllowed までの間に対象 instance が
-      // 削除され得るため、requireRunningInstance を渡して「INSERT の瞬間も
-      // running であること」を単一原子操作(instanceRepo.beginDeletingIfAllowed
-      // と対称)で再検証させる。team のキュー不変条件が原因でなければ
-      // InstanceNotRunning が返る(insertIfAllowed 側で切り分け済み)。
       return yield* enqueueBench({
         user: args.user,
         targetIp: instance.privateIp,
         targetPort: 80,
-        requireRunningInstance: { instanceId: instance.id }
+        requireRunningInstance: { instanceId: instance.id },
+        contest
       })
     }
     return yield* enqueueBench({
@@ -218,21 +221,30 @@ export interface RunnerJobView {
   readonly problemKey: string
 }
 
-// POST /api/runner/jobs/poll: pollNextJob(既存)の結果に、現在の Contest の
-// problemKey を載せて RunnerJob 形に組み立てる(ランナーが問題アダプタを
-// 選ぶための情報)。Contest が存在して running のときだけ dequeue する
-// (設計判断: 本家同様、コンテスト終了でキューは閉じる。enqueue 済みの
-// queued ジョブが finished 後に実行され始めることを防ぐ)。Contest 不在 /
-// preparing / finished では dequeue せず None(ジョブを running 化させない)。
+// POST /api/runner/jobs/poll: 現在の operational contest(preparing/running/
+// finalizing)を候補に取り、running なら competition、preparing なら
+// rehearsal を dequeue する。finalizing は running ジョブの完了待ちなので
+// 新規 dequeue はしない。
+//
+// Operational contract: dequeueNextQueued の running 排他は
+// (contest_id, purpose) スコープなので、DB 上は「同じ contest でも
+// rehearsal と competition の running が同時に存在しうる」形式に緩んでいる
+// (iter 8/13 で意図的に導入)。実運用では runner プロセスは 1 台前提で、
+// pollNextRunnerJob の呼び出しが直列化される限り「同時 running は 1 本」に
+// 保たれる。Rolling deploy 等で runner が一時的に 2 プロセスになると
+// rehearsal + competition が並行で走り得るので、process manager 側で単一
+// runner を保証すること(将来 Task 10 以降で runner heartbeat + 同時実行
+// ガードを DB 側に持たせる可能性がある)。
 export const pollNextRunnerJob = Effect.gen(function* () {
   const contests = yield* ContestRepo
-  const contest = yield* contests.getCurrent.pipe(
-    Effect.map(Option.filter((c) => c.status === "running"))
-  )
+  const contest = yield* contests.getOperational
   return yield* Option.match(contest, {
     onNone: () => Effect.succeed(Option.none<RunnerJobView>()),
-    onSome: (c) =>
-      pollNextJob.pipe(
+    onSome: (c) => {
+      const purpose: BenchJobPurpose | null =
+        c.status === "running" ? "competition" : c.status === "preparing" ? "rehearsal" : null
+      if (purpose === null) return Effect.succeed(Option.none<RunnerJobView>())
+      return pollNextJobFor({ contestId: c.id, purpose }).pipe(
         Effect.map(
           Option.map((job) => ({
             id: job.id,
@@ -243,15 +255,23 @@ export const pollNextRunnerJob = Effect.gen(function* () {
           }))
         )
       )
+    }
   })
 })
 
-// GET /api/bench-jobs?teamId=: スコア・状態の一覧は全員可(ログは含まない)。
+// GET /api/bench-jobs?teamId=。表示は「今 display すべき contest」に固定する
+// (running/finalizing > 最新 finished > preparing)。finished でも履歴が
+// 見えるべきなので getOperational ではなく getDisplay を使う。0 contest は [].
 export const listBenchJobs = (args: { teamId: TeamId }) =>
-  BenchJobRepo.pipe(Effect.flatMap((repo) => repo.listByTeam(args.teamId, 50)))
+  Effect.gen(function* () {
+    const contests = yield* ContestRepo
+    const contest = yield* contests.getDisplay
+    if (Option.isNone(contest)) return []
+    const jobs = yield* BenchJobRepo
+    return yield* jobs.listByTeam(contest.value.id, args.teamId, 50)
+  })
 
-// GET /api/bench-jobs/:id: ログ含む詳細。自チーム or admin のみ(cancelBench
-// と同様、存在しないジョブも Forbidden として扱い ID の存在有無を漏らさない)。
+// GET /api/bench-jobs/:id: ログ含む詳細。自チーム or admin のみ。
 export const getBenchJobDetail = (args: { user: User; jobId: BenchJobId }) =>
   Effect.gen(function* () {
     const jobs = yield* BenchJobRepo
@@ -261,7 +281,7 @@ export const getBenchJobDetail = (args: { user: User; jobId: BenchJobId }) =>
 
     if (!args.user.isAdmin) {
       const teams = yield* TeamRepo
-      const team = yield* teams.findByUserId(args.user.id)
+      const team = yield* teams.findByUserId(job.contestId, args.user.id)
       const isOwnTeam = Option.isSome(team) && team.value.id === job.teamId
       if (!isOwnTeam) {
         return yield* Effect.fail(new Forbidden())

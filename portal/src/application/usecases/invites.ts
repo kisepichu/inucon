@@ -1,9 +1,9 @@
 import { Clock, Effect, Either, Option } from "effect"
 import type { Team } from "../../domain/team.js"
 import { TeamInvite } from "../../domain/teamInvite.js"
-import type { InstanceId, TeamId } from "../../domain/ids.js"
-import { MemberConflict, TeamNotFound } from "../errors.js"
-import { CloudflarePort, GithubKeysPort, InstanceRepo, InviteRepo, ProxmoxPort, TeamRepo, UserRepo } from "../ports.js"
+import type { ContestId, InstanceId, TeamId } from "../../domain/ids.js"
+import { ContestNotFound, MemberConflict, TeamNotFound } from "../errors.js"
+import { ContestRepo, CloudflarePort, GithubKeysPort, InstanceRepo, InviteRepo, ProxmoxPort, TeamRepo, UserRepo } from "../ports.js"
 import { collectTeamAccess, describeError, hostnameFor } from "./provisioning.js"
 
 // isucon ユーザーの authorized_keys(spike メモ・provisioning.ts のコメント
@@ -56,6 +56,7 @@ export interface InviteResult {
 // 冪等(ensureAccessApp は和集合 PUT、guestExec の追記コマンドは grep で
 // 重複排除)なので、同じ招待を何度実行しても安全に「埋まる」。
 const syncRunningInstances = (
+  contestId: ContestId,
   teamId: TeamId,
   team: Team
 ): Effect.Effect<
@@ -68,10 +69,10 @@ const syncRunningInstances = (
     const cloudflare = yield* CloudflarePort
     const proxmox = yield* ProxmoxPort
 
-    const all = yield* instances.listByTeam(teamId).pipe(Effect.orDie)
+    const all = yield* instances.listByTeam(contestId, teamId).pipe(Effect.orDie)
     const running = all.filter((i) => i.status === "running")
 
-    const access = yield* collectTeamAccess(teamId).pipe(Effect.orDie)
+    const access = yield* collectTeamAccess(contestId, teamId).pipe(Effect.orDie)
 
     let accessOk = true
     let accessError: string | undefined
@@ -116,7 +117,30 @@ const syncRunningInstances = (
 // 2. 存在しなければ team_invites に upsert(初ログイン時に auth.ts が消費)。
 // 3. どちらの場合も、そのチームの全 running インスタンスへ Access/鍵を
 //    同期する(syncRunningInstances、全ステップ冪等)。
+// POST /api/admin/teams/:id/invites(admin のみ、Task 3 更新)。互換用の
+// この handler は「今 operational な contest」を解決してから scoped 版を呼ぶ。
+// Task 5 で contest 明示 endpoint が入るとそこから inviteMemberScoped を
+// 直接呼べる(scope は同じ、resolve だけこちらで行う)。
 export const inviteMember = (args: {
+  teamId: TeamId
+  githubLogin: string
+  email: string
+}): Effect.Effect<
+  InviteResult,
+  ContestNotFound | TeamNotFound | MemberConflict,
+  ContestRepo | TeamRepo | UserRepo | InviteRepo | InstanceRepo | CloudflarePort | ProxmoxPort | GithubKeysPort
+> =>
+  Effect.gen(function* () {
+    const contests = yield* ContestRepo
+    const contest = yield* contests.getOperational.pipe(
+      Effect.orDie,
+      Effect.flatMap(Option.match({ onNone: () => Effect.fail(new ContestNotFound()), onSome: Effect.succeed }))
+    )
+    return yield* inviteMemberScoped({ ...args, contestId: contest.id })
+  })
+
+export const inviteMemberScoped = (args: {
+  contestId: ContestId
   teamId: TeamId
   githubLogin: string
   email: string
@@ -127,7 +151,7 @@ export const inviteMember = (args: {
 > =>
   Effect.gen(function* () {
     const teams = yield* TeamRepo
-    const team = yield* teams.findById(args.teamId).pipe(
+    const team = yield* teams.findById(args.contestId, args.teamId).pipe(
       Effect.orDie,
       Effect.flatMap(Option.match({ onNone: () => Effect.fail(new TeamNotFound()), onSome: Effect.succeed }))
     )
@@ -138,18 +162,14 @@ export const inviteMember = (args: {
 
     let portal: "assigned" | "pending"
     if (user !== undefined) {
-      const currentTeam = yield* teams.findByUserId(user.id).pipe(Effect.orDie)
+      const currentTeam = yield* teams.findByUserId(args.contestId, user.id).pipe(Effect.orDie)
       if (Option.isSome(currentTeam) && currentTeam.value.id !== args.teamId) {
         return yield* Effect.fail(new MemberConflict({ logins: [args.githubLogin] }))
       }
       if (Option.isNone(currentTeam)) {
-        const added = yield* teams.addMember(args.teamId, user.id).pipe(Effect.orDie)
+        const added = yield* teams.addMember(args.contestId, args.teamId, user.id).pipe(Effect.orDie)
         if (!added) {
-          // TOCTOU: 上の findByUserId で「未所属」と見えた後、この addMember
-          // までの間に別の招待(または同時実行)がこのユーザーをどこかの
-          // チームへ追加した。実際の所属先を再確認し、要求チームと同じなら
-          // 冪等成功、異なれば横取りとして MemberConflict にする。
-          const actualTeam = yield* teams.findByUserId(user.id).pipe(Effect.orDie)
+          const actualTeam = yield* teams.findByUserId(args.contestId, user.id).pipe(Effect.orDie)
           if (Option.isNone(actualTeam) || actualTeam.value.id !== args.teamId) {
             return yield* Effect.fail(new MemberConflict({ logins: [args.githubLogin] }))
           }
@@ -161,26 +181,52 @@ export const inviteMember = (args: {
       const invites = yield* InviteRepo
       const now = yield* Clock.currentTimeMillis
       yield* invites
-        .create(new TeamInvite({ githubLogin: args.githubLogin, teamId: args.teamId, email: args.email, invitedAt: now }))
+        .create(
+          new TeamInvite({
+            contestId: args.contestId,
+            githubLogin: args.githubLogin,
+            teamId: args.teamId,
+            email: args.email,
+            invitedAt: now
+          })
+        )
         .pipe(Effect.orDie)
       portal = "pending"
     }
 
-    const sync = yield* syncRunningInstances(args.teamId, team)
+    const sync = yield* syncRunningInstances(args.contestId, args.teamId, team)
 
     return { portal, ...sync }
   })
 
-// GET /api/admin/teams/:id/invites(admin のみ): 招待中(未消費)の一覧。
+// GET /api/admin/teams/:id/invites(admin のみ)。互換 handler は operational
+// な contest を解決する。
 export const listInvites = (
+  teamId: TeamId
+): Effect.Effect<
+  ReadonlyArray<TeamInvite>,
+  ContestNotFound | TeamNotFound,
+  ContestRepo | TeamRepo | InviteRepo
+> =>
+  Effect.gen(function* () {
+    const contests = yield* ContestRepo
+    const contest = yield* contests.getOperational.pipe(
+      Effect.orDie,
+      Effect.flatMap(Option.match({ onNone: () => Effect.fail(new ContestNotFound()), onSome: Effect.succeed }))
+    )
+    return yield* listInvitesScoped(contest.id, teamId)
+  })
+
+export const listInvitesScoped = (
+  contestId: ContestId,
   teamId: TeamId
 ): Effect.Effect<ReadonlyArray<TeamInvite>, TeamNotFound, TeamRepo | InviteRepo> =>
   Effect.gen(function* () {
     const teams = yield* TeamRepo
-    yield* teams.findById(teamId).pipe(
+    yield* teams.findById(contestId, teamId).pipe(
       Effect.orDie,
       Effect.flatMap(Option.match({ onNone: () => Effect.fail(new TeamNotFound()), onSome: Effect.succeed }))
     )
     const invites = yield* InviteRepo
-    return yield* invites.listByTeam(teamId).pipe(Effect.orDie)
+    return yield* invites.listByTeam(contestId, teamId).pipe(Effect.orDie)
   })

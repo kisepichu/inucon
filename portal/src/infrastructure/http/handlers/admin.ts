@@ -27,6 +27,7 @@ export const AdminLive = HttpApiBuilder.group(api, "admin", (handlers) =>
     .handle("inviteMember", ({ path, payload }) =>
       inviteMember({ teamId: path.id, githubLogin: payload.githubLogin, email: payload.email }).pipe(
         Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound()),
           TeamNotFound: () => Effect.fail(new NotFound()),
           MemberConflict: (e) => Effect.fail(new MemberConflict({ logins: e.logins }))
         }),
@@ -35,7 +36,10 @@ export const AdminLive = HttpApiBuilder.group(api, "admin", (handlers) =>
     )
     .handle("listInvites", ({ path }) =>
       listInvites(path.id).pipe(
-        Effect.catchTags({ TeamNotFound: () => Effect.fail(new NotFound()) }),
+        Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound()),
+          TeamNotFound: () => Effect.fail(new NotFound())
+        }),
         Effect.orDie
       )
     )

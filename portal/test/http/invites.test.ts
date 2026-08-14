@@ -2,11 +2,11 @@ import { HttpBody, HttpClient } from "@effect/platform"
 import { it } from "@effect/vitest"
 import { Effect, Option } from "effect"
 import { describe, expect } from "vitest"
-import { Team } from "../../src/domain/team.js"
 import { TeamId } from "../../src/domain/ids.js"
+import { DEFAULT_TEST_CONTEST_ID, makeTeam } from "../support/factories.js"
 import { TeamRepo, UserRepo } from "../../src/application/ports.js"
 import { login } from "../support/login.js"
-import { TestLayer, asAdmin } from "../support/apiTestHelpers.js"
+import { TestLayer, asAdmin, seedOperationalContest } from "../support/apiTestHelpers.js"
 
 describe("POST /api/admin/teams/:id/invites", () => {
   const post = (cookieHeader: string, teamId: string, payload: unknown) =>
@@ -20,8 +20,9 @@ describe("POST /api/admin/teams/:id/invites", () => {
 
   it.effect("非 admin は403", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const teams = yield* TeamRepo
-      const team = new Team({ id: TeamId.make("team-invite-403"), name: "Invite 403", teamNumber: 60 })
+      const team = makeTeam({ id: TeamId.make("team-invite-403"), name: "Invite 403", teamNumber: 60 })
       yield* teams.create(team)
 
       const { cookieHeader } = yield* login({ isAdmin: false })
@@ -42,6 +43,7 @@ describe("POST /api/admin/teams/:id/invites", () => {
 
   it.effect("存在しないチームは404", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const { cookieHeader } = yield* asAdmin()
       const res = yield* post(cookieHeader, "no-such-team", { githubLogin: "someone", email: "someone@example.com" })
       expect(res.status).toBe(404)
@@ -50,14 +52,15 @@ describe("POST /api/admin/teams/:id/invites", () => {
 
   it.effect("既に他チームに所属するユーザーへの招待は409(横取りしない)", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const teams = yield* TeamRepo
-      const teamA = new Team({ id: TeamId.make("team-invite-conflict-a"), name: "Invite Conflict A", teamNumber: 61 })
-      const teamB = new Team({ id: TeamId.make("team-invite-conflict-b"), name: "Invite Conflict B", teamNumber: 62 })
+      const teamA = makeTeam({ id: TeamId.make("team-invite-conflict-a"), name: "Invite Conflict A", teamNumber: 61 })
+      const teamB = makeTeam({ id: TeamId.make("team-invite-conflict-b"), name: "Invite Conflict B", teamNumber: 62 })
       yield* teams.create(teamA)
       yield* teams.create(teamB)
 
       const { user } = yield* login({ githubLogin: "already-in-a" })
-      yield* teams.setMembers(teamA.id, [user.id])
+      yield* teams.setMembers(DEFAULT_TEST_CONTEST_ID, teamA.id, [user.id])
 
       const { cookieHeader } = yield* asAdmin()
       const res = yield* post(cookieHeader, teamB.id, { githubLogin: "already-in-a", email: "x@example.com" })
@@ -66,15 +69,16 @@ describe("POST /api/admin/teams/:id/invites", () => {
       expect(body).toStrictEqual({ _tag: "MemberConflict", logins: ["already-in-a"] })
 
       // 横取りされていない(teamA のメンバーのまま)。
-      const stillInA = yield* teams.findByUserId(user.id)
+      const stillInA = yield* teams.findByUserId(DEFAULT_TEST_CONTEST_ID, user.id)
       expect(stillInA).toStrictEqual(Option.some(teamA))
     }).pipe(Effect.provide(TestLayer))
   )
 
   it.effect("未ログインユーザーへの招待は200、portal=pendingでスキーマ通りの応答", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const teams = yield* TeamRepo
-      const team = new Team({ id: TeamId.make("team-invite-pending"), name: "Invite Pending", teamNumber: 63 })
+      const team = makeTeam({ id: TeamId.make("team-invite-pending"), name: "Invite Pending", teamNumber: 63 })
       yield* teams.create(team)
 
       const { cookieHeader } = yield* asAdmin()
@@ -95,8 +99,9 @@ describe("POST /api/admin/teams/:id/invites", () => {
 
   it.effect("既ログインユーザーへの招待は200、portal=assignedで即所属+email更新", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const teams = yield* TeamRepo
-      const team = new Team({ id: TeamId.make("team-invite-assigned"), name: "Invite Assigned", teamNumber: 64 })
+      const team = makeTeam({ id: TeamId.make("team-invite-assigned"), name: "Invite Assigned", teamNumber: 64 })
       yield* teams.create(team)
 
       const { user } = yield* login({ githubLogin: "already-registered" })
@@ -107,7 +112,7 @@ describe("POST /api/admin/teams/:id/invites", () => {
       const body = (yield* res.json) as { portal: string }
       expect(body.portal).toBe("assigned")
 
-      const assignedTeam = yield* teams.findByUserId(user.id)
+      const assignedTeam = yield* teams.findByUserId(DEFAULT_TEST_CONTEST_ID, user.id)
       expect(assignedTeam).toStrictEqual(Option.some(team))
 
       const users = yield* UserRepo
@@ -126,8 +131,9 @@ describe("GET /api/admin/teams/:id/invites", () => {
 
   it.effect("非 admin は403", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const teams = yield* TeamRepo
-      const team = new Team({ id: TeamId.make("team-invite-list-403"), name: "Invite List 403", teamNumber: 65 })
+      const team = makeTeam({ id: TeamId.make("team-invite-list-403"), name: "Invite List 403", teamNumber: 65 })
       yield* teams.create(team)
 
       const { cookieHeader } = yield* login({ isAdmin: false })
@@ -138,6 +144,7 @@ describe("GET /api/admin/teams/:id/invites", () => {
 
   it.effect("存在しないチームは404", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const { cookieHeader } = yield* asAdmin()
       const res = yield* get(cookieHeader, "no-such-team")
       expect(res.status).toBe(404)
@@ -146,8 +153,9 @@ describe("GET /api/admin/teams/:id/invites", () => {
 
   it.effect("招待中一覧が返る(消費済みは含まれない)", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const teams = yield* TeamRepo
-      const team = new Team({ id: TeamId.make("team-invite-list-ok"), name: "Invite List OK", teamNumber: 66 })
+      const team = makeTeam({ id: TeamId.make("team-invite-list-ok"), name: "Invite List OK", teamNumber: 66 })
       yield* teams.create(team)
 
       const { cookieHeader } = yield* asAdmin()

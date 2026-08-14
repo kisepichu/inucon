@@ -24,10 +24,12 @@ import {
 // に変換する。teams.ts の toTeamMember と同じ方針(Option は境界を跨がない)。
 const toBenchJobResponse = (job: BenchJob) => ({
   id: job.id,
+  contestId: job.contestId,
   teamId: job.teamId,
   targetIp: job.targetIp,
   targetPort: job.targetPort,
   status: job.status,
+  purpose: job.purpose,
   score: Option.getOrNull(job.score),
   passed: Option.getOrNull(job.passed),
   errorMessage: Option.getOrNull(job.errorMessage),
