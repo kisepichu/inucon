@@ -195,7 +195,10 @@ describe("POST /api/runner/jobs/poll", () => {
       expect(enqueueRes.status).toBe(200)
 
       const contests = yield* ContestRepo
-      yield* contests.saveIfRevision(makeContest({ ...contest, status: "finalizing" }), contest.revision)
+      yield* contests.saveIfRevision(
+        makeContest({ ...contest, status: "finalizing", revision: contest.revision + 1 }),
+        contest.revision
+      )
 
       const pollRes = yield* poll()
       expect(pollRes.status).toBe(200)
