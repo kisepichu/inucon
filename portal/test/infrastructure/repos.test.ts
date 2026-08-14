@@ -17,6 +17,7 @@ import {
   BenchJobRepo,
   ContestRepo,
   InstanceRepo,
+  InviteRepo,
   SessionRepo,
   TeamRepo,
   UserRepo,
@@ -25,6 +26,7 @@ import {
 import { BenchJobRepoLive } from "../../src/infrastructure/sql/repos/benchJobRepo.js"
 import { ContestRepoLive } from "../../src/infrastructure/sql/repos/contestRepo.js"
 import { InstanceRepoLive } from "../../src/infrastructure/sql/repos/instanceRepo.js"
+import { InviteRepoLive } from "../../src/infrastructure/sql/repos/inviteRepo.js"
 import { SessionRepoLive } from "../../src/infrastructure/sql/repos/sessionRepo.js"
 import { TeamRepoLive } from "../../src/infrastructure/sql/repos/teamRepo.js"
 import { UserRepoLive } from "../../src/infrastructure/sql/repos/userRepo.js"
@@ -53,7 +55,8 @@ const RepoLayer = Layer.mergeAll(
   SessionRepoLive,
   TeamRepoLive,
   InstanceRepoLive,
-  BenchJobRepoLive
+  BenchJobRepoLive,
+  InviteRepoLive
 ).pipe(Layer.provideMerge(UuidGenLive), Layer.provideMerge(MigratorTest), Layer.provideMerge(SqlTest))
 
 const layer = it.layer(RepoLayer)
@@ -1757,6 +1760,252 @@ layer("UuidGenLive", (it) => {
       const id2 = yield* gen.next
       expect(id1).not.toBe(id2)
       expect(id1).toMatch(/^[0-9a-f-]{36}$/)
+    })
+  )
+})
+
+// Task 3: purpose フィルタ (rehearsal vs competition) が dequeue で機能して
+// いることを確認する。古い queued(rehearsal)を無視して新しい queued
+// (competition)を選ぶ = FIFO のみでは説明できない挙動なので、フィルタ削除
+// を検知するリグレッションテストとして意味を持つ。
+layer("BenchJobRepo: dequeueNextQueued は purpose フィルタで competition を選ぶ", (it) => {
+  it.effect("古い rehearsal をスキップして新しい competition を返す", () =>
+    Effect.gen(function* () {
+      yield* seedContest("running")
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+      const rehearsalTeam = makeTeam({ id: TeamId.make("team-purpose-reh"), name: "Rehearsal", teamNumber: 201 })
+      const competitionTeam = makeTeam({ id: TeamId.make("team-purpose-com"), name: "Competition", teamNumber: 202 })
+      yield* teams.create(rehearsalTeam)
+      yield* teams.create(competitionTeam)
+
+      // rehearsal は 1000、competition は 2000。FIFO のみなら rehearsal が
+      // 先に選ばれるはずだが、purpose='competition' の dequeue は competition
+      // を返さなければならない。
+      const rehearsalJob = newJob({
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        purpose: "rehearsal",
+        id: BenchJobId.make("bj-purpose-reh"),
+        teamId: rehearsalTeam.id,
+        targetIp: "10.100.201.5",
+        targetPort: 8080,
+        now: 1000
+      })
+      const competitionJob = newJob({
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        purpose: "competition",
+        id: BenchJobId.make("bj-purpose-com"),
+        teamId: competitionTeam.id,
+        targetIp: "10.100.202.5",
+        targetPort: 8080,
+        now: 2000
+      })
+      yield* jobs.insertIfAllowed(rehearsalJob)
+      yield* jobs.insertIfAllowed(competitionJob)
+
+      const picked = yield* jobs.dequeueNextQueued(
+        { contestId: DEFAULT_TEST_CONTEST_ID, purpose: "competition" },
+        5000
+      )
+      expect(Option.isSome(picked)).toBe(true)
+      if (Option.isSome(picked)) {
+        expect(picked.value.id).toBe(competitionJob.id)
+        expect(picked.value.purpose).toBe("competition")
+      }
+    })
+  )
+})
+
+layer("BenchJobRepo: dequeueNextQueued は purpose フィルタで rehearsal を選ぶ", (it) => {
+  it.effect("古い competition をスキップして新しい rehearsal を返す", () =>
+    Effect.gen(function* () {
+      yield* seedContest("preparing")
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+      const competitionTeam = makeTeam({ id: TeamId.make("team-rev-com"), name: "CompetitionOlder", teamNumber: 211 })
+      const rehearsalTeam = makeTeam({ id: TeamId.make("team-rev-reh"), name: "RehearsalNewer", teamNumber: 212 })
+      yield* teams.create(competitionTeam)
+      yield* teams.create(rehearsalTeam)
+
+      const competitionJob = newJob({
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        purpose: "competition",
+        id: BenchJobId.make("bj-rev-com"),
+        teamId: competitionTeam.id,
+        targetIp: "10.100.211.5",
+        targetPort: 8080,
+        now: 1000
+      })
+      const rehearsalJob = newJob({
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        purpose: "rehearsal",
+        id: BenchJobId.make("bj-rev-reh"),
+        teamId: rehearsalTeam.id,
+        targetIp: "10.100.212.5",
+        targetPort: 8080,
+        now: 2000
+      })
+      yield* jobs.insertIfAllowed(competitionJob)
+      yield* jobs.insertIfAllowed(rehearsalJob)
+
+      const picked = yield* jobs.dequeueNextQueued(
+        { contestId: DEFAULT_TEST_CONTEST_ID, purpose: "rehearsal" },
+        5000
+      )
+      expect(Option.isSome(picked)).toBe(true)
+      if (Option.isSome(picked)) {
+        expect(picked.value.id).toBe(rehearsalJob.id)
+        expect(picked.value.purpose).toBe("rehearsal")
+      }
+    })
+  )
+})
+
+// Task 3: contest_id フィルタが dequeue で機能していることを確認する。
+// 別 contest に古い queued があっても、対象 contest の queued (新しい方) を
+// 返す = FIFO のみでは説明できない挙動なので、フィルタ削除を検知する。
+layer("BenchJobRepo: dequeueNextQueued は contest_id で絞る", (it) => {
+  it.effect("別 contest の古い queued は候補にならない", () =>
+    Effect.gen(function* () {
+      const contests = yield* ContestRepo
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+
+      // idx_contests_single_operational があるため operational は 1 つだけ。
+      // targetContest を running にし、otherContest は draft で置く。
+      const targetContestId = ContestId.make("00000000-0000-0000-0000-cccccccccce1")
+      const otherContestId = ContestId.make("00000000-0000-0000-0000-cccccccccce2")
+      yield* contests.create(makeContest({ id: targetContestId, edition: 11, status: "running" }))
+      yield* contests.create(makeContest({ id: otherContestId, edition: 12, status: "draft" }))
+
+      const otherTeam = makeTeam({
+        id: TeamId.make("team-cross-other"),
+        contestId: otherContestId,
+        name: "OtherContestTeam",
+        teamNumber: 221
+      })
+      const targetTeam = makeTeam({
+        id: TeamId.make("team-cross-target"),
+        contestId: targetContestId,
+        name: "TargetContestTeam",
+        teamNumber: 222
+      })
+      yield* teams.create(otherTeam)
+      yield* teams.create(targetTeam)
+
+      // 他 contest 側は 1000 (古い)、対象 contest 側は 2000 (新しい)。
+      // FIFO のみなら other が先だが、contest フィルタは target を返さねばならない。
+      const otherJob = newJob({
+        contestId: otherContestId,
+        purpose: "competition",
+        id: BenchJobId.make("bj-cross-other"),
+        teamId: otherTeam.id,
+        targetIp: "10.100.221.5",
+        targetPort: 8080,
+        now: 1000
+      })
+      const targetJob = newJob({
+        contestId: targetContestId,
+        purpose: "competition",
+        id: BenchJobId.make("bj-cross-target"),
+        teamId: targetTeam.id,
+        targetIp: "10.100.222.5",
+        targetPort: 8080,
+        now: 2000
+      })
+      yield* jobs.insertIfAllowed(otherJob)
+      yield* jobs.insertIfAllowed(targetJob)
+
+      const picked = yield* jobs.dequeueNextQueued(
+        { contestId: targetContestId, purpose: "competition" },
+        5000
+      )
+      expect(Option.isSome(picked)).toBe(true)
+      if (Option.isSome(picked)) {
+        expect(picked.value.id).toBe(targetJob.id)
+        expect(picked.value.contestId).toBe(targetContestId)
+      }
+    })
+  )
+})
+
+// Task 3 Step 5: 初ログイン時の invite 消費は draft/preparing/running/
+// finalizing の live contest 限定。finished/canceled の残骸は無視する。
+// SQL JOIN + status フィルタが実際に効いているかを SQL レイヤで検証する。
+layer("InviteRepo: listByGithubLoginForLiveContests", (it) => {
+  it.effect("live contest のみ返し、finished / canceled は除外する", () =>
+    Effect.gen(function* () {
+      const contests = yield* ContestRepo
+      const teams = yield* TeamRepo
+      const invites = yield* InviteRepo
+
+      const liveContestId = ContestId.make("00000000-0000-0000-0000-cccccccccdd1")
+      const finishedContestId = ContestId.make("00000000-0000-0000-0000-cccccccccdd2")
+      const canceledContestId = ContestId.make("00000000-0000-0000-0000-cccccccccdd3")
+      // running / finished / canceled を並置。idx_contests_edition_live は
+      // canceled を除いた edition 一意なので edition を全部変える。
+      yield* contests.create(makeContest({ id: liveContestId, edition: 21, status: "running" }))
+      yield* contests.create(
+        makeContest({ id: finishedContestId, edition: 22, status: "finished", finishedAt: Option.some(1_000_000) })
+      )
+      yield* contests.create(
+        makeContest({ id: canceledContestId, edition: 23, status: "canceled", canceledAt: Option.some(1_000_100) })
+      )
+
+      // 3 contest それぞれに 1 チームずつ + 同じ github_login への招待を発行。
+      const liveTeam = makeTeam({
+        id: TeamId.make("team-invite-live"),
+        contestId: liveContestId,
+        name: "LiveTeam",
+        teamNumber: 231
+      })
+      const finishedTeam = makeTeam({
+        id: TeamId.make("team-invite-fin"),
+        contestId: finishedContestId,
+        name: "FinishedTeam",
+        teamNumber: 232
+      })
+      const canceledTeam = makeTeam({
+        id: TeamId.make("team-invite-cxl"),
+        contestId: canceledContestId,
+        name: "CanceledTeam",
+        teamNumber: 233
+      })
+      yield* teams.create(liveTeam)
+      yield* teams.create(finishedTeam)
+      yield* teams.create(canceledTeam)
+
+      const githubLogin = "octocat-invitee"
+      yield* invites.create(
+        makeInvite({ contestId: liveContestId, teamId: liveTeam.id, githubLogin, email: "live@example.com", invitedAt: 100 })
+      )
+      yield* invites.create(
+        makeInvite({
+          contestId: finishedContestId,
+          teamId: finishedTeam.id,
+          githubLogin,
+          email: "fin@example.com",
+          invitedAt: 200
+        })
+      )
+      yield* invites.create(
+        makeInvite({
+          contestId: canceledContestId,
+          teamId: canceledTeam.id,
+          githubLogin,
+          email: "cxl@example.com",
+          invitedAt: 300
+        })
+      )
+
+      const live = yield* invites.listByGithubLoginForLiveContests(githubLogin)
+      expect(live.length).toBe(1)
+      expect(live[0]?.contestId).toBe(liveContestId)
+      expect(live[0]?.teamId).toBe(liveTeam.id)
+
+      // 別 github_login は 0 件で返る (パラメータバインドが効いていること)。
+      const other = yield* invites.listByGithubLoginForLiveContests("other-user")
+      expect(other).toStrictEqual([])
     })
   )
 })
