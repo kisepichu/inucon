@@ -26,6 +26,7 @@ import {
 // (null 許容)に変換する。bench.ts の toBenchJobResponse と同じ方針。
 const toInstanceResponse = (i: Instance) => ({
   id: i.id,
+  contestId: i.contestId,
   teamId: i.teamId,
   index: i.index,
   vmid: i.vmid,
@@ -44,6 +45,7 @@ export const InstancesLive = HttpApiBuilder.group(api, "instances", (handlers) =
         Effect.flatMap((user) => listTeamInstances({ user, teamId: path.id })),
         Effect.map((instances) => instances.map(toInstanceResponse)),
         Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound()),
           TeamNotFound: () => Effect.fail(new NotFound()),
           Forbidden: () => Effect.fail(new Forbidden())
         }),
@@ -54,6 +56,7 @@ export const InstancesLive = HttpApiBuilder.group(api, "instances", (handlers) =
       createInstance(payload).pipe(
         Effect.map(toInstanceResponse),
         Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound()),
           TeamNotFound: () => Effect.fail(new NotFound()),
           TargetIpOutOfSubnet: (e) => Effect.fail(new TargetIpOutOfSubnet({ ip: e.ip, teamNumber: e.teamNumber })),
           DuplicateInstanceIndex: (e) =>

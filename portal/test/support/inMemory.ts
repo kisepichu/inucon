@@ -1,9 +1,18 @@
 import { Context, Effect, Either, Layer, Option, Ref } from "effect"
+import type { BenchJobPurpose } from "../../src/domain/benchJob.js"
 import { cancelJob, failJob, finishJob, recordProgress, startJob } from "../../src/domain/benchJob.js"
 import type { BenchJob } from "../../src/domain/benchJob.js"
 import type { Contest } from "../../src/domain/contest.js"
-import { CannotCancelRunning, DuplicateInstanceIndex, InvalidJobTransition, TeamJobAlreadyQueued } from "../../src/domain/errors.js"
-import type { BenchJobId, InstanceId, TeamId } from "../../src/domain/ids.js"
+import {
+  CannotCancelRunning,
+  ContestEditionConflict,
+  ContestRevisionConflict,
+  DuplicateInstanceIndex,
+  InvalidJobTransition,
+  OperationalContestConflict,
+  TeamJobAlreadyQueued
+} from "../../src/domain/errors.js"
+import type { BenchJobId, ContestId, InstanceId, TeamId } from "../../src/domain/ids.js"
 import { UserId } from "../../src/domain/ids.js"
 import { Instance } from "../../src/domain/instance.js"
 import { User } from "../../src/domain/user.js"
@@ -45,78 +54,158 @@ export const UuidGenTest: Layer.Layer<UuidGen> = Layer.effect(
   })
 )
 
-export const makeContestRepoTest = (
-  initial: Option.Option<Contest> = Option.none()
-): Layer.Layer<ContestRepo> =>
+// Task 3: contest スコープの ContestRepo。initial に複数 contest を渡せる。
+// getOperational は preparing/running/finalizing 1 行、getDisplay は
+// running/finalizing > 最新 finished > preparing の優先順(canceled は除外)。
+export const makeContestRepoTest = (initial: ReadonlyArray<Contest> = []): Layer.Layer<ContestRepo> =>
   Layer.effect(
     ContestRepo,
     Effect.gen(function* () {
-      const ref = yield* Ref.make(initial)
+      const ref = yield* Ref.make<ReadonlyArray<Contest>>(initial)
+      const pickDisplay = (cs: ReadonlyArray<Contest>): Option.Option<Contest> => {
+        const op = cs.find((c) => c.status === "running" || c.status === "finalizing")
+        if (op !== undefined) return Option.some(op)
+        const finished = cs
+          .filter((c) => c.status === "finished")
+          .sort((a, b) => {
+            const bAt = Option.getOrElse(b.finishedAt, () => 0) - Option.getOrElse(a.finishedAt, () => 0)
+            return bAt !== 0 ? bAt : b.edition - a.edition
+          })
+        if (finished[0] !== undefined) return Option.some(finished[0])
+        const prep = cs.find((c) => c.status === "preparing")
+        return prep !== undefined ? Option.some(prep) : Option.none()
+      }
       return {
-        getCurrent: Ref.get(ref),
-        save: (c: Contest) => Ref.set(ref, Option.some(c))
+        list: Ref.get(ref).pipe(Effect.map((cs) => [...cs].sort((a, b) => b.edition - a.edition))),
+        findById: (id: ContestId) =>
+          Ref.get(ref).pipe(Effect.map((cs) => Option.fromNullable(cs.find((c) => c.id === id)))),
+        getOperational: Ref.get(ref).pipe(
+          Effect.map((cs) =>
+            Option.fromNullable(
+              cs.find((c) => c.status === "preparing" || c.status === "running" || c.status === "finalizing")
+            )
+          )
+        ),
+        getDisplay: Ref.get(ref).pipe(Effect.map(pickDisplay)),
+        create: (c: Contest) =>
+          Ref.modify(
+            ref,
+            (
+              cs
+            ): readonly [
+              Either.Either<void, ContestEditionConflict | OperationalContestConflict>,
+              ReadonlyArray<Contest>
+            ] => {
+              const editionConflict = cs.some((x) => x.edition === c.edition && x.status !== "canceled")
+              if (editionConflict && c.status !== "canceled") {
+                return [Either.left(new ContestEditionConflict({ edition: c.edition })), cs]
+              }
+              const operationalConflict =
+                (c.status === "preparing" || c.status === "running" || c.status === "finalizing") &&
+                cs.some((x) => x.status === "preparing" || x.status === "running" || x.status === "finalizing")
+              if (operationalConflict) {
+                return [Either.left(new OperationalContestConflict()), cs]
+              }
+              return [Either.right(undefined), [...cs, c]]
+            }
+          ).pipe(Effect.flatMap(Either.match({ onLeft: Effect.fail, onRight: Effect.succeed }))),
+        saveIfRevision: (c: Contest, expectedRevision: number) =>
+          Ref.modify(
+            ref,
+            (cs): readonly [Either.Either<Contest, ContestRevisionConflict>, ReadonlyArray<Contest>] => {
+              const existing = cs.find((x) => x.id === c.id)
+              if (existing === undefined) {
+                return [Either.left(new ContestRevisionConflict({ expected: expectedRevision, actual: 0 })), cs]
+              }
+              if (existing.revision !== expectedRevision) {
+                return [
+                  Either.left(new ContestRevisionConflict({ expected: expectedRevision, actual: existing.revision })),
+                  cs
+                ]
+              }
+              return [Either.right(c), cs.map((x) => (x.id === c.id ? c : x))]
+            }
+          ).pipe(Effect.flatMap(Either.match({ onLeft: Effect.fail, onRight: Effect.succeed })))
       }
     })
   )
 
+interface ScopedMember {
+  readonly contestId: ContestId
+  readonly teamId: TeamId
+  readonly userId: UserId
+}
+
 export const makeTeamRepoTest = (args: {
   teams: ReadonlyArray<Team>
-  memberships?: ReadonlyArray<{ userId: UserId; teamId: TeamId }>
+  memberships?: ReadonlyArray<ScopedMember>
   users?: ReadonlyArray<User>
 }): Layer.Layer<TeamRepo> =>
   Layer.effect(
     TeamRepo,
     Effect.gen(function* () {
       const teamsRef = yield* Ref.make(args.teams)
-      const membersRef = yield* Ref.make(args.memberships ?? [])
+      const membersRef = yield* Ref.make<ReadonlyArray<ScopedMember>>(args.memberships ?? [])
       const usersRef = yield* Ref.make(args.users ?? [])
       return {
-        list: Ref.get(teamsRef),
-        findById: (id: TeamId) =>
-          Ref.get(teamsRef).pipe(Effect.map((teams) => Option.fromNullable(teams.find((t) => t.id === id)))),
-        findByUserId: (userId: UserId) =>
+        listByContest: (contestId: ContestId) =>
+          Ref.get(teamsRef).pipe(
+            Effect.map((teams) =>
+              teams.filter((t) => t.contestId === contestId).sort((a, b) => a.teamNumber - b.teamNumber)
+            )
+          ),
+        findById: (contestId: ContestId, id: TeamId) =>
+          Ref.get(teamsRef).pipe(
+            Effect.map((teams) =>
+              Option.fromNullable(teams.find((t) => t.id === id && t.contestId === contestId))
+            )
+          ),
+        findByUserId: (contestId: ContestId, userId: UserId) =>
           Effect.gen(function* () {
             const members = yield* Ref.get(membersRef)
             const teams = yield* Ref.get(teamsRef)
-            const membership = members.find((m) => m.userId === userId)
+            const membership = members.find((m) => m.contestId === contestId && m.userId === userId)
             if (membership === undefined) return Option.none<Team>()
-            return Option.fromNullable(teams.find((t) => t.id === membership.teamId))
+            return Option.fromNullable(
+              teams.find((t) => t.id === membership.teamId && t.contestId === contestId)
+            )
           }),
         create: (t: Team) => Ref.update(teamsRef, (teams) => [...teams, t]),
-        setMembers: (teamId: TeamId, userIds: ReadonlyArray<UserId>) =>
+        setMembers: (contestId: ContestId, teamId: TeamId, userIds: ReadonlyArray<UserId>) =>
           Ref.update(membersRef, (members) => [
-            ...members.filter((m) => m.teamId !== teamId),
-            ...userIds.map((userId) => ({ userId, teamId }))
+            ...members.filter((m) => !(m.contestId === contestId && m.teamId === teamId)),
+            ...userIds.map((userId) => ({ contestId, teamId, userId }))
           ]),
-        // 単一メンバー追加(招待フロー)。team_members.user_id は UNIQUE の
-        // ため、既に(どのチームであれ)所属済みの userId は追加せず false を
-        // 返す(本番 SQLite 実装の「INSERT ... WHERE NOT EXISTS ... RETURNING」
-        // と同じ意味論。Ref.modify で読み取り+書き込みを単一 update に収め、
-        // 呼び出し元が事前に行った findByUserId チェックとの間の TOCTOU を
-        // ここでは起こさないようにする)。
-        addMember: (teamId: TeamId, userId: UserId) =>
+        // 単一メンバー追加(招待フロー)。scoped unique(contest_id, user_id)は
+        // 同一 contest 内でのみユニーク。異 contest には並行して所属可能。
+        addMember: (contestId: ContestId, teamId: TeamId, userId: UserId) =>
           Ref.modify(
             membersRef,
-            (members): readonly [boolean, ReadonlyArray<{ userId: UserId; teamId: TeamId }>] => {
-              if (members.some((m) => m.userId === userId)) return [false, members]
-              return [true, [...members, { userId, teamId }]]
+            (members): readonly [boolean, ReadonlyArray<ScopedMember>] => {
+              if (members.some((m) => m.contestId === contestId && m.userId === userId)) {
+                return [false, members]
+              }
+              return [true, [...members, { contestId, teamId, userId }]]
             }
           ),
-        listMembers: (teamId: TeamId) =>
+        listMembers: (contestId: ContestId, teamId: TeamId) =>
           Effect.gen(function* () {
             const members = yield* Ref.get(membersRef)
             const users = yield* Ref.get(usersRef)
-            const memberIds = new Set(members.filter((m) => m.teamId === teamId).map((m) => m.userId))
+            const memberIds = new Set(
+              members
+                .filter((m) => m.contestId === contestId && m.teamId === teamId)
+                .map((m) => m.userId)
+            )
             return users.filter((u) => memberIds.has(u.id))
           })
       }
     })
   )
 
-// InviteRepo のインメモリ実装(team_invites)。create は本番 SQLite 実装
-// (github_login PK の ON CONFLICT upsert)と同じ意味論: 同一 githubLogin の
-// 再招待は team/email を上書きする。saga/provisioner のテストで空の InviteRepo
-// を差し込むためにも使う(招待ゼロ = collectTeamAccess はメンバーのみ集約)。
+// InviteRepo(migration 0005: PK = (contest_id, github_login))。create は
+// 同一 (contestId, githubLogin) の upsert(team/email 上書き)、異 contest は
+// 別行として共存する。
 export const makeInviteRepoTest = (initial: ReadonlyArray<TeamInvite> = []): Layer.Layer<InviteRepo> =>
   Layer.effect(
     InviteRepo,
@@ -125,38 +214,55 @@ export const makeInviteRepoTest = (initial: ReadonlyArray<TeamInvite> = []): Lay
       return {
         create: (invite: TeamInvite) =>
           Ref.update(ref, (invites) => [
-            ...invites.filter((i) => i.githubLogin !== invite.githubLogin),
+            ...invites.filter(
+              (i) => !(i.contestId === invite.contestId && i.githubLogin === invite.githubLogin)
+            ),
             invite
           ]),
-        findByGithubLogin: (githubLogin: string) =>
-          Ref.get(ref).pipe(Effect.map((invites) => Option.fromNullable(invites.find((i) => i.githubLogin === githubLogin)))),
-        delete: (githubLogin: string) =>
-          Ref.update(ref, (invites) => invites.filter((i) => i.githubLogin !== githubLogin)),
-        listByTeam: (teamId: TeamId) =>
-          Ref.get(ref).pipe(Effect.map((invites) => invites.filter((i) => i.teamId === teamId)))
+        findByGithubLogin: (contestId: ContestId, githubLogin: string) =>
+          Ref.get(ref).pipe(
+            Effect.map((invites) =>
+              Option.fromNullable(
+                invites.find((i) => i.contestId === contestId && i.githubLogin === githubLogin)
+              )
+            )
+          ),
+        delete: (contestId: ContestId, githubLogin: string) =>
+          Ref.update(ref, (invites) =>
+            invites.filter((i) => !(i.contestId === contestId && i.githubLogin === githubLogin))
+          ),
+        listByTeam: (contestId: ContestId, teamId: TeamId) =>
+          Ref.get(ref).pipe(
+            Effect.map((invites) => invites.filter((i) => i.contestId === contestId && i.teamId === teamId))
+          ),
+        // Task 3 Step 5: live contest(draft/preparing/running/finalizing)のみ。
+        // in-memory 実装は「live contest 判定」を持てないため、渡された invite が
+        // 全部 live 前提でそのまま返す(auth テストで live 契約を守る形で
+        // 検証する — finished/canceled の invite を混ぜたテストが要る場合は
+        // makeInviteReposTest 側で contest 情報も持たせる)。
+        listByGithubLoginForLiveContests: (githubLogin: string) =>
+          Ref.get(ref).pipe(Effect.map((invites) => invites.filter((i) => i.githubLogin === githubLogin)))
       }
     })
   )
 
-// 招待フロー(Task 5)の application テスト用に、UserRepo / SessionRepo /
-// TeamRepo / InviteRepo を単一の共有ストアから提供する複合レイヤー。本番
-// SQLite は users テーブルを 1 つだけ持ち、TeamRepo.listMembers と
-// UserRepo.setEmail が同じ行を見る。makeTeamRepoTest(独自 usersRef)と
-// makeAuthReposTest(別の usersRef)を混ぜるとこの一貫性が崩れる(setEmail が
-// listMembers に反映されない)ため、招待テストではこの複合レイヤーで users を
-// 1 つに束ねる。
+// makeInviteReposTest: users/sessions/teams/invites を単一ストアで共有する。
+// contests パラメータで live 判定を持たせ、listByGithubLoginForLiveContests が
+// 正しくフィルタする(auth 初ログイン consumeLiveInvites のテストで使う)。
 export const makeInviteReposTest = (args: {
   teams: ReadonlyArray<Team>
+  contests?: ReadonlyArray<Contest>
   users?: ReadonlyArray<User>
-  memberships?: ReadonlyArray<{ userId: UserId; teamId: TeamId }>
+  memberships?: ReadonlyArray<ScopedMember>
   invites?: ReadonlyArray<TeamInvite>
 }): Layer.Layer<UserRepo | SessionRepo | TeamRepo | InviteRepo> =>
   Layer.effectContext(
     Effect.gen(function* () {
       const usersRef = yield* Ref.make<ReadonlyArray<User>>(args.users ?? [])
-      const membersRef = yield* Ref.make<ReadonlyArray<{ userId: UserId; teamId: TeamId }>>(args.memberships ?? [])
+      const membersRef = yield* Ref.make<ReadonlyArray<ScopedMember>>(args.memberships ?? [])
       const teamsRef = yield* Ref.make<ReadonlyArray<Team>>(args.teams)
       const invitesRef = yield* Ref.make<ReadonlyArray<TeamInvite>>(args.invites ?? [])
+      const contestsRef = yield* Ref.make<ReadonlyArray<Contest>>(args.contests ?? [])
       const sessionsRef = yield* Ref.make<
         ReadonlyArray<{ sessionId: string; userId: UserId; expiresAt: number }>
       >([])
@@ -214,40 +320,55 @@ export const makeInviteReposTest = (args: {
             const users = yield* Ref.get(usersRef)
             return Option.fromNullable(users.find((u) => u.id === session.userId))
           }),
-        delete: (sessionId) => Ref.update(sessionsRef, (sessions) => sessions.filter((s) => s.sessionId !== sessionId))
+        delete: (sessionId) =>
+          Ref.update(sessionsRef, (sessions) => sessions.filter((s) => s.sessionId !== sessionId))
       }
 
       const teamRepo: Context.Tag.Service<TeamRepo> = {
-        list: Ref.get(teamsRef),
-        findById: (id) =>
-          Ref.get(teamsRef).pipe(Effect.map((teams) => Option.fromNullable(teams.find((t) => t.id === id)))),
-        findByUserId: (userId) =>
+        listByContest: (contestId) =>
+          Ref.get(teamsRef).pipe(
+            Effect.map((teams) =>
+              teams.filter((t) => t.contestId === contestId).sort((a, b) => a.teamNumber - b.teamNumber)
+            )
+          ),
+        findById: (contestId, id) =>
+          Ref.get(teamsRef).pipe(
+            Effect.map((teams) =>
+              Option.fromNullable(teams.find((t) => t.id === id && t.contestId === contestId))
+            )
+          ),
+        findByUserId: (contestId, userId) =>
           Effect.gen(function* () {
             const members = yield* Ref.get(membersRef)
             const teams = yield* Ref.get(teamsRef)
-            const membership = members.find((m) => m.userId === userId)
+            const membership = members.find((m) => m.contestId === contestId && m.userId === userId)
             if (membership === undefined) return Option.none<Team>()
-            return Option.fromNullable(teams.find((t) => t.id === membership.teamId))
+            return Option.fromNullable(
+              teams.find((t) => t.id === membership.teamId && t.contestId === contestId)
+            )
           }),
         create: (t) => Ref.update(teamsRef, (teams) => [...teams, t]),
-        setMembers: (teamId, userIds) =>
+        setMembers: (contestId, teamId, userIds) =>
           Ref.update(membersRef, (members) => [
-            ...members.filter((m) => m.teamId !== teamId),
-            ...userIds.map((userId) => ({ userId, teamId }))
+            ...members.filter((m) => !(m.contestId === contestId && m.teamId === teamId)),
+            ...userIds.map((userId) => ({ contestId, teamId, userId }))
           ]),
-        addMember: (teamId, userId) =>
-          Ref.modify(
-            membersRef,
-            (members): readonly [boolean, ReadonlyArray<{ userId: UserId; teamId: TeamId }>] => {
-              if (members.some((m) => m.userId === userId)) return [false, members]
-              return [true, [...members, { userId, teamId }]]
+        addMember: (contestId, teamId, userId) =>
+          Ref.modify(membersRef, (members): readonly [boolean, ReadonlyArray<ScopedMember>] => {
+            if (members.some((m) => m.contestId === contestId && m.userId === userId)) {
+              return [false, members]
             }
-          ),
-        listMembers: (teamId) =>
+            return [true, [...members, { contestId, teamId, userId }]]
+          }),
+        listMembers: (contestId, teamId) =>
           Effect.gen(function* () {
             const members = yield* Ref.get(membersRef)
             const users = yield* Ref.get(usersRef)
-            const memberIds = new Set(members.filter((m) => m.teamId === teamId).map((m) => m.userId))
+            const memberIds = new Set(
+              members
+                .filter((m) => m.contestId === contestId && m.teamId === teamId)
+                .map((m) => m.userId)
+            )
             return users.filter((u) => memberIds.has(u.id))
           })
       }
@@ -255,15 +376,40 @@ export const makeInviteReposTest = (args: {
       const inviteRepo: Context.Tag.Service<InviteRepo> = {
         create: (invite) =>
           Ref.update(invitesRef, (invites) => [
-            ...invites.filter((i) => i.githubLogin !== invite.githubLogin),
+            ...invites.filter(
+              (i) => !(i.contestId === invite.contestId && i.githubLogin === invite.githubLogin)
+            ),
             invite
           ]),
-        findByGithubLogin: (githubLogin) =>
+        findByGithubLogin: (contestId, githubLogin) =>
           Ref.get(invitesRef).pipe(
-            Effect.map((invites) => Option.fromNullable(invites.find((i) => i.githubLogin === githubLogin)))
+            Effect.map((invites) =>
+              Option.fromNullable(
+                invites.find((i) => i.contestId === contestId && i.githubLogin === githubLogin)
+              )
+            )
           ),
-        delete: (githubLogin) => Ref.update(invitesRef, (invites) => invites.filter((i) => i.githubLogin !== githubLogin)),
-        listByTeam: (teamId) => Ref.get(invitesRef).pipe(Effect.map((invites) => invites.filter((i) => i.teamId === teamId)))
+        delete: (contestId, githubLogin) =>
+          Ref.update(invitesRef, (invites) =>
+            invites.filter((i) => !(i.contestId === contestId && i.githubLogin === githubLogin))
+          ),
+        listByTeam: (contestId, teamId) =>
+          Ref.get(invitesRef).pipe(
+            Effect.map((invites) => invites.filter((i) => i.contestId === contestId && i.teamId === teamId))
+          ),
+        // live 判定は contests ストアと突き合わせる。contests パラメータを渡さ
+        // なければ全 invite が live 扱い(既存 auth テストの多くは live のみで検証)。
+        listByGithubLoginForLiveContests: (githubLogin) =>
+          Effect.gen(function* () {
+            const invites = yield* Ref.get(invitesRef)
+            const contests = yield* Ref.get(contestsRef)
+            const liveIds = new Set(
+              contests
+                .filter((c) => c.status === "draft" || c.status === "preparing" || c.status === "running" || c.status === "finalizing")
+                .map((c) => c.id)
+            )
+            return invites.filter((i) => i.githubLogin === githubLogin && (contests.length === 0 || liveIds.has(i.contestId)))
+          })
       }
 
       return Context.make(UserRepo, userRepo).pipe(
@@ -274,29 +420,41 @@ export const makeInviteReposTest = (args: {
     })
   )
 
-// InstanceRepo のインメモリ実装。create は本番 SQLite 実装(instanceRepo.ts の
-// INSERT ... WHERE NOT EXISTS ... RETURNING)と同じ意味論: 同一 (teamId, index)
-// が既にあれば Ref.modify 内の単一操作で判定して DuplicateInstanceIndex を返す
-// (TOCTOU を模した Ref 単一 update、makeBenchJobRepoTest.insertIfAllowed と同型)。
+// InstanceRepo(contest スコープ)。create/createIfAllowed の重複判定は
+// (contestId, teamId, index) で行う(migration 0005 の部分ユニーク index と同条件)。
 export const makeInstanceRepoTest = (initial: ReadonlyArray<Instance> = []): Layer.Layer<InstanceRepo> =>
   Layer.effect(
     InstanceRepo,
     Effect.gen(function* () {
       const instancesRef = yield* Ref.make(initial)
       return {
-        listByTeam: (teamId: TeamId) =>
+        listByContest: (contestId: ContestId) =>
           Ref.get(instancesRef).pipe(
             Effect.map((instances) =>
-              instances.filter((i) => i.teamId === teamId).sort((a, b) => a.index - b.index)
+              instances
+                .filter((i) => i.contestId === contestId)
+                .sort((a, b) => (a.teamId === b.teamId ? a.index - b.index : a.teamId < b.teamId ? -1 : 1))
+            )
+          ),
+        listByTeam: (contestId: ContestId, teamId: TeamId) =>
+          Ref.get(instancesRef).pipe(
+            Effect.map((instances) =>
+              instances
+                .filter((i) => i.contestId === contestId && i.teamId === teamId)
+                .sort((a, b) => a.index - b.index)
             )
           ),
         findById: (id: InstanceId) =>
-          Ref.get(instancesRef).pipe(Effect.map((instances) => Option.fromNullable(instances.find((i) => i.id === id)))),
+          Ref.get(instancesRef).pipe(
+            Effect.map((instances) => Option.fromNullable(instances.find((i) => i.id === id)))
+          ),
         create: (i: Instance) =>
           Ref.modify(
             instancesRef,
             (instances): readonly [Either.Either<Instance, DuplicateInstanceIndex>, ReadonlyArray<Instance>] => {
-              const duplicate = instances.some((x) => x.teamId === i.teamId && x.index === i.index)
+              const duplicate = instances.some(
+                (x) => x.contestId === i.contestId && x.teamId === i.teamId && x.index === i.index
+              )
               if (duplicate) {
                 return [Either.left(new DuplicateInstanceIndex({ teamId: i.teamId, index: i.index })), instances]
               }
@@ -304,10 +462,6 @@ export const makeInstanceRepoTest = (initial: ReadonlyArray<Instance> = []): Lay
             }
           ).pipe(Effect.flatMap(Either.match({ onLeft: Effect.fail, onRight: Effect.succeed }))),
         remove: (id: InstanceId) => Ref.update(instancesRef, (instances) => instances.filter((i) => i.id !== id)),
-        // requestCreateInstance(Task 4)専用の原子的 guard 付き INSERT。単一の
-        // Ref.modify コールバック内で (1) quota、(2) 進行中無し、(3) idx 重複
-        // 無し、を判定してから挿入する(本番 SQLite 実装の単一 INSERT ...
-        // WHERE ... RETURNING 文と同じ TOCTOU 回避を Ref の単一操作で模す)。
         createIfAllowed: (
           i: Instance,
           quota: number
@@ -321,22 +475,29 @@ export const makeInstanceRepoTest = (initial: ReadonlyArray<Instance> = []): Lay
               ReadonlyArray<Instance>
             ] => {
               const activeCount = instances.filter(
-                (x) => x.teamId === i.teamId && (x.status === "creating" || x.status === "running")
+                (x) =>
+                  x.contestId === i.contestId &&
+                  x.teamId === i.teamId &&
+                  (x.status === "creating" || x.status === "running")
               ).length
               if (activeCount >= quota) {
                 return [Either.left(new QuotaExceeded({ teamId: i.teamId, quota })), instances]
               }
               const inProgress = instances.some(
-                (x) => x.teamId === i.teamId && (x.status === "creating" || x.status === "deleting")
+                (x) =>
+                  x.contestId === i.contestId &&
+                  x.teamId === i.teamId &&
+                  (x.status === "creating" || x.status === "deleting")
               )
               if (inProgress) {
                 return [Either.left(new ProvisionInProgress({ teamId: i.teamId })), instances]
               }
-              // Task 6 レビュー #E: 本番 SQLite 実装(migration 0003)と同じく
-              // deleted 以外(failed を含む)は (teamId, index) スロットを
-              // 予約中として扱う。
               const duplicate = instances.some(
-                (x) => x.teamId === i.teamId && x.index === i.index && x.status !== "deleted"
+                (x) =>
+                  x.contestId === i.contestId &&
+                  x.teamId === i.teamId &&
+                  x.index === i.index &&
+                  x.status !== "deleted"
               )
               if (duplicate) {
                 return [Either.left(new DuplicateInstanceIndex({ teamId: i.teamId, index: i.index })), instances]
@@ -344,12 +505,6 @@ export const makeInstanceRepoTest = (initial: ReadonlyArray<Instance> = []): Lay
               return [Either.right(i), [...instances, i]]
             }
           ).pipe(Effect.flatMap(Either.match({ onLeft: Effect.fail, onRight: Effect.succeed }))),
-        // requestDeleteInstance(削除ボタン)専用の原子的 guard 付き UPDATE
-        // (Task 6 レビュー #B)。単一の Ref.modify コールバック内で (1) 対象が
-        // running/failed、(2) チームに対象以外の creating/deleting が無い、を
-        // 判定してから status を deleting に更新する(本番 SQLite 実装の単一
-        // UPDATE ... WHERE ... RETURNING 文と同じ TOCTOU 回避を Ref の単一
-        // 操作で模す)。
         beginDeletingIfAllowed: (instanceId: InstanceId, now: number) =>
           Ref.modify(instancesRef, (instances): readonly [Option.Option<Instance>, ReadonlyArray<Instance>] => {
             const target = instances.find((x) => x.id === instanceId)
@@ -357,24 +512,18 @@ export const makeInstanceRepoTest = (initial: ReadonlyArray<Instance> = []): Lay
               return [Option.none(), instances]
             }
             const otherInProgress = instances.some(
-              (x) => x.teamId === target.teamId && x.id !== instanceId && (x.status === "creating" || x.status === "deleting")
+              (x) =>
+                x.contestId === target.contestId &&
+                x.teamId === target.teamId &&
+                x.id !== instanceId &&
+                (x.status === "creating" || x.status === "deleting")
             )
-            if (otherInProgress) {
-              return [Option.none(), instances]
-            }
+            if (otherInProgress) return [Option.none(), instances]
             const updated = new Instance({ ...target, status: "deleting", updatedAt: now })
-            return [
-              Option.some(updated),
-              instances.map((x) => (x.id === instanceId ? updated : x))
-            ]
+            return [Option.some(updated), instances.map((x) => (x.id === instanceId ? updated : x))]
           }),
-        // saga(provisioning.ts)の各ステップ後の progress/status/errorMessage
-        // 保存。id で 1 件を丸ごと置き換える(本番 SQLite 実装の UPDATE と同じ
-        // 意味論)。
         update: (i: Instance) =>
           Ref.update(instancesRef, (instances) => instances.map((x) => (x.id === i.id ? i : x))),
-        // ワーカー(provisioner.ts)が 1 tick で拾う対象。creating/deleting の
-        // うち最も古い(createdAt 昇順)1 件を返す。
         findNextForOrchestration: Ref.get(instancesRef).pipe(
           Effect.map((instances) => {
             const candidates = instances
@@ -387,18 +536,18 @@ export const makeInstanceRepoTest = (initial: ReadonlyArray<Instance> = []): Lay
     })
   )
 
-export const makeBenchJobRepoTest = (initial: ReadonlyArray<BenchJob> = []): Layer.Layer<BenchJobRepo> =>
+export const makeBenchJobRepoTest = (
+  initial: ReadonlyArray<BenchJob> = [],
+  options: {
+    scoreboardTeams?: ReadonlyArray<Team>
+  } = {}
+): Layer.Layer<BenchJobRepo> =>
   Layer.effect(
     BenchJobRepo,
     Effect.gen(function* () {
       const jobsRef = yield* Ref.make(initial)
       const logsRef = yield* Ref.make<Record<string, string>>({})
 
-      // reportProgress/reportFinish/cancel 共通の「判定+更新」ヘルパー。単一の
-      // Ref.modify コールバック内でジョブを引き、domain の遷移関数
-      // (recordProgress/finishJob/cancelJob)を適用して書き戻すことで TOCTOU を
-      // 回避する(ports.ts のコメントにある「条件付き UPDATE 1 文」の模擬)。
-      // ジョブ自体が見つからない場合は defect(die)にする(既存方針どおり)。
       const atomicTransition = <E>(
         id: BenchJobId,
         actionName: string,
@@ -432,7 +581,10 @@ export const makeBenchJobRepoTest = (initial: ReadonlyArray<BenchJob> = []): Lay
             jobsRef,
             (jobs): readonly [Either.Either<BenchJob, TeamJobAlreadyQueued>, ReadonlyArray<BenchJob>] => {
               const hasActiveForTeam = jobs.some(
-                (j) => j.teamId === job.teamId && (j.status === "queued" || j.status === "running")
+                (j) =>
+                  j.contestId === job.contestId &&
+                  j.teamId === job.teamId &&
+                  (j.status === "queued" || j.status === "running")
               )
               if (hasActiveForTeam) {
                 return [Either.left(new TeamJobAlreadyQueued({ teamId: job.teamId })), jobs]
@@ -442,25 +594,32 @@ export const makeBenchJobRepoTest = (initial: ReadonlyArray<BenchJob> = []): Lay
           ).pipe(Effect.flatMap(Either.match({ onLeft: Effect.fail, onRight: Effect.succeed }))),
         findById: (id: BenchJobId) =>
           Ref.get(jobsRef).pipe(Effect.map((jobs) => Option.fromNullable(jobs.find((j) => j.id === id)))),
-        listByTeam: (teamId: TeamId, limit: number) =>
+        listByTeam: (contestId: ContestId, teamId: TeamId, limit: number) =>
           Ref.get(jobsRef).pipe(
             Effect.map((jobs) =>
               jobs
-                .filter((j) => j.teamId === teamId)
+                .filter((j) => j.contestId === contestId && j.teamId === teamId)
                 .sort((a, b) => b.enqueuedAt - a.enqueuedAt)
                 .slice(0, limit)
             )
           ),
-        // 全体で running が 1 件でもあれば None。なければ最も古い queued を
-        // startJob で running 化し、Ref の単一 modify 呼び出し内で読み取りと
-        // 書き戻しを完結させることでアトミック性を模す。
-        dequeueNextQueued: (now: number) =>
+        dequeueNextQueued: (
+          candidate: { contestId: ContestId; purpose: BenchJobPurpose },
+          now: number
+        ) =>
           Ref.modify(
             jobsRef,
             (jobs): readonly [Option.Option<BenchJob>, ReadonlyArray<BenchJob>] => {
               const anyRunning = jobs.some((j) => j.status === "running")
               if (anyRunning) return [Option.none(), jobs]
-              const queued = jobs.filter((j) => j.status === "queued").sort((a, b) => a.enqueuedAt - b.enqueuedAt)
+              const queued = jobs
+                .filter(
+                  (j) =>
+                    j.status === "queued" &&
+                    j.contestId === candidate.contestId &&
+                    j.purpose === candidate.purpose
+                )
+                .sort((a, b) => a.enqueuedAt - b.enqueuedAt)
               const next = queued[0]
               if (next === undefined) return [Option.none(), jobs]
               const started = Either.getOrThrow(startJob(next, now))
@@ -479,9 +638,6 @@ export const makeBenchJobRepoTest = (initial: ReadonlyArray<BenchJob> = []): Lay
         appendLog: (id: BenchJobId, chunk: string) =>
           Ref.update(logsRef, (logs) => ({ ...logs, [id]: (logs[id] ?? "") + chunk })),
         getLog: (id: BenchJobId) => Ref.get(logsRef).pipe(Effect.map((logs) => logs[id] ?? "")),
-        // running かつ lastProgressAt < cutoff のジョブを単一の Ref.modify
-        // コールバック内で failed 化する(判定と更新を同一操作にすることで
-        // reportFinish との TOCTOU を模擬的に回避する)。
         failTimedOutJobs: (cutoff: number, now: number) =>
           Ref.modify(jobsRef, (jobs): readonly [number, ReadonlyArray<BenchJob>] => {
             let count = 0
@@ -495,13 +651,48 @@ export const makeBenchJobRepoTest = (initial: ReadonlyArray<BenchJob> = []): Lay
             })
             return [count, updated]
           }),
-        // Task 3 のユースケースでは未使用。scoreboard はチーム名の結合が要る
-        // ため、必要になった時点(スコアボード関連タスク)でチームデータも
-        // 受け取れるように拡張する。
-        scoreboard: Effect.succeed([])
+        // scoreboard: 集計対象は contestId + purpose='competition' の finished。
+        // options.scoreboardTeams が渡されていれば teams JOIN 済み結果を返し、
+        // 未指定なら空配列(集計はテスト対象外)。
+        scoreboard: (contestId: ContestId) =>
+          Effect.gen(function* () {
+            const teams = options.scoreboardTeams ?? []
+            const scopedTeams = teams.filter((t) => t.contestId === contestId)
+            if (scopedTeams.length === 0) return []
+            const jobs = yield* Ref.get(jobsRef)
+            return scopedTeams
+              .sort((a, b) => a.teamNumber - b.teamNumber)
+              .map((t) => {
+                const finished = jobs
+                  .filter(
+                    (j) =>
+                      j.contestId === contestId &&
+                      j.teamId === t.id &&
+                      j.status === "finished" &&
+                      j.purpose === "competition"
+                  )
+                  .sort((a, b) => {
+                    const bAt = Option.getOrElse(b.finishedAt, () => 0) - Option.getOrElse(a.finishedAt, () => 0)
+                    return bAt !== 0 ? bAt : (a.id < b.id ? 1 : -1)
+                  })
+                const scores = finished.flatMap((j) =>
+                  Option.match(j.score, { onNone: () => [] as number[], onSome: (s) => [s] })
+                )
+                const bestScore = scores.length > 0 ? Math.max(...scores) : null
+                const latest = finished[0]
+                return {
+                  teamId: t.id,
+                  teamName: t.name,
+                  bestScore,
+                  latestScore: latest === undefined ? null : Option.getOrNull(latest.score),
+                  latestAt: latest === undefined ? null : Option.getOrNull(latest.finishedAt)
+                }
+              })
+          })
       }
     })
   )
+
 
 export const RunnerConfigTest = (jobTimeoutMillis: number): Layer.Layer<RunnerConfig> =>
   Layer.succeed(RunnerConfig, { jobTimeoutMillis })

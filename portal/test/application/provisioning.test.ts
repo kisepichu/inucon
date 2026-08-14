@@ -4,9 +4,8 @@ import { describe, expect } from "vitest"
 import { newJob, startJob } from "../../src/domain/benchJob.js"
 import { InvalidInstanceTransition } from "../../src/domain/errors.js"
 import { BenchJobId, InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
-import { Instance, ipFor, newInstance, vmidFor } from "../../src/domain/instance.js"
-import type { ProvisionStep } from "../../src/domain/instance.js"
-import { Team } from "../../src/domain/team.js"
+import { ipFor, newInstance, vmidFor } from "../../src/domain/instance.js"
+import type { Instance, ProvisionStep } from "../../src/domain/instance.js"
 import { User } from "../../src/domain/user.js"
 import {
   Forbidden,
@@ -30,7 +29,7 @@ import {
   ProvisioningConfigTest,
   UuidGenTest
 } from "../support/inMemory.js"
-import { makeContest } from "../support/factories.js"
+import { DEFAULT_TEST_CONTEST_ID, makeContest, makeInstance, makeTeam } from "../support/factories.js"
 
 const team1Id = TeamId.make("11111111-1111-1111-1111-111111111111")
 const team2Id = TeamId.make("22222222-2222-2222-2222-222222222222")
@@ -39,8 +38,8 @@ const bobId = UserId.make("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 const carolId = UserId.make("cccccccc-cccc-cccc-cccc-cccccccccccc")
 const adminId = UserId.make("dddddddd-dddd-dddd-dddd-dddddddddddd")
 
-const team1 = new Team({ id: team1Id, name: "team1", teamNumber: 1 })
-const team2 = new Team({ id: team2Id, name: "team2", teamNumber: 2 })
+const team1 = makeTeam({ id: team1Id, name: "team1", teamNumber: 1 })
+const team2 = makeTeam({ id: team2Id, name: "team2", teamNumber: 2 })
 
 // alice はメール+鍵あり、bob はメール無し・鍵あり(collectTeamAccess の
 // 「メール未設定はスキップ、鍵は集約」を検証できる構成)。
@@ -80,9 +79,9 @@ const admin = new User({
 const teamRepoLayer = makeTeamRepoTest({
   teams: [team1, team2],
   memberships: [
-    { userId: aliceId, teamId: team1Id },
-    { userId: bobId, teamId: team1Id },
-    { userId: carolId, teamId: team2Id }
+    { contestId: DEFAULT_TEST_CONTEST_ID, userId: aliceId, teamId: team1Id },
+    { contestId: DEFAULT_TEST_CONTEST_ID, userId: bobId, teamId: team1Id },
+    { contestId: DEFAULT_TEST_CONTEST_ID, userId: carolId, teamId: team2Id }
   ],
   users: [alice, bob, carol, admin]
 })
@@ -97,26 +96,21 @@ const githubKeysLayer = makeGithubKeysPortTest({
 const inviteRepoLayer = makeInviteRepoTest([])
 
 const contestLayer = (instanceQuota = 3) =>
-  makeContestRepoTest(
-    Option.some(makeContest({ status: "running", instanceQuota }))
-  )
+  makeContestRepoTest([makeContest({ id: DEFAULT_TEST_CONTEST_ID, status: "running", instanceQuota })])
 
 const hostname1 = "inucon-team1-1.kisen.one"
 const vmid1 = vmidFor(1, 1)
 const ip1 = ipFor(1, 1)
 
 const runningInstance = (args: { id: string; teamId: TeamId; index: number; teamNumber: number }) =>
-  new Instance({
+  makeInstance({
     id: InstanceId.make(args.id),
     teamId: args.teamId,
     index: args.index,
     vmid: vmidFor(args.teamNumber, args.index),
     privateIp: ipFor(args.teamNumber, args.index),
     status: "running",
-    progress: ["clone_done", "configured", "started", "route_done", "access_done"],
-    errorMessage: Option.none(),
-    createdAt: 0,
-    updatedAt: 0
+    progress: ["clone_done", "configured", "started", "route_done", "access_done"]
   })
 
 const creatingInstance = (args: {
@@ -127,7 +121,7 @@ const creatingInstance = (args: {
   progress?: ReadonlyArray<ProvisionStep>
   createdAt?: number
 }) =>
-  new Instance({
+  makeInstance({
     id: InstanceId.make(args.id),
     teamId: args.teamId,
     index: args.index,
@@ -135,9 +129,7 @@ const creatingInstance = (args: {
     privateIp: ipFor(args.teamNumber, args.index),
     status: "creating",
     progress: args.progress ?? [],
-    errorMessage: Option.none(),
-    createdAt: args.createdAt ?? 0,
-    updatedAt: 0
+    createdAt: args.createdAt ?? 0
   })
 
 describe("requestCreateInstance(ガード)", () => {
@@ -201,7 +193,7 @@ describe("requestCreateInstance(ガード)", () => {
       )
       // ガードで弾かれたので creating 行は作られていない。
       const repo = yield* InstanceRepo
-      const rows = yield* repo.listByTeam(team1Id)
+      const rows = yield* repo.listByTeam(DEFAULT_TEST_CONTEST_ID, team1Id)
       expect(rows).toHaveLength(0)
     }).pipe(Effect.provide(baseGuardLayer({ freeMemBytes: 1_000_000_000, minFreeMemBytes: 5_000_000_000 })))
   )
@@ -306,17 +298,14 @@ describe("requestCreateInstance(index のサーバー採番)", () => {
   // 想定する。「削除→再追加を繰り返すと index が増え続ける」旧 UI ロジック
   // (nextInstanceIndex = active の max+1)の問題がサーバー採番では起きない
   // (最小の空き index=1 を再利用し、単調増加しない)ことを確認する。
-  const deletedIndex1 = new Instance({
+  const deletedIndex1 = makeInstance({
     id: InstanceId.make("deleted-1"),
     teamId: team1Id,
     index: 1,
     vmid: vmidFor(1, 1),
     privateIp: ipFor(1, 1),
     status: "deleted",
-    progress: ["clone_done", "configured", "started", "route_done", "access_done"],
-    errorMessage: Option.none(),
-    createdAt: 0,
-    updatedAt: 0
+    progress: ["clone_done", "configured", "started", "route_done", "access_done"]
   })
 
   it.effect("index=1 が(削除により non-active になって)解放されていれば、単調増加せず最小の空き index=1 を再利用する", () =>
@@ -335,7 +324,7 @@ describe("requestCreateInstance(index のサーバー採番)", () => {
     )
   )
 
-  const failedIndex2 = new Instance({
+  const failedIndex2 = makeInstance({
     id: InstanceId.make("failed-idx-2"),
     teamId: team1Id,
     index: 2,
@@ -343,9 +332,7 @@ describe("requestCreateInstance(index のサーバー採番)", () => {
     privateIp: ipFor(1, 2),
     status: "failed",
     progress: ["clone_done"],
-    errorMessage: Option.some("boom"),
-    createdAt: 0,
-    updatedAt: 0
+    errorMessage: Option.some("boom")
   })
 
   // Task 6 レビュー #A: quota は creating+running の「数」だけを見ているため、
@@ -371,17 +358,14 @@ describe("requestCreateInstance(index のサーバー採番)", () => {
     )
   )
 
-  const deletedIndex2 = new Instance({
+  const deletedIndex2 = makeInstance({
     id: InstanceId.make("deleted-idx-2"),
     teamId: team1Id,
     index: 2,
     vmid: vmidFor(1, 2),
     privateIp: ipFor(1, 2),
     status: "deleted",
-    progress: ["clone_done", "configured", "started", "route_done", "access_done"],
-    errorMessage: Option.none(),
-    createdAt: 0,
-    updatedAt: 0
+    progress: ["clone_done", "configured", "started", "route_done", "access_done"]
   })
 
   // deleted になった index はもう占有していないので再利用してよい(上の
@@ -438,7 +422,7 @@ describe("requestDeleteInstance(ガード)", () => {
           jobs: [
             Either.getOrThrow(
               startJob(
-                newJob({ id: BenchJobId.make("job-1"), teamId: team1Id, targetIp: ip1, targetPort: 80, now: 0 }),
+                newJob({ id: BenchJobId.make("job-1"), contestId: DEFAULT_TEST_CONTEST_ID, teamId: team1Id, targetIp: ip1, targetPort: 80, purpose: "competition", now: 0 }),
                 0
               )
             )
@@ -456,7 +440,7 @@ describe("requestDeleteInstance(ガード)", () => {
       Effect.provide(
         deleteLayer({
           instances: [runningTeam1],
-          jobs: [newJob({ id: BenchJobId.make("job-2"), teamId: team1Id, targetIp: ip1, targetPort: 80, now: 0 })]
+          jobs: [newJob({ id: BenchJobId.make("job-2"), contestId: DEFAULT_TEST_CONTEST_ID, teamId: team1Id, targetIp: ip1, targetPort: 80, purpose: "competition", now: 0 })]
         })
       )
     )
@@ -481,7 +465,7 @@ describe("requestDeleteInstance(ガード)", () => {
   // 無かった。
   it.effect("failed インスタンスも削除できる(running/failed → deleting)", () =>
     Effect.gen(function* () {
-      const failedInstance = new Instance({
+      const failedInstance = makeInstance({
         id: InstanceId.make("failed-1"),
         teamId: team1Id,
         index: 1,
@@ -489,9 +473,7 @@ describe("requestDeleteInstance(ガード)", () => {
         privateIp: ipFor(1, 1),
         status: "failed",
         progress: ["clone_done"],
-        errorMessage: Option.some("boom"),
-        createdAt: 0,
-        updatedAt: 0
+        errorMessage: Option.some("boom")
       })
       const result = yield* requestDeleteInstance({ user: alice, instanceId: failedInstance.id })
       expect(result.status).toBe("deleting")
@@ -502,7 +484,7 @@ describe("requestDeleteInstance(ガード)", () => {
       Effect.provide(
         deleteLayer({
           instances: [
-            new Instance({
+            makeInstance({
               id: InstanceId.make("failed-1"),
               teamId: team1Id,
               index: 1,
@@ -510,9 +492,7 @@ describe("requestDeleteInstance(ガード)", () => {
               privateIp: ipFor(1, 1),
               status: "failed",
               progress: ["clone_done"],
-              errorMessage: Option.some("boom"),
-              createdAt: 0,
-              updatedAt: 0
+              errorMessage: Option.some("boom")
             })
           ]
         })
@@ -540,7 +520,7 @@ describe("requestDeleteInstance(ガード)", () => {
 describe("collectTeamAccess", () => {
   it.effect("メール設定済みメンバーのメールと、全メンバーの鍵を集約する", () =>
     Effect.gen(function* () {
-      const access = yield* collectTeamAccess(team1Id)
+      const access = yield* collectTeamAccess(DEFAULT_TEST_CONTEST_ID, team1Id)
       expect(access.emails).toStrictEqual(["alice@example.com"])
       expect([...access.sshKeys].sort()).toStrictEqual(["ssh-ed25519 AAAA alice@host", "ssh-rsa BBBB bob@host"])
     }).pipe(Effect.provide(Layer.mergeAll(teamRepoLayer, githubKeysLayer, inviteRepoLayer)))
@@ -548,7 +528,7 @@ describe("collectTeamAccess", () => {
 
   it.effect("鍵未登録(GithubKeysError)のメンバーはスキップして続行する", () =>
     Effect.gen(function* () {
-      const access = yield* collectTeamAccess(team2Id)
+      const access = yield* collectTeamAccess(DEFAULT_TEST_CONTEST_ID, team2Id)
       // carol は鍵未登録スタブ(下記)なので鍵は空だがメールは残る。
       expect(access.emails).toStrictEqual(["carol@example.com"])
       expect(access.sshKeys).toStrictEqual([])
@@ -557,7 +537,7 @@ describe("collectTeamAccess", () => {
 
   it.effect("email 未登録メンバーは missingEmailLogins に載る(Access には含めない)", () =>
     Effect.gen(function* () {
-      const access = yield* collectTeamAccess(team1Id)
+      const access = yield* collectTeamAccess(DEFAULT_TEST_CONTEST_ID, team1Id)
       // bob は email 未設定。emails には載らず、missingEmailLogins に github_login。
       expect(access.emails).toStrictEqual(["alice@example.com"])
       expect(access.missingEmailLogins).toStrictEqual(["bob"])
@@ -827,17 +807,14 @@ describe("runProvisioning(払い出し saga)", () => {
 })
 
 describe("runTeardown(撤収 saga)", () => {
-  const deletingInstance = new Instance({
+  const deletingInstance = makeInstance({
     id: InstanceId.make("td-1"),
     teamId: team1Id,
     index: 1,
     vmid: vmid1,
     privateIp: ip1,
     status: "deleting",
-    progress: ["clone_done", "configured", "started", "route_done", "access_done"],
-    errorMessage: Option.none(),
-    createdAt: 0,
-    updatedAt: 0
+    progress: ["clone_done", "configured", "started", "route_done", "access_done"]
   })
 
   it.effect("正常系: route/access を消し VM を破棄して deleted", () =>

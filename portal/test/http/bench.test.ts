@@ -2,10 +2,8 @@ import { HttpBody, HttpClient } from "@effect/platform"
 import { it } from "@effect/vitest"
 import { Effect, Option } from "effect"
 import { describe, expect } from "vitest"
-import { makeContest } from "../support/factories.js"
+import { DEFAULT_TEST_CONTEST_ID, makeContest, makeInstance, makeTeam } from "../support/factories.js"
 import { InstanceId, TeamId } from "../../src/domain/ids.js"
-import { Instance } from "../../src/domain/instance.js"
-import { Team } from "../../src/domain/team.js"
 import { ContestRepo, InstanceRepo, TeamRepo } from "../../src/application/ports.js"
 import { login } from "../support/login.js"
 import { asAdmin, TestLayer } from "../support/apiTestHelpers.js"
@@ -24,16 +22,22 @@ const setup = (options?: { teamNumber?: number }) =>
   Effect.gen(function* () {
     teamSeq++
     const contests = yield* ContestRepo
-    const contest = makeContest({ status: "running" })
-    yield* contests.save(contest)
+    const existing = yield* contests.getOperational
+    const contest = Option.isSome(existing)
+      ? existing.value
+      : yield* Effect.gen(function* () {
+          const c = makeContest({ id: DEFAULT_TEST_CONTEST_ID, status: "running" })
+          yield* contests.create(c)
+          return c
+        })
 
     const teams = yield* TeamRepo
     const teamNumber = options?.teamNumber ?? 60 + teamSeq
-    const team = new Team({ id: TeamId.make(`team-bench-${teamSeq}`), name: `Team ${teamSeq}`, teamNumber })
+    const team = makeTeam({ id: TeamId.make(`team-bench-${teamSeq}`), name: `Team ${teamSeq}`, teamNumber })
     yield* teams.create(team)
 
     const { user, cookieHeader } = yield* login({ githubLogin: `bench-member-${teamSeq}`, githubId: teamSeq })
-    yield* teams.setMembers(team.id, [user.id])
+    yield* teams.setMembers(DEFAULT_TEST_CONTEST_ID, team.id, [user.id])
 
     return { contest, team, user, cookieHeader, teamNumber }
   })
@@ -191,7 +195,7 @@ describe("POST /api/runner/jobs/poll", () => {
       expect(enqueueRes.status).toBe(200)
 
       const contests = yield* ContestRepo
-      yield* contests.save(makeContest({ ...contest, status: "finished" }))
+      yield* contests.saveIfRevision(makeContest({ ...contest, status: "finalizing" }), contest.revision)
 
       const pollRes = yield* poll()
       expect(pollRes.status).toBe(200)
@@ -247,17 +251,14 @@ describe("POST /api/bench-jobs: instanceId 指定", () => {
     Effect.gen(function* () {
       const { cookieHeader, team, teamNumber } = yield* setup()
       const instances = yield* InstanceRepo
-      const instance = new Instance({
+      const instance = makeInstance({
         id: InstanceId.make("inst-bench-1"),
         teamId: team.id,
         index: 1,
         vmid: 1000 + teamNumber * 100 + 1,
         privateIp: `10.100.${teamNumber}.20`,
         status: "running",
-        progress: ["clone_done", "configured", "started", "route_done", "access_done"],
-        errorMessage: Option.none(),
-        createdAt: 0,
-        updatedAt: 0
+        progress: ["clone_done", "configured", "started", "route_done", "access_done"]
       })
       yield* instances.create(instance)
 
@@ -273,17 +274,14 @@ describe("POST /api/bench-jobs: instanceId 指定", () => {
     Effect.gen(function* () {
       const owner = yield* setup()
       const instances = yield* InstanceRepo
-      const instance = new Instance({
+      const instance = makeInstance({
         id: InstanceId.make("inst-bench-other-team"),
         teamId: owner.team.id,
         index: 1,
         vmid: 1000 + owner.teamNumber * 100 + 1,
         privateIp: `10.100.${owner.teamNumber}.30`,
         status: "running",
-        progress: ["clone_done", "configured", "started", "route_done", "access_done"],
-        errorMessage: Option.none(),
-        createdAt: 0,
-        updatedAt: 0
+        progress: ["clone_done", "configured", "started", "route_done", "access_done"]
       })
       yield* instances.create(instance)
 
@@ -304,17 +302,14 @@ describe("POST /api/bench-jobs: instanceId 指定", () => {
       Effect.gen(function* () {
         const { cookieHeader, team, teamNumber } = yield* setup()
         const instances = yield* InstanceRepo
-        const instance = new Instance({
+        const instance = makeInstance({
           id: InstanceId.make(`inst-bench-notrunning-${status}`),
           teamId: team.id,
           index: 1,
           vmid: 1000 + teamNumber * 100 + 1,
           privateIp: `10.100.${teamNumber}.20`,
           status,
-          progress: [],
-          errorMessage: status === "failed" ? Option.some("boom") : Option.none(),
-          createdAt: 0,
-          updatedAt: 0
+          errorMessage: status === "failed" ? Option.some("boom") : Option.none()
         })
         yield* instances.create(instance)
 

@@ -6,14 +6,21 @@ import { MemberConflict, TeamNotFound } from "../../src/application/errors.js"
 import { handleOAuthCallback } from "../../src/application/usecases/auth.js"
 import { inviteMember, listInvites } from "../../src/application/usecases/invites.js"
 import { hostnameFor } from "../../src/application/usecases/provisioning.js"
-import { InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
-import { Instance, ipFor, vmidFor } from "../../src/domain/instance.js"
-import { Team } from "../../src/domain/team.js"
+import { ContestId, InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
+import { ipFor, vmidFor } from "../../src/domain/instance.js"
 import { TeamInvite } from "../../src/domain/teamInvite.js"
 import { User } from "../../src/domain/user.js"
+import {
+  DEFAULT_TEST_CONTEST_ID,
+  makeContest,
+  makeInstance,
+  makeTeam
+} from "../support/factories.js"
+import type { Instance } from "../support/factories.js"
 import { makeGithubOAuthStub } from "../support/githubOAuthStub.js"
 import {
   makeCloudflarePortTest,
+  makeContestRepoTest,
   makeGithubKeysPortTest,
   makeInstanceRepoTest,
   makeInviteReposTest,
@@ -24,8 +31,9 @@ import {
 // 対象)。team2(teamNumber=2)は他チーム所属判定(MemberConflict)専用。
 const team1Id = TeamId.make("11111111-1111-1111-1111-111111111111")
 const team2Id = TeamId.make("22222222-2222-2222-2222-222222222222")
-const team1 = new Team({ id: team1Id, name: "team1", teamNumber: 1 })
-const team2 = new Team({ id: team2Id, name: "team2", teamNumber: 2 })
+const team1 = makeTeam({ id: team1Id, name: "team1", teamNumber: 1 })
+const team2 = makeTeam({ id: team2Id, name: "team2", teamNumber: 2 })
+const contest = makeContest({ id: DEFAULT_TEST_CONTEST_ID, status: "preparing" })
 
 const aliceId = UserId.make("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 const bobId = UserId.make("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
@@ -63,17 +71,14 @@ const vmid1 = vmidFor(1, 1)
 const ip1 = ipFor(1, 1)
 const hostname1 = hostnameFor(1, 1)
 
-const runningInstanceTeam1 = new Instance({
+const runningInstanceTeam1 = makeInstance({
   id: InstanceId.make("instance-1"),
   teamId: team1Id,
   index: 1,
   vmid: vmid1,
   privateIp: ip1,
   status: "running",
-  progress: ["clone_done", "configured", "started", "route_done", "access_done"],
-  errorMessage: Option.none(),
-  createdAt: 0,
-  updatedAt: 0
+  progress: ["clone_done", "configured", "started", "route_done", "access_done"]
 })
 
 // テストごとに独立した Ref を持つ Layer を組み立てる(state 汚染を防ぐため
@@ -85,7 +90,7 @@ const runningInstanceTeam1 = new Instance({
 const baseLayer = (
   opts: {
     users?: ReadonlyArray<User>
-    memberships?: ReadonlyArray<{ userId: UserId; teamId: TeamId }>
+    memberships?: ReadonlyArray<{ contestId: ContestId; userId: UserId; teamId: TeamId }>
     invites?: ReadonlyArray<TeamInvite>
     instances?: ReadonlyArray<Instance>
     githubKeysByLogin?: Record<string, ReadonlyArray<string>>
@@ -97,13 +102,14 @@ const baseLayer = (
     teams: [team1, team2],
     users: opts.users ?? [alice, bob, carol],
     memberships: opts.memberships ?? [
-      { userId: aliceId, teamId: team1Id },
-      { userId: bobId, teamId: team1Id },
-      { userId: carolId, teamId: team2Id }
+      { contestId: DEFAULT_TEST_CONTEST_ID, userId: aliceId, teamId: team1Id },
+      { contestId: DEFAULT_TEST_CONTEST_ID, userId: bobId, teamId: team1Id },
+      { contestId: DEFAULT_TEST_CONTEST_ID, userId: carolId, teamId: team2Id }
     ],
     invites: opts.invites ?? []
   })
   const layer = Layer.mergeAll(
+    makeContestRepoTest([contest]),
     reposLayer,
     makeInstanceRepoTest(opts.instances ?? [runningInstanceTeam1]),
     makeGithubKeysPortTest(
@@ -145,7 +151,7 @@ describe("inviteMember", () => {
       expect(Option.getOrNull(user.email)).toBe("newbie@example.com")
 
       const teams = yield* TeamRepo
-      const newbieTeam = yield* teams.findByUserId(user.id)
+      const newbieTeam = yield* teams.findByUserId(DEFAULT_TEST_CONTEST_ID, user.id)
       expect(newbieTeam).toStrictEqual(Option.some(team1))
 
       // invite 行は消費(削除)される。
@@ -172,7 +178,7 @@ describe("inviteMember", () => {
       expect(result.portal).toBe("assigned")
 
       const teams = yield* TeamRepo
-      const daveTeam = yield* teams.findByUserId(daveId)
+      const daveTeam = yield* teams.findByUserId(DEFAULT_TEST_CONTEST_ID, daveId)
       expect(daveTeam).toStrictEqual(Option.some(team1))
 
       const users = yield* UserRepo
@@ -191,7 +197,7 @@ describe("inviteMember", () => {
 
       // 横取りされていない(team2 のメンバーのまま)。
       const teams = yield* TeamRepo
-      const stillInTeam2 = yield* teams.findByUserId(carolId)
+      const stillInTeam2 = yield* teams.findByUserId(DEFAULT_TEST_CONTEST_ID, carolId)
       expect(stillInTeam2).toStrictEqual(Option.some(team2))
     }).pipe(Effect.provide(layer))
   })
@@ -209,7 +215,7 @@ describe("inviteMember", () => {
   it.effect("Access は現メンバー∪招待中(team_invites)の和集合で更新される", () => {
     const { cloudflare, layer } = baseLayer({
       invites: [
-        new TeamInvite({ githubLogin: "pending1", teamId: team1Id, email: "pending1@example.com", invitedAt: 0 })
+        new TeamInvite({ contestId: DEFAULT_TEST_CONTEST_ID, githubLogin: "pending1", teamId: team1Id, email: "pending1@example.com", invitedAt: 0 })
       ]
     })
 
@@ -303,7 +309,7 @@ describe("inviteMember", () => {
       expect(second.portal).toBe("assigned")
 
       const teams = yield* TeamRepo
-      const members = yield* teams.listMembers(team1Id)
+      const members = yield* teams.listMembers(DEFAULT_TEST_CONTEST_ID, team1Id)
       expect(members.filter((m) => m.id === aliceId)).toHaveLength(1)
 
       const users = yield* UserRepo
@@ -335,9 +341,9 @@ describe("inviteMember", () => {
           const teams = yield* TeamRepo
           return {
             ...teams,
-            addMember: (teamId: TeamId, userId: UserId) =>
+            addMember: (contestId, teamId, userId) =>
               Effect.gen(function* () {
-                yield* teams.addMember(teamId, userId)
+                yield* teams.addMember(contestId, teamId, userId)
                 return false
               })
           }
@@ -349,7 +355,7 @@ describe("inviteMember", () => {
         expect(result.portal).toBe("assigned")
 
         const teams = yield* TeamRepo
-        const daveTeam = yield* teams.findByUserId(daveId)
+        const daveTeam = yield* teams.findByUserId(DEFAULT_TEST_CONTEST_ID, daveId)
         expect(daveTeam).toStrictEqual(Option.some(team1))
       }).pipe(Effect.provide(Layer.mergeAll(layer, racyTeamRepoLayer)))
     }
@@ -378,9 +384,9 @@ describe("inviteMember", () => {
           const teams = yield* TeamRepo
           return {
             ...teams,
-            addMember: (_teamId: TeamId, userId: UserId) =>
+            addMember: (contestId, _teamId, userId) =>
               Effect.gen(function* () {
-                yield* teams.addMember(team2Id, userId)
+                yield* teams.addMember(contestId, team2Id, userId)
                 return false
               })
           }
@@ -394,7 +400,7 @@ describe("inviteMember", () => {
         expect(exit).toStrictEqual(Exit.fail(new MemberConflict({ logins: ["dave"] })))
 
         const teams = yield* TeamRepo
-        const daveTeam = yield* teams.findByUserId(daveId)
+        const daveTeam = yield* teams.findByUserId(DEFAULT_TEST_CONTEST_ID, daveId)
         expect(daveTeam).toStrictEqual(Option.some(team2))
       }).pipe(Effect.provide(Layer.mergeAll(layer, racyTeamRepoLayer)))
     }

@@ -3,19 +3,20 @@ import { it } from "@effect/vitest"
 import { Effect, Option } from "effect"
 import { describe, expect } from "vitest"
 import { TeamId } from "../../src/domain/ids.js"
-import { Team } from "../../src/domain/team.js"
 import { TeamRepo } from "../../src/application/ports.js"
+import { DEFAULT_TEST_CONTEST_ID, makeTeam } from "../support/factories.js"
 import { login } from "../support/login.js"
-import { TestLayer, asAdmin } from "../support/apiTestHelpers.js"
+import { TestLayer, asAdmin, seedOperationalContest } from "../support/apiTestHelpers.js"
 
 describe("GET /api/teams", () => {
   it.effect("メンバーの githubLogin 込みでチーム一覧が返る", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const teams = yield* TeamRepo
-      const team = new Team({ id: TeamId.make("team-list-1"), name: "Team List 1", teamNumber: 10 })
+      const team = makeTeam({ id: TeamId.make("team-list-1"), name: "Team List 1", teamNumber: 10 })
       yield* teams.create(team)
       const { user, cookieHeader } = yield* login({ githubLogin: "member-1" })
-      yield* teams.setMembers(team.id, [user.id])
+      yield* teams.setMembers(DEFAULT_TEST_CONTEST_ID, team.id, [user.id])
 
       const client = yield* HttpClient.HttpClient
       const res = yield* client.get("/api/teams", { headers: { cookie: cookieHeader } })
@@ -55,6 +56,7 @@ describe("POST /api/teams", () => {
 
   it.effect("admin は作成できる", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const { cookieHeader } = yield* asAdmin()
       const res = yield* post(cookieHeader, { name: "Team Y", teamNumber: 21 })
       expect(res.status).toBe(200)
@@ -66,6 +68,7 @@ describe("POST /api/teams", () => {
 
   it.effect("teamNumber 重複は409", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const { cookieHeader } = yield* asAdmin()
       const first = yield* post(cookieHeader, { name: "Team Dup 1", teamNumber: 22 })
       expect(first.status).toBe(200)
@@ -90,8 +93,9 @@ describe("PUT /api/teams/:id/members", () => {
 
   it.effect("非 admin は403", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const teams = yield* TeamRepo
-      const team = new Team({ id: TeamId.make("team-members-403"), name: "Members 403", teamNumber: 30 })
+      const team = makeTeam({ id: TeamId.make("team-members-403"), name: "Members 403", teamNumber: 30 })
       yield* teams.create(team)
 
       const { cookieHeader } = yield* login({ isAdmin: false })
@@ -102,6 +106,7 @@ describe("PUT /api/teams/:id/members", () => {
 
   it.effect("存在しないチームは404", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const { cookieHeader } = yield* asAdmin()
       const res = yield* put(cookieHeader, "no-such-team", { githubLogins: [] })
       expect(res.status).toBe(404)
@@ -110,8 +115,9 @@ describe("PUT /api/teams/:id/members", () => {
 
   it.effect("未ログイン(users に不在)の githubLogin は422で一覧が返る", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const teams = yield* TeamRepo
-      const team = new Team({ id: TeamId.make("team-members-unknown"), name: "Members Unknown", teamNumber: 31 })
+      const team = makeTeam({ id: TeamId.make("team-members-unknown"), name: "Members Unknown", teamNumber: 31 })
       yield* teams.create(team)
 
       const { cookieHeader } = yield* asAdmin()
@@ -124,14 +130,15 @@ describe("PUT /api/teams/:id/members", () => {
 
   it.effect("既に他チームに所属するユーザーが含まれる場合は409で衝突一覧が返る(横取りしない)", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const teams = yield* TeamRepo
-      const teamA = new Team({ id: TeamId.make("team-members-conflict-a"), name: "Conflict A", teamNumber: 32 })
-      const teamB = new Team({ id: TeamId.make("team-members-conflict-b"), name: "Conflict B", teamNumber: 33 })
+      const teamA = makeTeam({ id: TeamId.make("team-members-conflict-a"), name: "Conflict A", teamNumber: 32 })
+      const teamB = makeTeam({ id: TeamId.make("team-members-conflict-b"), name: "Conflict B", teamNumber: 33 })
       yield* teams.create(teamA)
       yield* teams.create(teamB)
 
       const { user: memberOfA } = yield* login({ githubLogin: "already-in-a" })
-      yield* teams.setMembers(teamA.id, [memberOfA.id])
+      yield* teams.setMembers(DEFAULT_TEST_CONTEST_ID, teamA.id, [memberOfA.id])
 
       const { cookieHeader } = yield* asAdmin()
       const res = yield* put(cookieHeader, teamB.id, { githubLogins: ["already-in-a"] })
@@ -139,16 +146,16 @@ describe("PUT /api/teams/:id/members", () => {
       const body = yield* res.json
       expect(body).toStrictEqual({ _tag: "MemberConflict", logins: ["already-in-a"] })
 
-      // 横取りされていない(teamA のメンバーのまま)ことを確認
-      const stillInA = yield* teams.findByUserId(memberOfA.id)
+      const stillInA = yield* teams.findByUserId(DEFAULT_TEST_CONTEST_ID, memberOfA.id)
       expect(stillInA).toStrictEqual(Option.some(teamA))
     }).pipe(Effect.provide(TestLayer))
   )
 
   it.effect("ペイロード内の重複 login は1人として扱われる(500にならない)", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const teams = yield* TeamRepo
-      const team = new Team({ id: TeamId.make("team-members-dup"), name: "Members Dup", teamNumber: 35 })
+      const team = makeTeam({ id: TeamId.make("team-members-dup"), name: "Members Dup", teamNumber: 35 })
       yield* teams.create(team)
 
       const { user } = yield* login({ githubLogin: "member-dup" })
@@ -157,15 +164,16 @@ describe("PUT /api/teams/:id/members", () => {
       const res = yield* put(cookieHeader, team.id, { githubLogins: ["member-dup", "member-dup"] })
       expect(res.status).toBe(200)
 
-      const members = yield* teams.listMembers(team.id)
+      const members = yield* teams.listMembers(DEFAULT_TEST_CONTEST_ID, team.id)
       expect(members.map((m) => m.id)).toStrictEqual([user.id])
     }).pipe(Effect.provide(TestLayer))
   )
 
   it.effect("正常系: 全量置換され、更新後のメンバー一覧が返る", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const teams = yield* TeamRepo
-      const team = new Team({ id: TeamId.make("team-members-ok"), name: "Members OK", teamNumber: 34 })
+      const team = makeTeam({ id: TeamId.make("team-members-ok"), name: "Members OK", teamNumber: 34 })
       yield* teams.create(team)
 
       const { user: memberA } = yield* login({ githubLogin: "member-ok-a", githubId: 1001 })
@@ -177,32 +185,29 @@ describe("PUT /api/teams/:id/members", () => {
       const body = (yield* res.json) as { members: ReadonlyArray<{ githubLogin: string }> }
       expect(body.members.map((m) => m.githubLogin).slice().sort()).toStrictEqual(["member-ok-a", "member-ok-b"])
 
-      const members = yield* teams.listMembers(team.id)
+      const members = yield* teams.listMembers(DEFAULT_TEST_CONTEST_ID, team.id)
       expect(members.map((m) => m.id).slice().sort()).toStrictEqual([memberA.id, memberB.id].slice().sort())
     }).pipe(Effect.provide(TestLayer))
   )
 
   it.effect("既存メンバーを含む同一チームへの再割当(冪等 PUT)はMemberConflictにならず成功する", () =>
     Effect.gen(function* () {
+      yield* seedOperationalContest("preparing")
       const teams = yield* TeamRepo
-      const team = new Team({ id: TeamId.make("team-members-idempotent"), name: "Members Idempotent", teamNumber: 36 })
+      const team = makeTeam({ id: TeamId.make("team-members-idempotent"), name: "Members Idempotent", teamNumber: 36 })
       yield* teams.create(team)
 
       const { user: memberA } = yield* login({ githubLogin: "idem-a", githubId: 1101 })
       const { user: memberB } = yield* login({ githubLogin: "idem-b", githubId: 1102 })
-      yield* teams.setMembers(team.id, [memberA.id])
+      yield* teams.setMembers(DEFAULT_TEST_CONTEST_ID, team.id, [memberA.id])
 
       const { cookieHeader } = yield* asAdmin()
-      // memberA は既に team のメンバー。setTeamMembers の
-      // findByUserId(memberA.id) === team.id となるため、既存メンバーを含む
-      // 再割当(memberB を追加)が MemberConflict(横取り判定)にならないことを
-      // 確認する。
       const res = yield* put(cookieHeader, team.id, { githubLogins: ["idem-a", "idem-b"] })
       expect(res.status).toBe(200)
       const body = (yield* res.json) as { members: ReadonlyArray<{ githubLogin: string }> }
       expect(body.members.map((m) => m.githubLogin).slice().sort()).toStrictEqual(["idem-a", "idem-b"])
 
-      const members = yield* teams.listMembers(team.id)
+      const members = yield* teams.listMembers(DEFAULT_TEST_CONTEST_ID, team.id)
       expect(members.map((m) => m.id).slice().sort()).toStrictEqual([memberA.id, memberB.id].slice().sort())
     }).pipe(Effect.provide(TestLayer))
   )

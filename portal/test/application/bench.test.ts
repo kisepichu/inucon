@@ -1,8 +1,8 @@
 import { it } from "@effect/vitest"
-import { Effect, Either, Exit, Layer, Option, TestClock } from "effect"
+import { Effect, Exit, Layer, Option, TestClock } from "effect"
 import { describe, expect } from "vitest"
 import { BenchJob, newJob, startJob } from "../../src/domain/benchJob.js"
-import { Contest } from "../../src/domain/contest.js"
+import type { Contest } from "../../src/domain/contest.js"
 import {
   CannotCancelRunning,
   ContestNotRunning,
@@ -11,7 +11,6 @@ import {
   TeamJobAlreadyQueued
 } from "../../src/domain/errors.js"
 import { BenchJobId, TeamId, UserId } from "../../src/domain/ids.js"
-import { Team } from "../../src/domain/team.js"
 import { User } from "../../src/domain/user.js"
 import { Forbidden, NotInTeam } from "../../src/application/errors.js"
 import { BenchJobRepo } from "../../src/application/ports.js"
@@ -23,6 +22,7 @@ import {
   reportProgress,
   sweepTimedOutJobs
 } from "../../src/application/usecases/bench.js"
+import { DEFAULT_TEST_CONTEST_ID, makeContest, makeTeam } from "../support/factories.js"
 import {
   makeBenchJobRepoTest,
   makeContestRepoTest,
@@ -30,7 +30,7 @@ import {
   RunnerConfigTest,
   UuidGenTest
 } from "../support/inMemory.js"
-import { makeContest } from "../support/factories.js"
+import { Either } from "effect"
 
 const team1Id = TeamId.make("22222222-2222-2222-2222-222222222222")
 const team2Id = TeamId.make("33333333-3333-3333-3333-333333333333")
@@ -38,8 +38,8 @@ const user1Id = UserId.make("44444444-4444-4444-4444-444444444444")
 const user2Id = UserId.make("55555555-5555-5555-5555-555555555555")
 const noTeamUserId = UserId.make("66666666-6666-6666-6666-666666666666")
 
-const team1 = new Team({ id: team1Id, name: "team1", teamNumber: 1 })
-const team2 = new Team({ id: team2Id, name: "team2", teamNumber: 2 })
+const team1 = makeTeam({ id: team1Id, name: "team1", teamNumber: 1 })
+const team2 = makeTeam({ id: team2Id, name: "team2", teamNumber: 2 })
 const user1 = new User({
   id: user1Id,
   githubId: 1,
@@ -57,33 +57,50 @@ const noTeamUser = new User({
   email: Option.none()
 })
 
-
 // startJob は queued な BenchJob からのみ成功するので、テストデータ作りは
 // 常に newJob() から作った queued ジョブを起点にする。
 const runningJobAt = (args: { id: BenchJobId; teamId: TeamId; targetIp: string; enqueuedAt: number; now: number }) =>
   Either.getOrThrow(
     startJob(
-      newJob({ id: args.id, teamId: args.teamId, targetIp: args.targetIp, targetPort: 8080, now: args.enqueuedAt }),
+      newJob({
+        id: args.id,
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        teamId: args.teamId,
+        targetIp: args.targetIp,
+        targetPort: 8080,
+        purpose: "competition",
+        now: args.enqueuedAt
+      }),
       args.now
     )
   )
 
+const queuedJob = (args: { id: BenchJobId; teamId: TeamId; targetIp: string; now: number }) =>
+  newJob({
+    id: args.id,
+    contestId: DEFAULT_TEST_CONTEST_ID,
+    teamId: args.teamId,
+    targetIp: args.targetIp,
+    targetPort: 8080,
+    purpose: "competition",
+    now: args.now
+  })
+
 const teamRepoLayer = makeTeamRepoTest({
   teams: [team1, team2],
   memberships: [
-    { userId: user1Id, teamId: team1Id },
-    { userId: user2Id, teamId: team2Id }
+    { contestId: DEFAULT_TEST_CONTEST_ID, userId: user1Id, teamId: team1Id },
+    { contestId: DEFAULT_TEST_CONTEST_ID, userId: user2Id, teamId: team2Id }
   ]
 })
-
 const testLayer = (
   contestStatus: Contest["status"],
-  jobs: ReadonlyArray<ReturnType<typeof newJob>> = [],
+  jobs: ReadonlyArray<BenchJob> = [],
   jobTimeoutMillis = 600_000
 ) =>
   Layer.mergeAll(
     UuidGenTest,
-    makeContestRepoTest(Option.some(makeContest({ status: contestStatus }))),
+    makeContestRepoTest([makeContest({ id: DEFAULT_TEST_CONTEST_ID, status: contestStatus })]),
     teamRepoLayer,
     makeBenchJobRepoTest(jobs),
     RunnerConfigTest(jobTimeoutMillis)
@@ -96,10 +113,11 @@ describe("enqueueBench", () => {
       expect(job.status).toBe("queued")
       expect(job.teamId).toBe(team1Id)
       expect(job.targetIp).toBe("10.100.1.5")
+      expect(job.purpose).toBe("competition")
     }).pipe(Effect.provide(testLayer("running")))
   )
 
-  it.effect("contest が preparing なら ContestNotRunning", () =>
+  it.effect("contest が preparing で 非 admin なら ContestNotRunning", () =>
     Effect.gen(function* () {
       const exit = yield* Effect.exit(enqueueBench({ user: user1, targetIp: "10.100.1.5", targetPort: 8080 }))
       expect(exit).toStrictEqual(Exit.fail(new ContestNotRunning({ status: "preparing" })))
@@ -113,11 +131,10 @@ describe("enqueueBench", () => {
     }).pipe(
       Effect.provide(
         testLayer("running", [
-          newJob({
+          queuedJob({
             id: BenchJobId.make("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
             teamId: team1Id,
             targetIp: "10.100.1.9",
-            targetPort: 8080,
             now: 1000
           })
         ])
@@ -149,9 +166,7 @@ describe("cancelBench", () => {
       expect(job.status).toBe("canceled")
     }).pipe(
       Effect.provide(
-        testLayer("running", [
-          newJob({ id: jobId, teamId: team1Id, targetIp: "10.100.1.9", targetPort: 8080, now: 1000 })
-        ])
+        testLayer("running", [queuedJob({ id: jobId, teamId: team1Id, targetIp: "10.100.1.9", now: 1000 })])
       )
     )
   )
@@ -175,9 +190,7 @@ describe("cancelBench", () => {
       expect(exit).toStrictEqual(Exit.fail(new Forbidden()))
     }).pipe(
       Effect.provide(
-        testLayer("running", [
-          newJob({ id: jobId, teamId: team2Id, targetIp: "10.100.2.9", targetPort: 8080, now: 1000 })
-        ])
+        testLayer("running", [queuedJob({ id: jobId, teamId: team2Id, targetIp: "10.100.2.9", now: 1000 })])
       )
     )
   )
@@ -204,18 +217,16 @@ describe("pollNextJob", () => {
     }).pipe(
       Effect.provide(
         testLayer("running", [
-          newJob({
+          queuedJob({
             id: BenchJobId.make("cccccccc-cccc-cccc-cccc-cccccccccccc"),
             teamId: team1Id,
             targetIp: "10.100.1.9",
-            targetPort: 8080,
             now: 1000
           }),
-          newJob({
+          queuedJob({
             id: BenchJobId.make("dddddddd-dddd-dddd-dddd-dddddddddddd"),
             teamId: team2Id,
             targetIp: "10.100.2.9",
-            targetPort: 8080,
             now: 2000
           })
         ])
@@ -253,9 +264,7 @@ describe("reportProgress", () => {
       )
     }).pipe(
       Effect.provide(
-        testLayer("running", [
-          newJob({ id: jobId, teamId: team1Id, targetIp: "10.100.1.9", targetPort: 8080, now: 1000 })
-        ])
+        testLayer("running", [queuedJob({ id: jobId, teamId: team1Id, targetIp: "10.100.1.9", now: 1000 })])
       )
     )
   )
@@ -285,9 +294,7 @@ describe("reportFinish", () => {
       expect(exit).toStrictEqual(Exit.fail(new InvalidJobTransition({ jobId, from: "queued", action: "finish" })))
     }).pipe(
       Effect.provide(
-        testLayer("running", [
-          newJob({ id: jobId, teamId: team1Id, targetIp: "10.100.1.9", targetPort: 8080, now: 1000 })
-        ])
+        testLayer("running", [queuedJob({ id: jobId, teamId: team1Id, targetIp: "10.100.1.9", now: 1000 })])
       )
     )
   )
@@ -296,11 +303,10 @@ describe("reportFinish", () => {
 describe("sweepTimedOutJobs", () => {
   const staleId = BenchJobId.make("11111111-2222-3333-4444-555555555555")
   const freshId = BenchJobId.make("66666666-7777-8888-9999-000000000000")
-  const jobTimeoutMillis = 600_000 // 10 分
+  const jobTimeoutMillis = 600_000
 
   it.effect("進捗途絶(10 分超)の running は failed(timeout) になり、直近進捗ありは無傷", () =>
     Effect.gen(function* () {
-      // now=700_000, timeout=600_000 → cutoff=100_000
       yield* TestClock.setTime(700_000)
       const count = yield* sweepTimedOutJobs
       expect(count).toBe(1)
@@ -324,11 +330,11 @@ describe("sweepTimedOutJobs", () => {
           [
             new BenchJob({
               ...runningJobAt({ id: staleId, teamId: team1Id, targetIp: "10.100.1.9", enqueuedAt: 0, now: 0 }),
-              lastProgressAt: Option.some(0) // 700_000 - 0 > timeout → 対象
+              lastProgressAt: Option.some(0)
             }),
             new BenchJob({
               ...runningJobAt({ id: freshId, teamId: team2Id, targetIp: "10.100.2.9", enqueuedAt: 0, now: 0 }),
-              lastProgressAt: Option.some(650_000) // 700_000 - 650_000 < timeout → 無傷
+              lastProgressAt: Option.some(650_000)
             })
           ],
           jobTimeoutMillis
@@ -339,13 +345,10 @@ describe("sweepTimedOutJobs", () => {
 
   it.effect("reportFinish 済みのジョブは cutoff 条件を満たしても failed にならない(件数 0)", () =>
     Effect.gen(function* () {
-      // running(lastProgressAt=0)のジョブを先に finish してから sweep する。
-      // 判定と更新が原子的でない実装だと、finished を failed で上書きしうる
-      // 競合(TOCTOU)の代表ケース。
       const finished = yield* reportFinish({ jobId: staleId, score: 100, passed: true })
       expect(finished.status).toBe("finished")
 
-      yield* TestClock.setTime(700_000) // cutoff=100_000、lastProgressAt=0 < cutoff
+      yield* TestClock.setTime(700_000)
       const count = yield* sweepTimedOutJobs
       expect(count).toBe(0)
 
@@ -373,15 +376,10 @@ describe("sweepTimedOutJobs", () => {
   )
 })
 
-// reportProgress/reportFinish/cancel を「判定+更新」を単一の原子的操作に
-// 寄せた(recordProgressIfRunning/finishIfRunning/cancelIfQueued)ことの回帰
-// テスト。sweep や dequeue が先にジョブの状態を変えてしまうケースで、後続の
-// ユースケースが古い状態を前提に上書きしないことを確認する。
 describe("状態遷移の競合(TOCTOU 回帰)", () => {
   it.effect("sweep で failed になったジョブへの reportFinish は InvalidJobTransition で失敗し failed のまま", () =>
     Effect.gen(function* () {
       const staleId = BenchJobId.make("77777777-8888-9999-aaaa-bbbbbbbbbbbb")
-      // now=700_000, timeout=600_000 → cutoff=100_000。lastProgressAt=0 は対象。
       yield* TestClock.setTime(700_000)
       const count = yield* sweepTimedOutJobs
       expect(count).toBe(1)
@@ -441,11 +439,10 @@ describe("状態遷移の競合(TOCTOU 回帰)", () => {
     }).pipe(
       Effect.provide(
         testLayer("running", [
-          newJob({
+          queuedJob({
             id: BenchJobId.make("99999999-aaaa-bbbb-cccc-dddddddddddd"),
             teamId: team1Id,
             targetIp: "10.100.1.9",
-            targetPort: 8080,
             now: 1000
           })
         ])

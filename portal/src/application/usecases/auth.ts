@@ -3,14 +3,13 @@ import type { UserId } from "../../domain/ids.js"
 import type { Team } from "../../domain/team.js"
 import type { User } from "../../domain/user.js"
 import type { OAuthFailed, RepoError } from "../ports.js"
-import { AuthConfig, GithubOAuthPort, InviteRepo, SessionRepo, TeamRepo, UserRepo } from "../ports.js"
+import { AuthConfig, ContestRepo, GithubOAuthPort, InviteRepo, SessionRepo, TeamRepo, UserRepo } from "../ports.js"
 
 // セッション有効期限: 30 日(スペック §認証)。
 export const SESSION_TTL_MILLIS = 30 * 24 * 60 * 60 * 1000
 
-// OAuth callback の後半: code 交換 → users upsert(isAdmin は
-// ADMIN_GITHUB_LOGINS 由来)→ セッション発行。state 検証と cookie の
-// 読み書きは HTTP 境界(handlers/auth.ts)の責務。
+// OAuth callback の後半: code 交換 → users upsert → 全 live contest 招待の
+// 消費 → セッション発行。state 検証と cookie は HTTP 境界の責務。
 export const handleOAuthCallback = (args: {
   code: string
 }): Effect.Effect<
@@ -31,16 +30,7 @@ export const handleOAuthCallback = (args: {
       isAdmin: config.adminGithubLogins.includes(gh.githubLogin)
     })
 
-    // 初ログイン時の team_invites 消費(スペック §招待フロー・Task 5):
-    // 事前招待(未ログインユーザー宛)があれば、このログインで自動所属し、
-    // Access ログイン用メール(users.email)を引き継ぎ、invite 行を削除する。
-    // 冪等: 既にどこかのチームへ所属済みなら addMember はスキップし(横取り
-    // 防止)、invite 行の消費(削除)だけ行う。addMember は TeamRepo.addMember
-    // の原子的判定(TOCTOU 回避)により false(追加できなかった)を返し得るが、
-    // その場合も同じユーザー・同じ invite の team_id で呼んでいるため既に
-    // 目的のチームへ所属済みであり、以降の setEmail/delete のみで冪等に完了
-    // する(結果は使わず捨ててよい)。
-    const user = yield* consumeInviteOnFirstLogin(upserted)
+    const user = yield* consumeLiveInvitesOnLogin(upserted)
 
     const sessions = yield* SessionRepo
     const now = yield* Clock.currentTimeMillis
@@ -48,33 +38,45 @@ export const handleOAuthCallback = (args: {
     return { user, sessionId }
   })
 
-// 初ログイン時の team_invites 消費(handleOAuthCallback から呼ぶ)。invite が
-// 無ければ upsert 済みユーザーをそのまま返す。invite があれば所属 + email
-// 反映後の最新ユーザーを findById で読み直して返す(setEmail は User を返さ
-// ないため、レスポンスの email を正しくするには再取得する)。
-const consumeInviteOnFirstLogin = (user: User): Effect.Effect<User, RepoError, UserRepo | TeamRepo | InviteRepo> =>
+// Task 3 Step 5: 「全 live contest(draft/preparing/running/finalizing)に紐づく
+// 招待をすべて消費する」。同じログインが第 n 回・第 n+1 回それぞれに事前招待
+// されている場合、初ログインでどちらのチームにも所属させる(finished/canceled
+// contest の招待残骸は無視)。email は最新の invite で上書きする(同一ログイン
+// が異なるメールで招待されている場合の解決策は「最後に入った invite」に統一)。
+const consumeLiveInvitesOnLogin = (user: User): Effect.Effect<User, RepoError, UserRepo | TeamRepo | InviteRepo> =>
   Effect.gen(function* () {
     const invites = yield* InviteRepo
-    const invite = yield* invites.findByGithubLogin(user.githubLogin)
-    if (Option.isNone(invite)) return user
+    const pending = yield* invites.listByGithubLoginForLiveContests(user.githubLogin)
+    if (pending.length === 0) return user
 
     const teams = yield* TeamRepo
-    const currentTeam = yield* teams.findByUserId(user.id)
-    if (Option.isNone(currentTeam)) {
-      yield* teams.addMember(invite.value.teamId, user.id)
-    }
-
     const users = yield* UserRepo
-    yield* users.setEmail(user.id, invite.value.email)
-    yield* invites.delete(user.githubLogin)
 
+    let lastEmail: string | undefined
+    for (const invite of pending) {
+      const currentTeam = yield* teams.findByUserId(invite.contestId, user.id)
+      if (Option.isNone(currentTeam)) {
+        yield* teams.addMember(invite.contestId, invite.teamId, user.id)
+      }
+      yield* invites.delete(invite.contestId, invite.githubLogin)
+      lastEmail = invite.email
+    }
+    if (lastEmail !== undefined) {
+      yield* users.setEmail(user.id, lastEmail)
+    }
     return yield* users.findById(user.id).pipe(Effect.map(Option.getOrElse(() => user)))
   })
 
 export const logout = (sessionId: string): Effect.Effect<void, RepoError, SessionRepo> =>
   SessionRepo.pipe(Effect.flatMap((sessions) => sessions.delete(sessionId)))
 
-// GET /api/me のチーム部分。user 自体は Authentication ミドルウェアが提供する
-// CurrentUser をそのまま返すため、ここではチームだけ引く。
-export const getMe = (userId: UserId): Effect.Effect<Option.Option<Team>, RepoError, TeamRepo> =>
-  TeamRepo.pipe(Effect.flatMap((teams) => teams.findByUserId(userId)))
+// GET /api/me のチーム部分。CurrentUser を持つ user は ContestRepo.getDisplay
+// で解決した contest 内での所属チームを返す(0 contest の場合は None)。
+export const getMe = (userId: UserId): Effect.Effect<Option.Option<Team>, RepoError, ContestRepo | TeamRepo> =>
+  Effect.gen(function* () {
+    const contests = yield* ContestRepo
+    const contest = yield* contests.getDisplay
+    if (Option.isNone(contest)) return Option.none()
+    const teams = yield* TeamRepo
+    return yield* teams.findByUserId(contest.value.id, userId)
+  })

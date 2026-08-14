@@ -18,15 +18,17 @@ import {
   TargetIpOutOfSubnet,
   TeamJobAlreadyQueued
 } from "../../src/domain/errors.js"
-import { BenchJobId, TeamId } from "../../src/domain/ids.js"
+import { BenchJobId, ContestId, TeamId } from "../../src/domain/ids.js"
 import { makeContest } from "../support/factories.js"
 
 const teamId = TeamId.make("22222222-2222-2222-2222-222222222222")
 const jobId = BenchJobId.make("33333333-3333-3333-3333-333333333333")
+const contestId = ContestId.make("44444444-4444-4444-4444-444444444444")
 
 
 const baseEnqueueArgs = {
   contest: makeContest({ status: "running" }),
+  purpose: "competition" as const,
   activeJobCountForTeam: 0,
   teamId,
   teamNumber: 1,
@@ -56,7 +58,8 @@ describe("checkEnqueueAllowed", () => {
   })
 })
 
-const makeQueuedJob = () => newJob({ id: jobId, teamId, targetIp: "10.100.1.11", targetPort: 8080, now: 1000 })
+const makeQueuedJob = () =>
+  newJob({ id: jobId, contestId, teamId, targetIp: "10.100.1.11", targetPort: 8080, purpose: "competition", now: 1000 })
 
 describe("startJob", () => {
   it("queued → running に成功する(startedAt/lastProgressAt = now)", () => {

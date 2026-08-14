@@ -2,7 +2,6 @@ import { it } from "@effect/vitest"
 import { Effect, Exit, Layer, Option } from "effect"
 import { describe, expect } from "vitest"
 import { TeamId, UserId } from "../../src/domain/ids.js"
-import { Team } from "../../src/domain/team.js"
 import { AuthConfig, OAuthFailed, SessionRepo } from "../../src/application/ports.js"
 import {
   getMe,
@@ -10,8 +9,14 @@ import {
   logout,
   SESSION_TTL_MILLIS
 } from "../../src/application/usecases/auth.js"
+import { DEFAULT_TEST_CONTEST_ID, makeContest, makeTeam } from "../support/factories.js"
 import { makeGithubOAuthStub } from "../support/githubOAuthStub.js"
-import { makeAuthReposTest, makeInviteRepoTest, makeTeamRepoTest } from "../support/inMemory.js"
+import {
+  makeAuthReposTest,
+  makeContestRepoTest,
+  makeInviteRepoTest,
+  makeTeamRepoTest
+} from "../support/inMemory.js"
 
 const stubCodes = {
   "code-taro": { githubId: 100, githubLogin: "taro", displayName: "Taro" },
@@ -20,13 +25,20 @@ const stubCodes = {
 
 const teamId = TeamId.make("team-1")
 const memberId = UserId.make("member-1")
-const team = new Team({ id: teamId, name: "team one", teamNumber: 1 })
+// Task 3: getMe / auth は ContestRepo.getDisplay を経由するため、running な
+// contest を用意する(display は running を最優先で返す)。
+const contest = makeContest({ id: DEFAULT_TEST_CONTEST_ID, status: "running" })
+const team = makeTeam({ id: teamId, name: "team one", teamNumber: 1 })
 
 const testLayer = Layer.mergeAll(
   makeAuthReposTest(),
   makeGithubOAuthStub(stubCodes),
   Layer.succeed(AuthConfig, { adminGithubLogins: ["admin-user"] }),
-  makeTeamRepoTest({ teams: [team], memberships: [{ userId: memberId, teamId }] }),
+  makeContestRepoTest([contest]),
+  makeTeamRepoTest({
+    teams: [team],
+    memberships: [{ contestId: DEFAULT_TEST_CONTEST_ID, userId: memberId, teamId }]
+  }),
   makeInviteRepoTest([])
 )
 

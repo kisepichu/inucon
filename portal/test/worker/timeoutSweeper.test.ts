@@ -3,6 +3,7 @@ import { Context, Effect, Either, Layer, Option, Ref, TestClock } from "effect"
 import { describe, expect } from "vitest"
 import { BenchJob, newJob, startJob } from "../../src/domain/benchJob.js"
 import { BenchJobId, TeamId } from "../../src/domain/ids.js"
+import { DEFAULT_TEST_CONTEST_ID } from "../support/factories.js"
 import { BenchJobRepo, RepoError } from "../../src/application/ports.js"
 import { TimeoutSweeperLive } from "../../src/infrastructure/worker/timeoutSweeper.js"
 import { makeBenchJobRepoTest, RunnerConfigTest } from "../support/inMemory.js"
@@ -20,7 +21,15 @@ const team2Id = TeamId.make("22222222-2222-2222-2222-222222222222")
 const runningJobWithProgress = (args: { id: BenchJobId; teamId: TeamId; lastProgressAt: number }) => {
   const started = Either.getOrThrow(
     startJob(
-      newJob({ id: args.id, teamId: args.teamId, targetIp: "10.100.1.9", targetPort: 8080, now: 0 }),
+      newJob({
+        id: args.id,
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        teamId: args.teamId,
+        targetIp: "10.100.1.9",
+        targetPort: 8080,
+        purpose: "competition",
+        now: 0
+      }),
       0
     )
   )
@@ -93,7 +102,7 @@ describe("TimeoutSweeperLive", () => {
         finishIfRunning: notUsed,
         failIfRunning: notUsed,
         cancelIfQueued: notUsed,
-        scoreboard: Effect.succeed([]),
+        scoreboard: () => Effect.succeed([]),
         // 常に RepoError を返す(sweep が失敗し続けるケースを再現する)。
         failTimedOutJobs: () =>
           Ref.updateAndGet(callsRef, (n) => n + 1).pipe(

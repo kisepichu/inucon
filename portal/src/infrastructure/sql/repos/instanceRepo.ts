@@ -1,6 +1,6 @@
 import { SqlClient } from "@effect/sql"
 import { Effect, Layer, Option } from "effect"
-import type { InstanceId, TeamId } from "../../../domain/ids.js"
+import type { ContestId, InstanceId, TeamId } from "../../../domain/ids.js"
 import { Instance } from "../../../domain/instance.js"
 import { DuplicateInstanceIndex } from "../../../domain/errors.js"
 import { ProvisionInProgress, QuotaExceeded } from "../../../application/errors.js"
@@ -10,6 +10,7 @@ import { decodeRow, optionToNull, wrapSqlError } from "./support.js"
 
 interface InstanceRow {
   readonly id: string
+  readonly contestId: string
   readonly teamId: string
   readonly index: number
   readonly vmid: number
@@ -21,18 +22,13 @@ interface InstanceRow {
   readonly updatedAt: number
 }
 
-// SELECT / RETURNING で共通して使う列リスト(BENCH_JOB_COLUMNS と同じ方針)。
-// progress は JSON 配列を TEXT で保持する(migration 0002)ため、decode 時に
-// JSON.parse してから Schema.decodeUnknown に渡す。
 const INSTANCE_COLUMNS = `
-  id, team_id AS teamId, idx AS "index", vmid, private_ip AS privateIp, status,
+  id, contest_id AS contestId, team_id AS teamId, idx AS "index", vmid,
+  private_ip AS privateIp, status,
   progress, error_message AS errorMessage, created_at AS createdAt, updated_at AS updatedAt
 `
 
 const decodeInstance = (row: InstanceRow) =>
-  // progress は TEXT に JSON 配列で保存されている。壊れた値でプロセスを落とさない
-  // よう Effect.try でパースし、失敗も RepoError として E チャネルに載せる
-  // (後段の Schema.decodeUnknown の失敗と同じ扱い)。
   Effect.try({
     try: () => JSON.parse(row.progress) as unknown,
     catch: (cause) => new RepoError({ cause })
@@ -45,12 +41,20 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
     const columns = sql.literal(INSTANCE_COLUMNS)
 
     return {
-      listByTeam: (teamId: TeamId) =>
+      listByContest: (contestId: ContestId) =>
         wrapSqlError(
-          sql<InstanceRow>`SELECT ${columns} FROM instances WHERE team_id = ${teamId} ORDER BY idx`
+          sql<InstanceRow>`SELECT ${columns} FROM instances WHERE contest_id = ${contestId} ORDER BY team_id, idx`
         ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeInstance))),
 
-      // POST /api/bench-jobs: instanceId 指定時に privateIp を解決するために使う。
+      listByTeam: (contestId: ContestId, teamId: TeamId) =>
+        wrapSqlError(
+          sql<InstanceRow>`
+            SELECT ${columns} FROM instances
+            WHERE contest_id = ${contestId} AND team_id = ${teamId}
+            ORDER BY idx
+          `
+        ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeInstance))),
+
       findById: (id: InstanceId) =>
         wrapSqlError(sql<InstanceRow>`SELECT ${columns} FROM instances WHERE id = ${id}`).pipe(
           Effect.flatMap((rows) =>
@@ -60,27 +64,21 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
           )
         ),
 
-      // (team_id, idx) の重複判定は migration 0003 の部分ユニークインデックス
-      // (status != 'deleted', Task 6 レビュー #E で failed も予約対象に
-      // 変更)と同条件で行う。deleted の行があった idx だけ再作成できる。
-      // この WHERE NOT EXISTS の条件を DB のインデックス述語と一致させて
-      // おかないと、failed 行との衝突が「NOT EXISTS は通る→INSERT が UNIQUE
-      // 制約違反で失敗→RepoError(500)」になってしまい、本来返すべき
-      // DuplicateInstanceIndex(409)にならない。判定と INSERT は
-      // 「INSERT ... SELECT ... WHERE NOT EXISTS ... RETURNING」の単一原子的操作
-      // (TOCTOU 回避、teamRepo.create / benchJobRepo.insertIfAllowed と同じ形)。
+      // 台帳取り込み(admin)。(contest_id, team_id, idx) の重複判定は
+      // migration 0005 の部分ユニーク index(status != 'deleted')と同条件で
+      // WHERE NOT EXISTS ... RETURNING の単一原子的操作で行う。
       create: (i: Instance) =>
         Effect.gen(function* () {
           const rows = yield* wrapSqlError(
             sql<InstanceRow>`
               INSERT INTO instances
-                (id, team_id, idx, vmid, private_ip, status, progress, error_message, created_at, updated_at)
+                (id, contest_id, team_id, idx, vmid, private_ip, status, progress, error_message, created_at, updated_at)
               SELECT
-                ${i.id}, ${i.teamId}, ${i.index}, ${i.vmid}, ${i.privateIp}, ${i.status},
+                ${i.id}, ${i.contestId}, ${i.teamId}, ${i.index}, ${i.vmid}, ${i.privateIp}, ${i.status},
                 ${JSON.stringify(i.progress)}, ${optionToNull(i.errorMessage)}, ${i.createdAt}, ${i.updatedAt}
               WHERE NOT EXISTS (
                 SELECT 1 FROM instances
-                WHERE team_id = ${i.teamId} AND idx = ${i.index}
+                WHERE contest_id = ${i.contestId} AND team_id = ${i.teamId} AND idx = ${i.index}
                   AND status != 'deleted'
               )
               RETURNING ${columns}
@@ -94,42 +92,32 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
 
       remove: (id: InstanceId) => wrapSqlError(sql`DELETE FROM instances WHERE id = ${id}`).pipe(Effect.asVoid),
 
-      // requestCreateInstance(Task 4、追加ボタン)専用の原子的 guard 付き
-      // INSERT。単一の INSERT ... SELECT ... WHERE ... RETURNING 文で
-      // (1) チームの creating+running 数 < quota、(2) チームに進行中
-      // (creating/deleting)が無いこと、(3) (team_id, idx) の重複が無いこと、
-      // を検証してから挿入する(TOCTOU 回避、benchJobRepo.insertIfAllowed と
-      // 同型)。0 行挿入時は追加の SELECT で原因を優先順位(quota → 進行中 →
-      // 重複)で判定する(currentStatusOrDie と同じ「失敗時のみ読み直す」
-      // 方針。実際の許可判定は上の単一原子的操作が行っており、この読み直しは
-      // 呼び出し元に返すエラー種別を選ぶためだけに使う)。
-      // (3) の重複判定は migration 0003 の部分ユニークインデックス
-      // (status != 'deleted')と同条件にする(Task 6 レビュー #E)。
-      // 呼び出し元(requestCreateInstance)の occupiedIndices が既に
-      // deleted 以外を占有中として index を選ぶため通常はここに来ないが、
-      // 同一 idx への競合 INSERT が割り込んだ場合の TOCTOU backstop として
-      // DB のインデックスと同じ条件で弾く必要がある。
+      // (1) quota 判定・(2) 同 contest 同 team の進行中 1 本ガード・(3) 重複 idx
+      // ガードすべて contest スコープに絞った条件で単一原子的 INSERT を組み立てる。
       createIfAllowed: (i: Instance, quota: number) =>
         wrapSqlError(
           sql.withTransaction(
             Effect.gen(function* () {
               const rows = yield* sql<InstanceRow>`
                 INSERT INTO instances
-                  (id, team_id, idx, vmid, private_ip, status, progress, error_message, created_at, updated_at)
+                  (id, contest_id, team_id, idx, vmid, private_ip, status, progress, error_message, created_at, updated_at)
                 SELECT
-                  ${i.id}, ${i.teamId}, ${i.index}, ${i.vmid}, ${i.privateIp}, ${i.status},
+                  ${i.id}, ${i.contestId}, ${i.teamId}, ${i.index}, ${i.vmid}, ${i.privateIp}, ${i.status},
                   ${JSON.stringify(i.progress)}, ${optionToNull(i.errorMessage)}, ${i.createdAt}, ${i.updatedAt}
                 WHERE
                   (
                     SELECT COUNT(*) FROM instances
-                    WHERE team_id = ${i.teamId} AND status IN ('creating', 'running')
+                    WHERE contest_id = ${i.contestId} AND team_id = ${i.teamId}
+                      AND status IN ('creating', 'running')
                   ) < ${quota}
                   AND NOT EXISTS (
-                    SELECT 1 FROM instances WHERE team_id = ${i.teamId} AND status IN ('creating', 'deleting')
+                    SELECT 1 FROM instances
+                    WHERE contest_id = ${i.contestId} AND team_id = ${i.teamId}
+                      AND status IN ('creating', 'deleting')
                   )
                   AND NOT EXISTS (
                     SELECT 1 FROM instances
-                    WHERE team_id = ${i.teamId} AND idx = ${i.index}
+                    WHERE contest_id = ${i.contestId} AND team_id = ${i.teamId} AND idx = ${i.index}
                       AND status != 'deleted'
                   )
                 RETURNING ${columns}
@@ -140,14 +128,16 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
 
               const activeCountRows = yield* sql<{ activeCount: number }>`
                 SELECT COUNT(*) AS activeCount FROM instances
-                WHERE team_id = ${i.teamId} AND status IN ('creating', 'running')
+                WHERE contest_id = ${i.contestId} AND team_id = ${i.teamId} AND status IN ('creating', 'running')
               `
               if (activeCountRows[0].activeCount >= quota) {
                 return yield* Effect.fail(new QuotaExceeded({ teamId: i.teamId, quota }))
               }
 
               const inProgressRows = yield* sql<{ id: string }>`
-                SELECT id FROM instances WHERE team_id = ${i.teamId} AND status IN ('creating', 'deleting')
+                SELECT id FROM instances
+                WHERE contest_id = ${i.contestId} AND team_id = ${i.teamId}
+                  AND status IN ('creating', 'deleting')
               `
               if (inProgressRows.length > 0) {
                 return yield* Effect.fail(new ProvisionInProgress({ teamId: i.teamId }))
@@ -158,29 +148,7 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
           )
         ),
 
-      // requestDeleteInstance(削除ボタン)専用の原子的 guard 付き UPDATE
-      // (Task 6 レビュー #B、#D)。単一の UPDATE ... WHERE ... RETURNING 文で
-      // (1) 対象行が running/failed であること、(2) 同じチームに(対象以外で)
-      // creating/deleting の行が無いこと、(3) 対象の private_ip を targetIp と
-      // する queued/running な bench_jobs が無いこと、を検証してから status を
-      // deleting に更新する(TOCTOU 回避、createIfAllowed と同型)。
-      // listByTeam/BenchJobRepo.listByTeam で読んでから update する二段階実装
-      // だと、二つの並行リクエストが両方読み取りを通過して両方書き込めてしまう
-      // (チームにつき進行中は高々1件という不変条件違反、または削除とベンチ
-      // enqueue が両方成功してベンチ対象 VM が消える不整合)。
-      // (3) を追加した経緯(Task 6 レビュー #D): 旧実装は「bench 対象中」判定を
-      // このアトミック UPDATE の外側(requestDeleteInstance の事前 listByTeam
-      // 読み取り)でしか行っておらず、削除リクエストがそのチェックを通過した
-      // 直後に(BenchJobRepo.insertIfAllowed 側の instanceGuard も同様に非
-      // アトミックだった当時は)enqueue が割り込んで queued 行を挿入できて
-      // しまい、削除がそのまま deleting へ進んでベンチ対象の VM を壊し得た。
-      // SQLite は書き込みを直列化するため、この NOT EXISTS を UPDATE 文自身に
-      // 含めることで「削除 UPDATE と enqueue INSERT のどちらが先に確定した
-      // ものを見るか」がどちらの実行順序でも正しく決まる(先に確定した方を
-      // 後続の一方が必ず見る)。0 行更新時は Option.none() を返し、呼び出し元
-      // (requestDeleteInstance)が再読み込みして原因(対象不在 / 対象の状態が
-      // 既に running/failed でない / bench 対象中 / 他行が進行中)を優先順位
-      // 付けて判定する。
+      // 対象 instance の contest_id/team_id で scoping。全条件は 0004 の設計を踏襲。
       beginDeletingIfAllowed: (instanceId: InstanceId, now: number) =>
         wrapSqlError(
           sql<InstanceRow>`
@@ -190,13 +158,15 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
               AND status IN ('running', 'failed')
               AND NOT EXISTS (
                 SELECT 1 FROM instances i2
-                WHERE i2.team_id = instances.team_id
+                WHERE i2.contest_id = instances.contest_id
+                  AND i2.team_id = instances.team_id
                   AND i2.id <> ${instanceId}
                   AND i2.status IN ('creating', 'deleting')
               )
               AND NOT EXISTS (
                 SELECT 1 FROM bench_jobs bj
-                WHERE bj.target_ip = instances.private_ip
+                WHERE bj.contest_id = instances.contest_id
+                  AND bj.target_ip = instances.private_ip
                   AND bj.status IN ('queued', 'running')
               )
             RETURNING ${columns}
@@ -209,8 +179,6 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
           )
         ),
 
-      // saga(provisioning.ts)が各ステップ後に progress/status/errorMessage/
-      // updatedAt を保存するための全量更新(id で 1 行を丸ごと置き換える)。
       update: (i: Instance) =>
         wrapSqlError(
           sql`
@@ -222,15 +190,8 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
           `
         ).pipe(Effect.asVoid),
 
-      // ワーカー(provisioner.ts)が 1 tick で拾う対象。creating/deleting の
-      // うち最も古い(created_at 昇順、同値は id で決定的に)1 件を返す。
-      // 注意(Task 4 レビュー M6): この SELECT は行ロック(SELECT ... FOR
-      // UPDATE 相当)を取らない単純な読み取りであり、単一プロセス(ワーカーは
-      // main.ts で 1 fiber のみ forkScoped する前提、provisioner.ts のコメント
-      // 参照)がこの関数を直列に呼ぶことでのみ「同時 1 インスタンス」の排他が
-      // 成立する。複数プロセスから並行に呼ばれると同じ行を同時に拾い得る
-      // (SQLite はプロセス内シングルスレッドだが、この関数自体は競合防止を
-      // 提供しない)。
+      // ワーカーは全 contest 横断で拾う(オーケストレーション対象は Contest に
+      // 縛らずキュー全体で最古 1 件を進める)。
       findNextForOrchestration: wrapSqlError(
         sql<InstanceRow>`
           SELECT ${columns} FROM instances
