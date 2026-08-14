@@ -1,5 +1,5 @@
 import { it } from "@effect/vitest"
-import { Effect, Exit, Layer, Option, TestClock } from "effect"
+import { Effect, Either, Exit, Layer, Option, TestClock } from "effect"
 import { describe, expect } from "vitest"
 import { BenchJob, newJob, startJob } from "../../src/domain/benchJob.js"
 import type { Contest } from "../../src/domain/contest.js"
@@ -32,7 +32,6 @@ import {
   RunnerConfigTest,
   UuidGenTest
 } from "../support/inMemory.js"
-import { Either } from "effect"
 
 const team1Id = TeamId.make("22222222-2222-2222-2222-222222222222")
 const team2Id = TeamId.make("33333333-3333-3333-3333-333333333333")

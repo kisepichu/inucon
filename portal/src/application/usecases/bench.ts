@@ -225,6 +225,16 @@ export interface RunnerJobView {
 // finalizing)を候補に取り、running なら competition、preparing なら
 // rehearsal を dequeue する。finalizing は running ジョブの完了待ちなので
 // 新規 dequeue はしない。
+//
+// Operational contract: dequeueNextQueued の running 排他は
+// (contest_id, purpose) スコープなので、DB 上は「同じ contest でも
+// rehearsal と competition の running が同時に存在しうる」形式に緩んでいる
+// (iter 8/13 で意図的に導入)。実運用では runner プロセスは 1 台前提で、
+// pollNextRunnerJob の呼び出しが直列化される限り「同時 running は 1 本」に
+// 保たれる。Rolling deploy 等で runner が一時的に 2 プロセスになると
+// rehearsal + competition が並行で走り得るので、process manager 側で単一
+// runner を保証すること(将来 Task 10 以降で runner heartbeat + 同時実行
+// ガードを DB 側に持たせる可能性がある)。
 export const pollNextRunnerJob = Effect.gen(function* () {
   const contests = yield* ContestRepo
   const contest = yield* contests.getOperational

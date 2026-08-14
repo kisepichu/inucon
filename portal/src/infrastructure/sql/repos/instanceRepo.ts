@@ -41,10 +41,6 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
     const columns = sql.literal(INSTANCE_COLUMNS)
 
     return {
-      listByContest: (contestId: ContestId) =>
-        wrapSqlError(
-          sql<InstanceRow>`SELECT ${columns} FROM instances WHERE contest_id = ${contestId} ORDER BY team_id, idx`
-        ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeInstance))),
 
       listByTeam: (contestId: ContestId, teamId: TeamId) =>
         wrapSqlError(

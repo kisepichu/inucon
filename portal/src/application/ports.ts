@@ -168,7 +168,6 @@ export class InviteRepo extends Context.Tag("app/InviteRepo")<
 export class InstanceRepo extends Context.Tag("app/InstanceRepo")<
   InstanceRepo,
   {
-    readonly listByContest: (contestId: ContestId) => Effect.Effect<ReadonlyArray<Instance>, RepoError>
     readonly listByTeam: (
       contestId: ContestId,
       teamId: TeamId

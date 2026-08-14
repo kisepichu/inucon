@@ -99,11 +99,13 @@ export const TeamRepoLive: Layer.Layer<TeamRepo, never, SqlClient.SqlClient> = L
       // user_id) で落ちる。素の SqlError → RepoError → 500 は誤解を招く
       // (実態は MemberConflict の 409 相当)ので、UNIQUE 違反を検出したら
       // 診断 SELECT で衝突していた user の github_login を集めて
-      // MemberConflict に落とす。
+      // MemberConflict に落とす。DELETE + INSERT + 診断 SELECT を同一
+      // sql.withTransaction 内で走らせて INSERT 失敗後の snapshot も
+      // 一貫させる(iter 16 レビュー #1)。
       setMembers: (contestId: ContestId, teamId: TeamId, userIds: ReadonlyArray<UserId>) =>
-        sql
-          .withTransaction(
-            Effect.gen(function* () {
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const writeResult = yield* Effect.gen(function* () {
               yield* sql`
                 DELETE FROM team_members
                 WHERE contest_id = ${contestId} AND team_id = ${teamId}
@@ -118,35 +120,31 @@ export const TeamRepoLive: Layer.Layer<TeamRepo, never, SqlClient.SqlClient> = L
                   })))}
                 `
               }
-            })
-          )
-          .pipe(
-            Effect.catchTag(
-              "SqlError",
-              (cause): Effect.Effect<void, RepoError | MemberConflict> =>
-                Effect.gen(function* () {
-                  // SqlError の cause 連鎖形式は driver 依存で fragile なので、
-                  // 常に診断 SELECT を走らせて MemberConflict か否かを判定する。
-                  // 対象 userIds のうち、当該 contest 内で teamId 以外に所属して
-                  // いるものを github_login 付きで拾う。0 件なら未知の SQL エラー
-                  // として RepoError にする(呼び出し元は 500 に畳む)。
-                  const conflicts = yield* sql<{ githubLogin: string }>`
-                    SELECT u.github_login AS githubLogin
-                    FROM team_members tm
-                    JOIN users u ON u.id = tm.user_id
-                    WHERE tm.contest_id = ${contestId}
-                      AND tm.team_id <> ${teamId}
-                      AND tm.user_id IN ${sql.in(userIds)}
-                  `.pipe(Effect.catchTag("SqlError", () => Effect.succeed([])))
-                  if (conflicts.length > 0) {
-                    return yield* Effect.fail(
-                      new MemberConflict({ logins: conflicts.map((row) => row.githubLogin) })
-                    )
-                  }
-                  return yield* Effect.fail(new RepoError({ cause }))
-                })
+              return { ok: true as const }
+            }).pipe(
+              Effect.catchTag("SqlError", (cause) => Effect.succeed({ ok: false as const, cause }))
             )
-          ),
+            if (writeResult.ok) return
+
+            // INSERT 失敗後、同一 tx 内で診断 SELECT を走らせる。呼び出し元の
+            // pre-check が「別チーム所属じゃない」と判定した user のうち、
+            // 実際は別チームに存在しているものを github_login 付きで拾う。
+            const conflicts = yield* sql<{ githubLogin: string }>`
+              SELECT u.github_login AS githubLogin
+              FROM team_members tm
+              JOIN users u ON u.id = tm.user_id
+              WHERE tm.contest_id = ${contestId}
+                AND tm.team_id <> ${teamId}
+                AND tm.user_id IN ${sql.in(userIds)}
+            `.pipe(Effect.catchTag("SqlError", () => Effect.succeed([])))
+            if (conflicts.length > 0) {
+              return yield* Effect.fail(
+                new MemberConflict({ logins: conflicts.map((row) => row.githubLogin) })
+              )
+            }
+            return yield* Effect.fail(new RepoError({ cause: writeResult.cause }))
+          })
+        ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new RepoError({ cause })))),
 
       // scoped unique(contest_id, user_id)を TOCTOU なく判定する。同じ user が
       // 別 contest には所属可能。0 行挿入なら false(既に同一 contest 内の

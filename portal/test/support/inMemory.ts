@@ -497,14 +497,6 @@ export const makeInstanceRepoTest = (initial: ReadonlyArray<Instance> = []): Lay
     Effect.gen(function* () {
       const instancesRef = yield* Ref.make(initial)
       return {
-        listByContest: (contestId: ContestId) =>
-          Ref.get(instancesRef).pipe(
-            Effect.map((instances) =>
-              instances
-                .filter((i) => i.contestId === contestId)
-                .sort((a, b) => (a.teamId === b.teamId ? a.index - b.index : a.teamId < b.teamId ? -1 : 1))
-            )
-          ),
         listByTeam: (contestId: ContestId, teamId: TeamId) =>
           Ref.get(instancesRef).pipe(
             Effect.map((instances) =>
