@@ -2009,3 +2009,138 @@ layer("InviteRepo: listByGithubLoginForLiveContests", (it) => {
     })
   )
 })
+
+// Task 3 Step 1: 「異 contest の finished ジョブが scoreboard に混ざらない」。
+// scoreboard SQL の contest_id フィルタが機能していることを SQL レイヤで
+// 直接検証する(WHERE t.contest_id と各サブクエリの contest_id 条件が
+// 揃っていることの回帰テスト)。
+layer("BenchJobRepo: scoreboard は edition を混ぜない", (it) => {
+  it.effect("別 contest の finished job は scoreboard(c1) に現れない", () =>
+    Effect.gen(function* () {
+      const contests = yield* ContestRepo
+      const teams = yield* TeamRepo
+      const jobs = yield* BenchJobRepo
+
+      const contestAId = ContestId.make("00000000-0000-0000-0000-cccccccccef1")
+      const contestBId = ContestId.make("00000000-0000-0000-0000-cccccccccef2")
+      yield* contests.create(makeContest({ id: contestAId, edition: 41, status: "running" }))
+      yield* contests.create(makeContest({ id: contestBId, edition: 42, status: "draft" }))
+
+      const teamA = makeTeam({
+        id: TeamId.make("team-sb-iso-a"),
+        contestId: contestAId,
+        name: "ScoreboardIsoA",
+        teamNumber: 241
+      })
+      const teamB = makeTeam({
+        id: TeamId.make("team-sb-iso-b"),
+        contestId: contestBId,
+        name: "ScoreboardIsoB",
+        teamNumber: 242
+      })
+      yield* teams.create(teamA)
+      yield* teams.create(teamB)
+
+      // 各 contest に finished competition job を 1 つずつ (異なる score) 投入。
+      const jobA = newJob({
+        contestId: contestAId,
+        purpose: "competition",
+        id: BenchJobId.make("bj-sb-iso-a"),
+        teamId: teamA.id,
+        targetIp: "10.100.301.5",
+        targetPort: 8080,
+        now: 1000
+      })
+      const jobB = newJob({
+        contestId: contestBId,
+        purpose: "competition",
+        id: BenchJobId.make("bj-sb-iso-b"),
+        teamId: teamB.id,
+        targetIp: "10.100.302.5",
+        targetPort: 8080,
+        now: 1000
+      })
+      yield* jobs.insertIfAllowed(jobA)
+      yield* jobs.insertIfAllowed(jobB)
+      // 各ジョブを running → finished へ (別 contest でも running は同時に
+      // 1 本以下という制約があるので、 A を先に finish してから B を扱う)。
+      yield* jobs.dequeueNextQueued({ contestId: contestAId, purpose: "competition" }, 2000)
+      yield* jobs.finishIfRunning(jobA.id, { score: 100, passed: true }, 3000)
+      yield* jobs.dequeueNextQueued({ contestId: contestBId, purpose: "competition" }, 4000)
+      yield* jobs.finishIfRunning(jobB.id, { score: 900, passed: true }, 5000)
+
+      const boardA = yield* jobs.scoreboard(contestAId)
+      expect(boardA.length).toBe(1)
+      expect(boardA[0]?.teamId).toBe(teamA.id)
+      expect(boardA[0]?.bestScore).toBe(100)
+      expect(boardA[0]?.latestScore).toBe(100)
+
+      const boardB = yield* jobs.scoreboard(contestBId)
+      expect(boardB.length).toBe(1)
+      expect(boardB[0]?.teamId).toBe(teamB.id)
+      expect(boardB[0]?.bestScore).toBe(900)
+      expect(boardB[0]?.latestScore).toBe(900)
+    })
+  )
+})
+
+// Task 3 Step 1: 「同一 user が異 contest でそれぞれ別チームに所属できる」。
+// TeamRepo.findByUserId(contestId, userId) が (contest_id, user_id) の
+// scoped unique に沿って contest ごとに独立解決することを検証する。
+layer("TeamRepo: findByUserId は contest ごとに独立して解決する", (it) => {
+  it.effect("同一 user が別 contest の別チームに所属していても、findByUserId は各 contest の team を返す", () =>
+    Effect.gen(function* () {
+      const contests = yield* ContestRepo
+      const teams = yield* TeamRepo
+      const users = yield* UserRepo
+
+      const contestAId = ContestId.make("00000000-0000-0000-0000-cccccccceee1")
+      const contestBId = ContestId.make("00000000-0000-0000-0000-cccccccceee2")
+      yield* contests.create(makeContest({ id: contestAId, edition: 51, status: "draft" }))
+      yield* contests.create(makeContest({ id: contestBId, edition: 52, status: "draft" }))
+
+      const teamA = makeTeam({
+        id: TeamId.make("team-uiso-a"),
+        contestId: contestAId,
+        name: "UserIsoA",
+        teamNumber: 251
+      })
+      const teamB = makeTeam({
+        id: TeamId.make("team-uiso-b"),
+        contestId: contestBId,
+        name: "UserIsoB",
+        teamNumber: 252
+      })
+      yield* teams.create(teamA)
+      yield* teams.create(teamB)
+
+      const user = yield* users.upsertByGithub({
+        githubId: 9301,
+        githubLogin: "user-iso",
+        displayName: "User Iso",
+        isAdmin: false
+      })
+      // 同一 user を A/B 双方の team に所属させる。scoped unique
+      // (contest_id, user_id) により同一 contest 内では 1 team だが、
+      // 別 contest 間では別 team に所属可能。
+      const addedA = yield* teams.addMember(contestAId, teamA.id, user.id)
+      const addedB = yield* teams.addMember(contestBId, teamB.id, user.id)
+      expect(addedA).toBe(true)
+      expect(addedB).toBe(true)
+
+      const foundInA = yield* teams.findByUserId(contestAId, user.id)
+      expect(Option.isSome(foundInA)).toBe(true)
+      if (Option.isSome(foundInA)) {
+        expect(foundInA.value.id).toBe(teamA.id)
+        expect(foundInA.value.contestId).toBe(contestAId)
+      }
+
+      const foundInB = yield* teams.findByUserId(contestBId, user.id)
+      expect(Option.isSome(foundInB)).toBe(true)
+      if (Option.isSome(foundInB)) {
+        expect(foundInB.value.id).toBe(teamB.id)
+        expect(foundInB.value.contestId).toBe(contestBId)
+      }
+    })
+  )
+})

@@ -68,6 +68,9 @@ export const InviteRepoLive: Layer.Layer<InviteRepo, never, SqlClient.SqlClient>
       // finalizing の 4 状態(finalizing 中の初ログインでも roster に載せて
       // archive に反映するため include。finished/canceled は read-only なので
       // 招待残骸があっても無視する)。
+      // invited_at ASC でソートすることで、auth.consumeLiveInvitesOnLogin の
+      // 「最後に入った invite の email を users.email に上書き」が
+      // 決定論的になる(ループ末尾 = 最新 invited_at)。
       listByGithubLoginForLiveContests: (githubLogin: string) =>
         wrapSqlError(
           sql<InviteRow>`
@@ -75,6 +78,7 @@ export const InviteRepoLive: Layer.Layer<InviteRepo, never, SqlClient.SqlClient>
             JOIN contests ON contests.id = team_invites.contest_id
             WHERE team_invites.github_login = ${githubLogin}
               AND contests.status IN ('draft','preparing','running','finalizing')
+            ORDER BY team_invites.invited_at ASC
           `
         ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, (row) => decodeRow(TeamInvite, row))))
     }

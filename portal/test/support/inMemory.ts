@@ -204,12 +204,31 @@ export const makeTeamRepoTest = (args: {
 
 // InviteRepo(migration 0005: PK = (contest_id, github_login))。create は
 // 同一 (contestId, githubLogin) の upsert(team/email 上書き)、異 contest は
-// 別行として共存する。
-export const makeInviteRepoTest = (initial: ReadonlyArray<TeamInvite> = []): Layer.Layer<InviteRepo> =>
+// 別行として共存する。contests を渡すと listByGithubLoginForLiveContests が
+// draft/preparing/running/finalizing のみ返し、SQL 実装と同じ契約になる。
+// contests 未指定なら全 invite を live 扱いにする(旧テストとの後方互換)。
+export const makeInviteRepoTest = (
+  initial: ReadonlyArray<TeamInvite> = [],
+  contests?: ReadonlyArray<Contest>
+): Layer.Layer<InviteRepo> =>
   Layer.effect(
     InviteRepo,
     Effect.gen(function* () {
       const ref = yield* Ref.make(initial)
+      const liveIds =
+        contests === undefined
+          ? undefined
+          : new Set(
+              contests
+                .filter(
+                  (c) =>
+                    c.status === "draft" ||
+                    c.status === "preparing" ||
+                    c.status === "running" ||
+                    c.status === "finalizing"
+                )
+                .map((c) => c.id)
+            )
       return {
         create: (invite: TeamInvite) =>
           Ref.update(ref, (invites) => [
@@ -235,12 +254,18 @@ export const makeInviteRepoTest = (initial: ReadonlyArray<TeamInvite> = []): Lay
             Effect.map((invites) => invites.filter((i) => i.contestId === contestId && i.teamId === teamId))
           ),
         // Task 3 Step 5: live contest(draft/preparing/running/finalizing)のみ。
-        // in-memory 実装は「live contest 判定」を持てないため、渡された invite が
-        // 全部 live 前提でそのまま返す(auth テストで live 契約を守る形で
-        // 検証する — finished/canceled の invite を混ぜたテストが要る場合は
-        // makeInviteReposTest 側で contest 情報も持たせる)。
+        // contests 未指定なら「全部 live」フォールバックで旧テスト互換を保つ。
+        // invited_at ASC でソートするのは SQL 側と同一契約
+        // (auth の for-of ループ末尾の email が users.email を決定論に上書き)。
         listByGithubLoginForLiveContests: (githubLogin: string) =>
-          Ref.get(ref).pipe(Effect.map((invites) => invites.filter((i) => i.githubLogin === githubLogin)))
+          Ref.get(ref).pipe(
+            Effect.map((invites) =>
+              invites
+                .filter((i) => i.githubLogin === githubLogin && (liveIds === undefined || liveIds.has(i.contestId)))
+                .slice()
+                .sort((a, b) => a.invitedAt - b.invitedAt)
+            )
+          )
       }
     })
   )
@@ -398,6 +423,8 @@ export const makeInviteReposTest = (args: {
           ),
         // live 判定は contests ストアと突き合わせる。contests パラメータを渡さ
         // なければ全 invite が live 扱い(既存 auth テストの多くは live のみで検証)。
+        // invited_at ASC でソートするのは SQL 側と同一契約(auth 側 for-of の
+        // 「ループ末尾の email が users.email を上書き」を決定論にする)。
         listByGithubLoginForLiveContests: (githubLogin) =>
           Effect.gen(function* () {
             const invites = yield* Ref.get(invitesRef)
@@ -407,7 +434,10 @@ export const makeInviteReposTest = (args: {
                 .filter((c) => c.status === "draft" || c.status === "preparing" || c.status === "running" || c.status === "finalizing")
                 .map((c) => c.id)
             )
-            return invites.filter((i) => i.githubLogin === githubLogin && (contests.length === 0 || liveIds.has(i.contestId)))
+            return invites
+              .filter((i) => i.githubLogin === githubLogin && (contests.length === 0 || liveIds.has(i.contestId)))
+              .slice()
+              .sort((a, b) => a.invitedAt - b.invitedAt)
           })
       }
 
