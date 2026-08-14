@@ -230,10 +230,11 @@ export class BenchJobRepo extends Context.Tag("app/BenchJobRepo")<
       id: BenchJobId
     ) => Effect.Effect<BenchJob, RepoError | CannotCancelRunning | InvalidJobTransition>
     // preparing→running 遷移で残っている queued rehearsal を一括キャンセルする。
-    // insertIfAllowed の NOT EXISTS ガードは purpose 非依存で「チームごと
-    // 1 active job」を強制するため、これを残すと running 中に同一チームが
-    // competition を enqueue できなくなる。Task 10 の guarded_start Operation
-    // が正式化されたらこの port は不要になる予定。
+    // insertIfAllowed の NOT EXISTS は (contest_id, team_id, purpose) スコープ
+    // なので queued rehearsal は competition enqueue を阻害しないが、
+    // dequeueNextQueued は running phase では purpose='competition' しか拾わない
+    // ため、放置すると orphan として queued に残り dashboard / 履歴 UI を汚す。
+    // Task 10 の guarded_start Operation が正式化されたらこの port は不要になる予定。
     readonly cancelQueuedRehearsalsForContest: (contestId: ContestId) => Effect.Effect<void, RepoError>
     // Task 3: scoreboard は contest スコープ。purpose='competition' の finished
     // のみを集計対象にする。0 件チームも desiredInstanceCount 分の枠として

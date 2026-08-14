@@ -159,10 +159,11 @@ describe("enqueueBench", () => {
   )
 })
 
-// preparing→running 遷移で queued rehearsal を残してはならない (残すと
-// insertIfAllowed の NOT EXISTS が同一チームの competition enqueue を
-// 永久ブロックする)。startContestUsecase 内で
-// cancelQueuedRehearsalsForContest を呼ぶことで防いでいる。
+// preparing→running 遷移で queued rehearsal を残すと、runner は running phase で
+// purpose='competition' しか dequeue しないため orphan として queued に残り、
+// dashboard / 履歴 UI を汚す。同一チームの competition enqueue 自体は
+// iter 13 の insertIfAllowed purpose スコープ化で影響を受けないが、
+// startContestUsecase 側で orphan を掃除して起動後の状態を清潔に保つ。
 describe("startContestUsecase: preparing 中の queued rehearsal を running 遷移でキャンセルする", () => {
   const admin1 = new User({ ...user1, isAdmin: true })
 
@@ -176,8 +177,10 @@ describe("startContestUsecase: preparing 中の queued rehearsal を running 遷
       // 2. startContestUsecase: preparing → running 遷移 + queued rehearsal を一括キャンセル。
       yield* startContestUsecase
 
-      // 3. 同一チームの一般ユーザが competition を enqueue できる。
-      //    (rehearsal がキャンセルされていないと TeamJobAlreadyQueued で失敗する)。
+      // 3. 同一チームの一般ユーザが competition を enqueue できる (rehearsal が
+      //    canceled でも queued でも insertIfAllowed は purpose-scoped なので
+      //    通るが、下記 4. で rehearsal が実際に canceled されていることを
+      //    確認する)。
       const competition = yield* enqueueBench({ user: user1, targetIp: "10.100.1.5", targetPort: 8080 })
       expect(competition.status).toBe("queued")
       expect(competition.purpose).toBe("competition")
@@ -237,6 +240,24 @@ describe("cancelBench", () => {
       const exit = yield* Effect.exit(cancelBench({ user: user1, jobId }))
       expect(exit).toStrictEqual(Exit.fail(new Forbidden()))
     }).pipe(Effect.provide(testLayer("running", [])))
+  )
+
+  // Task 3 認可: admin は cancelBench でチーム所有者チェックを素通りする
+  // (ダッシュボードから任意チームの queued ジョブを止められる)。
+  // !args.user.isAdmin ブランチが誤って強化されると発火する。
+  const otherTeamJobId = BenchJobId.make("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+  const adminUser = new User({ ...user1, isAdmin: true })
+
+  it.effect("admin は他チームの queued ジョブを cancel できる", () =>
+    Effect.gen(function* () {
+      const canceled = yield* cancelBench({ user: adminUser, jobId: otherTeamJobId })
+      expect(canceled.status).toBe("canceled")
+      expect(canceled.teamId).toBe(team2Id)
+    }).pipe(
+      Effect.provide(
+        testLayer("running", [queuedJob({ id: otherTeamJobId, teamId: team2Id, targetIp: "10.100.2.9", now: 1000 })])
+      )
+    )
   )
 })
 
