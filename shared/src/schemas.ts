@@ -17,6 +17,20 @@ export type ContestId = typeof ContestId.Type
 export const InstanceId = Schema.String.pipe(Schema.brand("InstanceId"))
 export type InstanceId = typeof InstanceId.Type
 
+// Task 1 (multi-edition lifecycle): 後続タスクの durable Operation / ResourceBinding /
+// Artifact の識別子。portal/src/domain/ids.ts と同名の構造的ブランド。
+export const OperationId = Schema.String.pipe(Schema.brand("OperationId"))
+export type OperationId = typeof OperationId.Type
+
+export const OperationStepId = Schema.String.pipe(Schema.brand("OperationStepId"))
+export type OperationStepId = typeof OperationStepId.Type
+
+export const ResourceBindingId = Schema.String.pipe(Schema.brand("ResourceBindingId"))
+export type ResourceBindingId = typeof ResourceBindingId.Type
+
+export const ArtifactId = Schema.String.pipe(Schema.brand("ArtifactId"))
+export type ArtifactId = typeof ArtifactId.Type
+
 export const User = Schema.Struct({
   id: UserId,
   githubId: Schema.Int,
@@ -45,17 +59,43 @@ export const Me = Schema.Struct({
 })
 export type Me = typeof Me.Type
 
-export const ContestStatus = Schema.Literal("preparing", "running", "finished")
+// Task 1 (multi-edition lifecycle): 6状態遷移 (draft -> preparing -> running ->
+// finalizing -> finished、draft|preparing -> canceled)。
+export const ContestStatus = Schema.Literal(
+  "draft",
+  "preparing",
+  "running",
+  "finalizing",
+  "finished",
+  "canceled"
+)
 export type ContestStatus = typeof ContestStatus.Type
 
 // Phase 3: チームごとのインスタンス上限(domain/contest.ts の instanceQuota と
 // 同形。Team ページの追加ボタン活性判定に使う)。
+// Task 1: 開催回スコープ(edition/problemRevision/templateVmid)と schedule/
+// closed timestamps(Option -> nullable int)を追加。domain 側は Option、
+// wire 側は null で表現する(既存の User.email と同じ規約)。
 export const Contest = Schema.Struct({
   id: ContestId,
+  edition: Schema.Int.pipe(Schema.positive()),
   name: Schema.String,
   problemKey: Schema.String,
+  problemRevision: Schema.String,
+  templateVmid: Schema.Int.pipe(Schema.positive()),
   status: ContestStatus,
-  instanceQuota: Schema.Int.pipe(Schema.positive())
+  instanceQuota: Schema.Int.pipe(Schema.positive()),
+  scheduledStartAt: Schema.OptionFromNullOr(Schema.Int),
+  scheduledEndAt: Schema.OptionFromNullOr(Schema.Int),
+  accessClosesAt: Schema.OptionFromNullOr(Schema.Int),
+  cleanupAt: Schema.OptionFromNullOr(Schema.Int),
+  accessClosedAt: Schema.OptionFromNullOr(Schema.Int),
+  cleanupCompletedAt: Schema.OptionFromNullOr(Schema.Int),
+  startedAt: Schema.OptionFromNullOr(Schema.Int),
+  finalizingAt: Schema.OptionFromNullOr(Schema.Int),
+  finishedAt: Schema.OptionFromNullOr(Schema.Int),
+  canceledAt: Schema.OptionFromNullOr(Schema.Int),
+  revision: Schema.Int.pipe(Schema.positive())
 })
 export type Contest = typeof Contest.Type
 

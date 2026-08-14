@@ -10,7 +10,7 @@ import {
   TargetIpOutOfSubnet,
   TeamJobAlreadyQueued
 } from "../../src/domain/errors.js"
-import { BenchJobId, ContestId, TeamId, UserId } from "../../src/domain/ids.js"
+import { BenchJobId, TeamId, UserId } from "../../src/domain/ids.js"
 import { Team } from "../../src/domain/team.js"
 import { User } from "../../src/domain/user.js"
 import { Forbidden, NotInTeam } from "../../src/application/errors.js"
@@ -30,8 +30,8 @@ import {
   RunnerConfigTest,
   UuidGenTest
 } from "../support/inMemory.js"
+import { makeContest } from "../support/factories.js"
 
-const contestId = ContestId.make("11111111-1111-1111-1111-111111111111")
 const team1Id = TeamId.make("22222222-2222-2222-2222-222222222222")
 const team2Id = TeamId.make("33333333-3333-3333-3333-333333333333")
 const user1Id = UserId.make("44444444-4444-4444-4444-444444444444")
@@ -57,8 +57,6 @@ const noTeamUser = new User({
   email: Option.none()
 })
 
-const makeContest = (status: Contest["status"]) =>
-  new Contest({ id: contestId, name: "INUCON", problemKey: "problem-1", status, instanceQuota: 3 })
 
 // startJob は queued な BenchJob からのみ成功するので、テストデータ作りは
 // 常に newJob() から作った queued ジョブを起点にする。
@@ -85,7 +83,7 @@ const testLayer = (
 ) =>
   Layer.mergeAll(
     UuidGenTest,
-    makeContestRepoTest(Option.some(makeContest(contestStatus))),
+    makeContestRepoTest(Option.some(makeContest({ status: contestStatus }))),
     teamRepoLayer,
     makeBenchJobRepoTest(jobs),
     RunnerConfigTest(jobTimeoutMillis)

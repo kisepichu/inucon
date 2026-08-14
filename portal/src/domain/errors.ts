@@ -8,9 +8,22 @@ import type { BenchJobId, InstanceId, TeamId } from "./ids.js"
 // ContestStatus / BenchJobStatus は contest.ts / benchJob.ts で定義される型のみを
 // import type で参照する(実行時の循環 import を避けるため)。
 
+// Task 1 (multi-edition lifecycle): 6状態機械の不正遷移。canceled も含む。
 export class InvalidContestTransition extends Data.TaggedError("InvalidContestTransition")<{
   from: ContestStatus
   to: ContestStatus
+}> {}
+
+// draft -> preparing の schedule 検証で unset/順序違反が見つかったときに返す。
+// beginPreparation で生成され、admin API は 422 にマップする(Task 5)。
+export type InvalidContestScheduleReason =
+  | "missing_schedule"
+  | "start_not_before_end"
+  | "access_close_before_end"
+  | "cleanup_before_access_close"
+
+export class InvalidContestSchedule extends Data.TaggedError("InvalidContestSchedule")<{
+  reason: InvalidContestScheduleReason
 }> {}
 
 export type JobAction = "start" | "recordProgress" | "finish" | "fail" | "cancel"

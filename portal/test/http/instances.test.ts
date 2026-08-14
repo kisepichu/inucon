@@ -4,13 +4,13 @@ import { Effect, Option } from "effect"
 import { describe, expect } from "vitest"
 import { DuplicateInstanceIndex } from "shared"
 import { BenchJob } from "../../src/domain/benchJob.js"
-import { Contest } from "../../src/domain/contest.js"
 import { Instance } from "../../src/domain/instance.js"
-import { BenchJobId, ContestId, InstanceId, TeamId } from "../../src/domain/ids.js"
+import { BenchJobId, InstanceId, TeamId } from "../../src/domain/ids.js"
 import { Team } from "../../src/domain/team.js"
 import { BenchJobRepo, ContestRepo, InstanceRepo, TeamRepo } from "../../src/application/ports.js"
 import { login } from "../support/login.js"
 import { TestLayer, asAdmin, makeApiClient } from "../support/apiTestHelpers.js"
+import { makeContest } from "../support/factories.js"
 
 describe("GET /api/teams/:id/instances", () => {
   it.effect("自チームのメンバーは200", () =>
@@ -263,18 +263,10 @@ describe("DELETE /api/instances/:id", () => {
 // 検証済みのため、ここでは HTTP 配線(ステータスコード・エラー _tag マップ・
 // 認可)が正しいことだけを確認する。
 describe("POST /api/teams/:id/instances", () => {
-  let contestSeq = 0
   const setupRunningContest = (quota: number) =>
     Effect.gen(function* () {
-      contestSeq++
       const contests = yield* ContestRepo
-      const contest = new Contest({
-        id: ContestId.make(`contest-createteaminst-${contestSeq}`),
-        name: "INUCON",
-        problemKey: "private-isu",
-        status: "running",
-        instanceQuota: quota
-      })
+      const contest = makeContest({ status: "running", instanceQuota: quota })
       yield* contests.save(contest)
       return contest
     })

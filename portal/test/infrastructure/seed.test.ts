@@ -1,8 +1,7 @@
 import { it } from "@effect/vitest"
 import { Effect, Layer, Option } from "effect"
 import { expect } from "vitest"
-import { Contest } from "../../src/domain/contest.js"
-import { ContestId } from "../../src/domain/ids.js"
+import { makeContest } from "../support/factories.js"
 import { ContestRepo } from "../../src/application/ports.js"
 import { ContestRepoLive } from "../../src/infrastructure/sql/repos/contestRepo.js"
 import { seedIfEmpty } from "../../src/infrastructure/sql/seed.js"
@@ -42,13 +41,7 @@ layer("seedIfEmpty", (it) => {
   it.effect("既に contest があれば増えない(既存行を上書きしない)", () =>
     Effect.gen(function* () {
       const repo = yield* ContestRepo
-      const existing = new Contest({
-        id: ContestId.make("contest-existing"),
-        name: "既存コンテスト",
-        problemKey: "existing-problem",
-        status: "running",
-        instanceQuota: 3
-      })
+      const existing = makeContest({ status: "running", name: "既存コンテスト", problemKey: "existing-problem" })
       yield* repo.save(existing)
 
       yield* seedIfEmpty
