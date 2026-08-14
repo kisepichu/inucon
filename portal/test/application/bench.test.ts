@@ -17,6 +17,7 @@ import { BenchJobRepo } from "../../src/application/ports.js"
 import {
   cancelBench,
   enqueueBench,
+  listBenchJobs,
   pollNextJob,
   reportFinish,
   reportProgress,
@@ -480,6 +481,45 @@ describe("状態遷移の競合(TOCTOU 回帰)", () => {
             teamId: team1Id,
             targetIp: "10.100.1.9",
             now: 1000
+          })
+        ])
+      )
+    )
+  )
+})
+
+// Task 3: listBenchJobs は「今 display すべき contest」を返す (getDisplay)。
+// contest が finished でも履歴が見えなければならない (アーカイブ表示)。
+// この regression テストは getOperational に戻ると failing になる (finished
+// では None → [] になる)。
+describe("listBenchJobs: finished contest でも履歴を返す", () => {
+  const finishedJobId = BenchJobId.make("ffffffff-ffff-ffff-ffff-ffffffffffff")
+
+  it.effect("contest.status='finished' でも自チームの finished job が list される", () =>
+    Effect.gen(function* () {
+      const jobs = yield* listBenchJobs({ teamId: team1Id })
+      expect(jobs.length).toBe(1)
+      expect(jobs[0]?.id).toBe(finishedJobId)
+      expect(jobs[0]?.status).toBe("finished")
+      expect(jobs[0]?.teamId).toBe(team1Id)
+    }).pipe(
+      Effect.provide(
+        testLayer("finished", [
+          new BenchJob({
+            id: finishedJobId,
+            contestId: DEFAULT_TEST_CONTEST_ID,
+            teamId: team1Id,
+            targetIp: "10.100.1.9",
+            targetPort: 8080,
+            status: "finished",
+            purpose: "competition",
+            score: Option.some(1234),
+            passed: Option.some(true),
+            errorMessage: Option.none(),
+            enqueuedAt: 1000,
+            startedAt: Option.some(2000),
+            finishedAt: Option.some(3000),
+            lastProgressAt: Option.some(2500)
           })
         ])
       )

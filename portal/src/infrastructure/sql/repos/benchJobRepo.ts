@@ -151,13 +151,13 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
         ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeBenchJob))),
 
       // Task 3: dequeue 対象は「候補の contest かつ candidate.purpose」に絞る。
-      // running 排他は現状「テーブル全体で 1 本」で表現している(Task 1 以前の
-      // 設計を維持)。これは 0004 の idx_contests_single_operational が
-      // preparing/running/finalizing の contest を全体で最大 1 件に制約する
-      // 前提に依存する外部不変条件で、この SQL 内には現れないので注意。
-      // Task 11 以降でこの制約が緩む(複数 contest が同時に running を許す)
-      // 場合、running 排他を `AND contest_id = ${candidate.contestId}` で
-      // scope し直すこと。
+      // running 排他も同じ contest 内で 1 本に絞ることで、旧 contest から
+      // 掃除しきれなかった stale 'running' 行(runner クラッシュで
+      // failIfRunning が呼ばれず failTimedOutJobs sweep 待ちの状態)が
+      // 新しい contest の dequeue をブロックしないようにする。
+      // 0004 の idx_contests_single_operational が preparing/running/
+      // finalizing の contest を全体で 1 件に絞る前提と併せて「同時 running
+      // ジョブは 1 本」を保証する。
       dequeueNextQueued: (
         candidate: { contestId: ContestId; purpose: BenchJobPurpose },
         now: number
@@ -172,7 +172,10 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
                 WHERE status = 'queued'
                   AND contest_id = ${candidate.contestId}
                   AND purpose = ${candidate.purpose}
-                  AND NOT EXISTS (SELECT 1 FROM bench_jobs WHERE status = 'running')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM bench_jobs
+                    WHERE contest_id = ${candidate.contestId} AND status = 'running'
+                  )
                 ORDER BY enqueued_at, id
                 LIMIT 1
               )

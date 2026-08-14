@@ -34,6 +34,16 @@ const resolveOperationalContestId = ContestRepo.pipe(
   Effect.map((c) => c.id)
 )
 
+// listTeamInstances 用: mutation ではなく履歴表示なので getDisplay を使う。
+// running/finalizing > 最新 finished > preparing の順で「今見せるべき
+// contest」を返し、finished でも過去のインスタンスを表示できるようにする。
+// 0 contest 時は ContestNotFound(404)で従来通り。
+const resolveDisplayContestId = ContestRepo.pipe(
+  Effect.flatMap((repo) => repo.getDisplay),
+  Effect.flatMap(Option.match({ onNone: () => Effect.fail(new ContestNotFound()), onSome: Effect.succeed })),
+  Effect.map((c) => c.id)
+)
+
 // listTeamInstances / requestCreateInstance / requestDeleteInstance 共通の
 // 認可チェック(当該チームメンバー or admin)。
 const assertTeamMemberOrAdmin = (contestId: ContestId, user: User, teamId: TeamId) =>
@@ -49,7 +59,7 @@ const assertTeamMemberOrAdmin = (contestId: ContestId, user: User, teamId: TeamI
 
 export const listTeamInstances = (args: { user: User; teamId: TeamId }) =>
   Effect.gen(function* () {
-    const contestId = yield* resolveOperationalContestId
+    const contestId = yield* resolveDisplayContestId
     const teams = yield* TeamRepo
     yield* teams.findById(contestId, args.teamId).pipe(
       Effect.flatMap(Option.match({ onNone: () => Effect.fail(new TeamNotFound()), onSome: Effect.succeed }))

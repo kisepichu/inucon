@@ -46,11 +46,12 @@ export const startContestUsecase = Effect.gen(function* () {
 })
 
 // POST /api/admin/contest/finish は Task 1 の互換ブリッジ層。running ->
-// finalizing (beginFinalization) -> finished (finishContest) を 1 tx 内で
-// つなぐ(Task 11 で durable finalization Operation に置き換え、このブリッジは
-// 削除される)。楽観ロックは 2 段まとめてトランザクション先頭の revision で
-// 判定する(saveIfRevision を 2 回呼ぶが、間で他 admin が触ると 2 回目が
-// revision conflict になり retry で拾える)。
+// finalizing (beginFinalization) -> finished (finishContest) を domain
+// 側で連続適用し、単一の saveIfRevision で永続化する(finished の revision
+// は元 +2、期待 revision は遷移前の元 revision で楽観ロック)。並行 admin
+// 操作で revision がズレていれば ContestRevisionConflict → RepoError で
+// 500 に畳んで retry させる。Task 11 で durable finalization Operation に
+// 置き換え、このブリッジは削除される。
 export const finishContestUsecase = Effect.gen(function* () {
   const repo = yield* ContestRepo
   const contest = yield* repo.getOperational.pipe(

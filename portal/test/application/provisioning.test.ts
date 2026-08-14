@@ -15,7 +15,7 @@ import {
   QuotaExceeded
 } from "../../src/application/errors.js"
 import { CloudflareError, CloudflarePort, InstanceRepo, ProxmoxError } from "../../src/application/ports.js"
-import { requestCreateInstance, requestDeleteInstance } from "../../src/application/usecases/instances.js"
+import { listTeamInstances, requestCreateInstance, requestDeleteInstance } from "../../src/application/usecases/instances.js"
 import { collectTeamAccess, runProvisioning, runTeardown } from "../../src/application/usecases/provisioning.js"
 import {
   makeBenchJobRepoTest,
@@ -884,5 +884,41 @@ describe("runTeardown(撤収 saga)", () => {
       expect(result.status).toBe("failed")
       expect(Option.isSome(result.errorMessage)).toBe(true)
     })
+  )
+})
+
+// Task 3: listTeamInstances は「今 display すべき contest」を返す (getDisplay)。
+// contest が finished でも履歴が見えなければならない (アーカイブ表示 = provisioning
+// 履歴の閲覧)。この regression テストは getOperational に戻ると failing になる
+// (finished では None → ContestNotFound → 404 になる)。
+describe("listTeamInstances: finished contest でも履歴を返す", () => {
+  const finishedContestLayer = makeContestRepoTest([
+    makeContest({
+      id: DEFAULT_TEST_CONTEST_ID,
+      status: "finished",
+      finishedAt: Option.some(4000)
+    })
+  ])
+
+  it.effect("contest.status='finished' でも自チームの instance が list される", () =>
+    Effect.gen(function* () {
+      const instances = yield* listTeamInstances({ user: alice, teamId: team1Id })
+      expect(instances.length).toBe(1)
+      expect(instances[0]?.teamId).toBe(team1Id)
+      expect(instances[0]?.status).toBe("running")
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          UuidGenTest,
+          teamRepoLayer,
+          finishedContestLayer,
+          makeInstanceRepoTest([
+            runningInstance({ id: "fin-1", teamId: team1Id, index: 1, teamNumber: 1 })
+          ]),
+          makeProxmoxPortTest({ freeMemBytes: 6_000_000_000 }).layer,
+          ProvisioningConfigTest({ minFreeMemBytes: 5_000_000_000 })
+        )
+      )
+    )
   )
 })

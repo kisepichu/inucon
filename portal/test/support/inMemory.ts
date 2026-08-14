@@ -639,8 +639,8 @@ export const makeBenchJobRepoTest = (
           Ref.modify(
             jobsRef,
             (jobs): readonly [Option.Option<BenchJob>, ReadonlyArray<BenchJob>] => {
-              const anyRunning = jobs.some((j) => j.status === "running")
-              if (anyRunning) return [Option.none(), jobs]
+              const contestRunning = jobs.some((j) => j.status === "running" && j.contestId === candidate.contestId)
+              if (contestRunning) return [Option.none(), jobs]
               const queued = jobs
                 .filter(
                   (j) =>

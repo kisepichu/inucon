@@ -248,11 +248,13 @@ export const pollNextRunnerJob = Effect.gen(function* () {
   })
 })
 
-// GET /api/bench-jobs?teamId=(operational contest スコープ)。
+// GET /api/bench-jobs?teamId=。表示は「今 display すべき contest」に固定する
+// (running/finalizing > 最新 finished > preparing)。finished でも履歴が
+// 見えるべきなので getOperational ではなく getDisplay を使う。0 contest は [].
 export const listBenchJobs = (args: { teamId: TeamId }) =>
   Effect.gen(function* () {
     const contests = yield* ContestRepo
-    const contest = yield* contests.getOperational
+    const contest = yield* contests.getDisplay
     if (Option.isNone(contest)) return []
     const jobs = yield* BenchJobRepo
     return yield* jobs.listByTeam(contest.value.id, args.teamId, 50)
