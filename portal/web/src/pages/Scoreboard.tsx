@@ -51,6 +51,10 @@ export function Scoreboard() {
       setEntries([])
       return
     }
+    // edition 切替時は前 contest の entries を残さない(review claude iter 1)。
+    // 大 edition → 小 edition に切り替えたときに前の集計が誤って残ると
+    // 順位・スコア表示が矛盾する。null にして既存 loading gate に委ねる。
+    setEntries(null)
     let canceled = false
     const contestId = selectedContest.id
     const load = async () => {
