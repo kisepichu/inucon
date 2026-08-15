@@ -201,15 +201,45 @@ export const ContestRepoLive: Layer.Layer<ContestRepo, never, SqlClient.SqlClien
             if (updated.length > 0) return c
             const current = yield* sql<{ revision: number }>`SELECT revision FROM contests WHERE id = ${c.id}`
             if (current.length === 0) {
-              // contest 行が消失した(hard-delete 経路は現状無いので defect)。
-              // ContestRevisionConflict{actual: 0} で誤魔化すと呼び出し元の
-              // 「別 admin が触った」判定と区別が付かず debug しにくいので
-              // Effect.dieMessage で明示的に落として原因調査を強制する。
               return yield* Effect.dieMessage(`saveIfRevision: contest ${c.id} row disappeared`)
             }
             return yield* Effect.fail(
               new ContestRevisionConflict({ expected: expectedRevision, actual: current[0].revision })
             )
+          })
+        ).pipe(
+          Effect.catchTag("SqlError", (cause) => Effect.fail(new RepoError({ cause })))
+        ),
+
+      // Task 5: cancel Operation 用の atomic 版。同じ楽観ロック UPDATE を走らせた
+      // うえで、成功したら同 contest_id の team_invites を全消しする。DELETE を
+      // 同一トランザクション内に閉じ込め、UPDATE 成功後に別 admin が招待を
+      // 追加しても DELETE で綺麗に消える(あるいは cancel 済みの Contest に
+      // FOREIGN KEY 制約で追加できないケースは既存 upsert 側で防がれる)。
+      saveIfRevisionAndPurgeInvites: (c: Contest, expectedRevision: number) =>
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const updated = yield* sql<{ revision: number }>`
+              UPDATE contests SET
+                status = ${c.status},
+                canceled_at = ${Option.getOrNull(c.canceledAt)},
+                revision = ${c.revision}
+              WHERE id = ${c.id} AND revision = ${expectedRevision}
+              RETURNING revision
+            `
+            if (updated.length === 0) {
+              const current = yield* sql<{ revision: number }>`SELECT revision FROM contests WHERE id = ${c.id}`
+              if (current.length === 0) {
+                return yield* Effect.dieMessage(
+                  `saveIfRevisionAndPurgeInvites: contest ${c.id} row disappeared`
+                )
+              }
+              return yield* Effect.fail(
+                new ContestRevisionConflict({ expected: expectedRevision, actual: current[0].revision })
+              )
+            }
+            yield* sql`DELETE FROM team_invites WHERE contest_id = ${c.id}`
+            return c
           })
         ).pipe(
           Effect.catchTag("SqlError", (cause) => Effect.fail(new RepoError({ cause })))

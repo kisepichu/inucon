@@ -8,6 +8,7 @@ import { AdminLive } from "../../src/infrastructure/http/handlers/admin.js"
 import { AuthLive } from "../../src/infrastructure/http/handlers/auth.js"
 import { BenchLive } from "../../src/infrastructure/http/handlers/bench.js"
 import { ContestLive, ContestsLive } from "../../src/infrastructure/http/handlers/contest.js"
+import { ContestAdminLive } from "../../src/infrastructure/http/handlers/contestAdmin.js"
 import { HealthLive } from "../../src/infrastructure/http/handlers/health.js"
 import { InstancesLive } from "../../src/infrastructure/http/handlers/instances.js"
 import { RunnerLive } from "../../src/infrastructure/http/handlers/runner.js"
@@ -22,6 +23,7 @@ import { SessionRepoLive } from "../../src/infrastructure/sql/repos/sessionRepo.
 import { TeamRepoLive } from "../../src/infrastructure/sql/repos/teamRepo.js"
 import { UserRepoLive } from "../../src/infrastructure/sql/repos/userRepo.js"
 import { UuidGenLive } from "../../src/infrastructure/sql/uuid.js"
+import { TransactionRunnerLive } from "../../src/infrastructure/sql/transactionRunner.js"
 import type { StubGithubUser } from "./githubOAuthStub.js"
 import { makeGithubOAuthStub } from "./githubOAuthStub.js"
 import {
@@ -42,7 +44,8 @@ export const ReposTestLive = Layer.mergeAll(
   ContestRepoLive,
   InstanceRepoLive,
   BenchJobRepoLive,
-  InviteRepoLive
+  InviteRepoLive,
+  TransactionRunnerLive
 ).pipe(
   Layer.provideMerge(UuidGenLive),
   Layer.provideMerge(MigratorTest),
@@ -105,6 +108,7 @@ export const makeAppTestLayer = (options?: {
             TeamsLive,
             InstancesLive,
             AdminLive,
+            ContestAdminLive,
             BenchLive,
             RunnerLive,
             ScoreboardLive

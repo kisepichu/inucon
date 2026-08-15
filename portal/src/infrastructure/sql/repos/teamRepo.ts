@@ -174,7 +174,73 @@ export const TeamRepoLive: Layer.Layer<TeamRepo, never, SqlClient.SqlClient> = L
           Effect.flatMap((rows) =>
             Effect.forEach(rows, (row) => decodeRow(User, { ...row, isAdmin: nullableIntToBool(row.isAdmin) }))
           )
-        )
+        ),
+
+      // Task 5: 単一トランザクションで teams / team_members / team_invites を
+      // 一括 INSERT する。呼び出し元は新 team ID の採番と invite → 新 teamId
+      // への差し替えを済ませて渡す。
+      //
+      // Task 5 review finding 2: SQLite は失敗した INSERT の後も同じ tx 内で
+      // SELECT を実行できてしまい、直前に成功した INSERT の未 commit 行が
+      // 見える。もとの実装は「INSERT 失敗後に diagnostic SELECT で
+      // team_number 重複を判定」していたが、team_members / team_invites の
+      // INSERT が失敗した場合でも先の teams INSERT の未 commit 行がヒットし、
+      // 実際の原因を TeamNumberConflict に誤分類してしまう。原因の
+      // SQL エラー文字列に依存せず正しく分類するため、tx を開始した直後に
+      // 「target 側の (contest_id, team_number) の重複」だけを先に pre-check
+      // し、その後 INSERT を素直に流す。INSERT が SqlError を返したら
+      // pre-check が通っている以上 team_number 以外の原因(FK/UNIQUE
+      // (contest_id, github_login) 等)なので RepoError へ畳む。
+      copyRoster: ({ targetContestId, teams: newTeams, memberships, invites: newInvites }) =>
+        sql.withTransaction(
+          Effect.gen(function* () {
+            const now = yield* Clock.currentTimeMillis
+            if (newTeams.length > 0) {
+              const conflict = yield* sql<{ teamNumber: number }>`
+                SELECT team_number AS teamNumber FROM teams
+                WHERE contest_id = ${targetContestId}
+                  AND team_number IN ${sql.in(newTeams.map((t) => t.teamNumber))}
+                LIMIT 1
+              `
+              if (conflict.length > 0) {
+                return yield* Effect.fail(new TeamNumberConflict({ teamNumber: conflict[0].teamNumber }))
+              }
+              yield* sql`
+                INSERT INTO teams
+                ${sql.insert(newTeams.map((t) => ({
+                  id: t.id,
+                  contest_id: t.contestId,
+                  name: t.name,
+                  team_number: t.teamNumber,
+                  desired_instance_count: t.desiredInstanceCount,
+                  created_at: now
+                })))}
+              `
+            }
+            if (memberships.length > 0) {
+              yield* sql`
+                INSERT INTO team_members
+                ${sql.insert(memberships.map((m) => ({
+                  contest_id: targetContestId,
+                  team_id: m.teamId,
+                  user_id: m.userId
+                })))}
+              `
+            }
+            if (newInvites.length > 0) {
+              yield* sql`
+                INSERT INTO team_invites
+                ${sql.insert(newInvites.map((i) => ({
+                  contest_id: i.contestId,
+                  github_login: i.githubLogin,
+                  team_id: i.teamId,
+                  email: i.email,
+                  invited_at: i.invitedAt
+                })))}
+              `
+            }
+          })
+        ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new RepoError({ cause }))))
     }
   })
 )

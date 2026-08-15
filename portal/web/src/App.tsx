@@ -3,6 +3,8 @@ import { Navigate, NavLink, Route, Routes } from "react-router-dom"
 import type { Contest, Me } from "shared/schemas"
 import { ApiError, api, loginUrl } from "./api.ts"
 import { Admin } from "./pages/Admin.tsx"
+import { Contests } from "./pages/Contests.tsx"
+import { ContestSetup } from "./pages/ContestSetup.tsx"
 import { JobDetail } from "./pages/JobDetail.tsx"
 import { Scoreboard } from "./pages/Scoreboard.tsx"
 import { Team } from "./pages/Team.tsx"
@@ -97,6 +99,14 @@ export function App() {
               </NavLink>
             )}
             {me?.user.isAdmin && (
+              <NavLink
+                to="/admin/contests"
+                className={({ isActive }) => (isActive ? "nav-link active" : "nav-link")}
+              >
+                Contests
+              </NavLink>
+            )}
+            {me?.user.isAdmin && (
               <NavLink to="/admin" className={({ isActive }) => (isActive ? "nav-link active" : "nav-link")}>
                 Admin
               </NavLink>
@@ -130,6 +140,20 @@ export function App() {
           <Route path="/team" element={me !== null ? <Team me={me} /> : <Navigate to="/" replace />} />
           <Route path="/jobs/:id" element={me !== null ? <JobDetail /> : <Navigate to="/" replace />} />
           <Route path="/admin" element={me?.user.isAdmin ? <Admin /> : <Navigate to="/" replace />} />
+          <Route
+            path="/admin/contests"
+            element={me?.user.isAdmin ? <Contests /> : <Navigate to="/" replace />}
+          />
+          <Route
+            path="/admin/contests/new"
+            element={
+              me?.user.isAdmin ? (
+                <ContestSetup onCreated={() => window.location.assign("/admin/contests")} />
+              ) : (
+                <Navigate to="/" replace />
+              )
+            }
+          />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>

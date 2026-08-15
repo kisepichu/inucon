@@ -12,6 +12,7 @@ import { AdminLive } from "./infrastructure/http/handlers/admin.js"
 import { AuthLive } from "./infrastructure/http/handlers/auth.js"
 import { BenchLive } from "./infrastructure/http/handlers/bench.js"
 import { ContestLive, ContestsLive } from "./infrastructure/http/handlers/contest.js"
+import { ContestAdminLive } from "./infrastructure/http/handlers/contestAdmin.js"
 import { HealthLive } from "./infrastructure/http/handlers/health.js"
 import { InstancesLive } from "./infrastructure/http/handlers/instances.js"
 import { RunnerLive } from "./infrastructure/http/handlers/runner.js"
@@ -23,6 +24,7 @@ import { ProxmoxHttpClientLive, ProxmoxLive } from "./infrastructure/proxmox/cli
 import { InstancePortsStubLive } from "./infrastructure/stubPorts.js"
 import { MigratorLive, SqlLive } from "./infrastructure/sql/client.js"
 import { SeedLive } from "./infrastructure/sql/seed.js"
+import { TransactionRunnerLive } from "./infrastructure/sql/transactionRunner.js"
 import { BenchJobRepoLive } from "./infrastructure/sql/repos/benchJobRepo.js"
 import { ContestRepoLive } from "./infrastructure/sql/repos/contestRepo.js"
 import { InstanceRepoLive } from "./infrastructure/sql/repos/instanceRepo.js"
@@ -58,7 +60,8 @@ const ReposLive = Layer.mergeAll(
   ContestRepoLive,
   InstanceRepoLive,
   BenchJobRepoLive,
-  InviteRepoLive
+  InviteRepoLive,
+  TransactionRunnerLive
 ).pipe(
   Layer.provideMerge(UuidGenLive),
   Layer.provide(SqlLive)
@@ -152,6 +155,7 @@ const ApiLive = HttpApiBuilder.api(api).pipe(
       TeamsLive,
       InstancesLive,
       AdminLive,
+      ContestAdminLive,
       BenchLive,
       RunnerLive,
       ScoreboardLive

@@ -528,3 +528,50 @@ input.input:focus, select.input:focus {
 .team-block .members { color: var(--text-muted); font-size: var(--fs-small); margin: 0 0 var(--sp-2); }
 .team-block ul { margin: 0; padding-left: 1.3em; font-size: var(--fs-small); }
 .team-block li { margin: 4px 0; display: flex; align-items: center; gap: var(--sp-2); }
+
+/* ---------- Contest wizard / list (Task 5) ---------- */
+.contest-setup section,
+.contests-page {
+  background: var(--surface);
+  border: 1px solid var(--gray-border);
+  border-radius: 6px;
+  padding: 1rem 1.25rem;
+  margin: 1rem 0;
+}
+.contest-setup h1,
+.contests-page h1 {
+  margin-top: 0;
+}
+.contest-setup label {
+  display: block;
+  margin: 0.5rem 0;
+}
+.contest-setup input {
+  display: block;
+  margin-top: 0.25rem;
+  min-width: 260px;
+}
+.contest-setup-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+.contest-setup-review dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 1rem;
+}
+.contest-setup-review dt {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+.contests-page table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.contests-page th,
+.contests-page td {
+  border-bottom: 1px solid var(--gray-border);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+}

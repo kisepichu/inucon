@@ -5,6 +5,9 @@ import type {
   BenchJob,
   BenchJobDetail,
   Contest,
+  ContestTransitionRequest,
+  CopyContestRosterRequest,
+  CreateContestDraftRequest,
   CreateInstanceRequest,
   CreateTeamInstanceRequest,
   CreateTeamRequest,
@@ -17,7 +20,8 @@ import type {
   SetTeamMembersRequest,
   Team,
   TeamInvite,
-  TeamWithMembers
+  TeamWithMembers,
+  UpdateContestDraftRequest
 } from "shared/schemas"
 
 // サーバーのエラーは `{ "_tag": "..." }` JSON + status で返る(スペック調査メモ §6)。
@@ -104,6 +108,21 @@ export const api = {
   inviteMember: (teamId: string, body: InviteRequest) =>
     request<InviteResult>(`/api/admin/teams/${teamId}/invites`, { method: "POST", body }),
   listInvites: (teamId: string) => request<Array<TeamInvite>>(`/api/admin/teams/${teamId}/invites`),
+
+  // Task 5: draft wizard 用の contest 管理 API。
+  listAdminContests: (includeCanceled = false) =>
+    request<Array<Contest>>(`/api/admin/contests${includeCanceled ? "?includeCanceled=true" : ""}`),
+  getAdminContest: (contestId: string) => request<Contest>(`/api/admin/contests/${contestId}`),
+  createContestDraft: (body: CreateContestDraftRequest) =>
+    request<Contest>("/api/admin/contests", { method: "POST", body }),
+  updateContestDraft: (contestId: string, body: UpdateContestDraftRequest) =>
+    request<Contest>(`/api/admin/contests/${contestId}`, { method: "PATCH", body }),
+  beginContestPreparation: (contestId: string, body: ContestTransitionRequest) =>
+    request<Contest>(`/api/admin/contests/${contestId}/prepare`, { method: "POST", body }),
+  cancelAdminContest: (contestId: string, body: ContestTransitionRequest) =>
+    request<Contest>(`/api/admin/contests/${contestId}/cancel`, { method: "POST", body }),
+  copyContestRoster: (contestId: string, body: CopyContestRosterRequest) =>
+    request<Array<Team>>(`/api/admin/contests/${contestId}/roster/copy`, { method: "POST", body }),
 
   enqueueBench: (body: EnqueueBenchRequest) => request<BenchJob>("/api/bench-jobs", { method: "POST", body }),
   listBenchJobs: (teamId: string) => request<Array<BenchJob>>(`/api/bench-jobs?teamId=${encodeURIComponent(teamId)}`),

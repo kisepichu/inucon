@@ -34,6 +34,7 @@ import {
   RunnerConfig,
   SessionRepo,
   TeamRepo,
+  TransactionRunner,
   UserRepo,
   UuidGen
 } from "../../src/application/ports.js"
@@ -51,6 +52,15 @@ export const UuidGenTest: Layer.Layer<UuidGen> = Layer.effect(
       next: Ref.updateAndGet(counter, (n) => n + 1).pipe(Effect.map((n) => `test-uuid-${n}`))
     }
   })
+)
+
+// Task 5 review finding 3: in-memory テストではトランザクション境界を
+// 持たないため、effect をそのまま実行する passthrough 実装。実行順は Ref の
+// 更新順に決まるので、read → write の一貫性検証は他の repo 実装(SQL)の
+// migration/http テストが担当する。
+export const TransactionRunnerTest: Layer.Layer<TransactionRunner> = Layer.succeed(
+  TransactionRunner,
+  { run: (effect) => effect }
 )
 
 // Task 3: contest スコープの ContestRepo。initial に複数 contest を渡せる。
@@ -109,6 +119,26 @@ export const makeContestRepoTest = (initial: ReadonlyArray<Contest> = []): Layer
             }
           ).pipe(Effect.flatMap(Either.match({ onLeft: Effect.fail, onRight: Effect.succeed }))),
         saveIfRevision: (c: Contest, expectedRevision: number) =>
+          Ref.modify(
+            ref,
+            (cs): readonly [Either.Either<Contest, ContestRevisionConflict>, ReadonlyArray<Contest>] => {
+              const existing = cs.find((x) => x.id === c.id)
+              if (existing === undefined) {
+                return [Either.left(new ContestRevisionConflict({ expected: expectedRevision, actual: 0 })), cs]
+              }
+              if (existing.revision !== expectedRevision) {
+                return [
+                  Either.left(new ContestRevisionConflict({ expected: expectedRevision, actual: existing.revision })),
+                  cs
+                ]
+              }
+              return [Either.right(c), cs.map((x) => (x.id === c.id ? c : x))]
+            }
+          ).pipe(Effect.flatMap(Either.match({ onLeft: Effect.fail, onRight: Effect.succeed }))),
+        // Task 5: makeContestRepoTest 単体では team_invites 側と ref を共有しない
+        // ため、purge は no-op(戻り値の Contest 更新だけ)。invite 削除まで
+        // 検証したいテストは shared-state な makeContestAdminReposTest を使う。
+        saveIfRevisionAndPurgeInvites: (c: Contest, expectedRevision: number) =>
           Ref.modify(
             ref,
             (cs): readonly [Either.Either<Contest, ContestRevisionConflict>, ReadonlyArray<Contest>] => {
@@ -218,6 +248,17 @@ export const makeTeamRepoTest = (args: {
                 .map((m) => m.userId)
             )
             return users.filter((u) => memberIds.has(u.id))
+          }),
+        // Task 5: makeTeamRepoTest 単体では team_invites を持たないため、
+        // invites 引数は無視して teams + memberships のみ書き込む。invites も
+        // 含めて検証したいテストは shared-state な makeContestAdminReposTest を使う。
+        copyRoster: ({ targetContestId, teams: newTeams, memberships }) =>
+          Effect.gen(function* () {
+            yield* Ref.update(teamsRef, (existing) => [...existing, ...newTeams])
+            yield* Ref.update(membersRef, (existing) => [
+              ...existing,
+              ...memberships.map((m) => ({ contestId: targetContestId, teamId: m.teamId, userId: m.userId }))
+            ])
           })
       }
     })
@@ -273,6 +314,12 @@ export const makeInviteRepoTest = (
         listByTeam: (contestId: ContestId, teamId: TeamId) =>
           Ref.get(ref).pipe(
             Effect.map((invites) => invites.filter((i) => i.contestId === contestId && i.teamId === teamId))
+          ),
+        listByContest: (contestId: ContestId) =>
+          Ref.get(ref).pipe(
+            Effect.map((invites) =>
+              invites.filter((i) => i.contestId === contestId).slice().sort((a, b) => a.invitedAt - b.invitedAt)
+            )
           ),
         // Task 3 Step 5: live contest(draft/preparing/running/finalizing)のみ。
         // contests 未指定なら「全部 live」フォールバックで旧テスト互換を保つ。
@@ -434,6 +481,15 @@ export const makeInviteReposTest = (args: {
                 .map((m) => m.userId)
             )
             return users.filter((u) => memberIds.has(u.id))
+          }),
+        copyRoster: ({ targetContestId, teams: newTeams, memberships, invites: newInvites }) =>
+          Effect.gen(function* () {
+            yield* Ref.update(teamsRef, (existing) => [...existing, ...newTeams])
+            yield* Ref.update(membersRef, (existing) => [
+              ...existing,
+              ...memberships.map((m) => ({ contestId: targetContestId, teamId: m.teamId, userId: m.userId }))
+            ])
+            yield* Ref.update(invitesRef, (existing) => [...existing, ...newInvites])
           })
       }
 
@@ -460,6 +516,12 @@ export const makeInviteReposTest = (args: {
         listByTeam: (contestId, teamId) =>
           Ref.get(invitesRef).pipe(
             Effect.map((invites) => invites.filter((i) => i.contestId === contestId && i.teamId === teamId))
+          ),
+        listByContest: (contestId) =>
+          Ref.get(invitesRef).pipe(
+            Effect.map((invites) =>
+              invites.filter((i) => i.contestId === contestId).slice().sort((a, b) => a.invitedAt - b.invitedAt)
+            )
           ),
         // live 判定は contests ストアと突き合わせる。contests パラメータを渡さ
         // なければ全 invite が live 扱い(既存 auth テストの多くは live のみで検証)。

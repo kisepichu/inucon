@@ -44,6 +44,17 @@ export class UuidGen extends Context.Tag("app/UuidGen")<
   { readonly next: Effect.Effect<string> }
 >() {}
 
+// Task 5 review finding 3: 複数リポジトリ越しの read/write を単一の
+// トランザクションで括るためのポート。SQL 側は sql.withTransaction を
+// そのまま噛ませる。テスト側は passthrough(単純に effect を実行するだけ)。
+// エフェクトの型は変わらない — 実装がトランザクション境界を追加するだけ。
+export class TransactionRunner extends Context.Tag("app/TransactionRunner")<
+  TransactionRunner,
+  {
+    readonly run: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E | RepoError, R>
+  }
+>() {}
+
 // Task 3: Contest は contest スコープの正となる履歴付き集約。単一 contest 運用の
 // ブリッジ層(getCurrent/save)は解消し、明示的な list / findById / operational /
 // display と楽観ロック付き saveIfRevision に置き換える。
@@ -73,6 +84,15 @@ export class ContestRepo extends Context.Tag("app/ContestRepo")<
       contest: Contest
     ) => Effect.Effect<void, RepoError | ContestEditionConflict | OperationalContestConflict>
     readonly saveIfRevision: (
+      contest: Contest,
+      expectedRevision: number
+    ) => Effect.Effect<Contest, RepoError | ContestRevisionConflict>
+    // Task 5: cancel Operation は「contest 行の status を canceled に flip」
+    // と「同 contest の team_invites を全削除」を1つのトランザクションで
+    // 行う。呼び出し側の usecase (contestAdmin.cancelContest) は cancel 済み
+    // Contest を渡し、リポジトリは楽観ロック更新 + DELETE を一気に走らせる。
+    // Task 11 の finish_contest step も同じ理由でこの atomic 版を使う。
+    readonly saveIfRevisionAndPurgeInvites: (
       contest: Contest,
       expectedRevision: number
     ) => Effect.Effect<Contest, RepoError | ContestRevisionConflict>
@@ -134,6 +154,17 @@ export class TeamRepo extends Context.Tag("app/TeamRepo")<
       teamId: TeamId,
       userId: UserId
     ) => Effect.Effect<boolean, RepoError>
+    // Task 5: draft wizard から呼ばれる roster copy。source contest の
+    // teams / team_members / team_invites を target contest へ複製する。
+    // usecase 側で新しい team ID を採番し、oldTeamId -> newTeamId の写像と
+    // 複製後の全 team/member/invite 行を渡す。リポジトリは1つのトランザクション
+    // で INSERT を回し、部分書き込みを残さない。
+    readonly copyRoster: (args: {
+      readonly targetContestId: ContestId
+      readonly teams: ReadonlyArray<Team>
+      readonly memberships: ReadonlyArray<{ readonly teamId: TeamId; readonly userId: UserId }>
+      readonly invites: ReadonlyArray<TeamInvite>
+    }) => Effect.Effect<void, RepoError | TeamNumberConflict>
     readonly listMembers: (
       contestId: ContestId,
       teamId: TeamId
@@ -155,6 +186,11 @@ export class InviteRepo extends Context.Tag("app/InviteRepo")<
     readonly listByTeam: (
       contestId: ContestId,
       teamId: TeamId
+    ) => Effect.Effect<ReadonlyArray<TeamInvite>, RepoError>
+    // Task 5: roster copy 用途。contest スコープの全 team_invites を返す。
+    // 小規模(数チーム × 数十招待)前提なのでページングなし。
+    readonly listByContest: (
+      contestId: ContestId
     ) => Effect.Effect<ReadonlyArray<TeamInvite>, RepoError>
     // 初ログイン時の全 live contest 招待消費(auth.ts、Task 3 Step 5)。
     // draft/preparing/running/finalizing のいずれかの contest に紐づく

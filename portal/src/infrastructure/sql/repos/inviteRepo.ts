@@ -64,6 +64,18 @@ export const InviteRepoLive: Layer.Layer<InviteRepo, never, SqlClient.SqlClient>
           `
         ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, (row) => decodeRow(TeamInvite, row)))),
 
+      // Task 5: contest スコープの全 team_invites。roster copy が「source
+      // contest の全招待を target contest 側の新 teamId 配下に複製する」ため
+      // に一括読み出しする。順序は決定論(invited_at ASC で挿入順を保つ)。
+      listByContest: (contestId: ContestId) =>
+        wrapSqlError(
+          sql<InviteRow>`
+            SELECT ${columns} FROM team_invites
+            WHERE contest_id = ${contestId}
+            ORDER BY invited_at ASC
+          `
+        ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, (row) => decodeRow(TeamInvite, row)))),
+
       // Task 3 Step 5: 初ログイン時に消費する候補は draft/preparing/running/
       // finalizing の 4 状態(finalizing 中の初ログインでも roster に載せて
       // archive に反映するため include。finished/canceled は read-only なので

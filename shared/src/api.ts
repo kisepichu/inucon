@@ -13,13 +13,17 @@ import {
   BenchJobId,
   BenchJobStatus,
   Contest,
+  ContestDraftPatch,
+  ContestId,
   ContestStatus,
+  ContestTransitionRequest,
+  CopyContestRosterRequest,
+  CreateContestDraftRequest,
   CreateInstanceRequest,
   CreateTeamInstanceRequest,
   CreateTeamRequest,
   EnqueueBenchRequest,
   Instance,
-  ContestId,
   InstanceId,
   InstanceStatus,
   InviteRequest,
@@ -35,6 +39,7 @@ import {
   TeamId,
   TeamInvite,
   TeamWithMembers,
+  UpdateContestDraftRequest,
   User
 } from "./schemas.js"
 
@@ -175,6 +180,41 @@ export class InvalidInstanceTransition extends Schema.TaggedError<InvalidInstanc
 export class InvalidContestTransition extends Schema.TaggedError<InvalidContestTransition>()(
   "InvalidContestTransition",
   { from: ContestStatus, to: ContestStatus },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// Task 5: draft wizard の schedule バリデーション(未設定/順序違反)。
+export class InvalidContestSchedule extends Schema.TaggedError<InvalidContestSchedule>()(
+  "InvalidContestSchedule",
+  {
+    reason: Schema.Literal(
+      "missing_schedule",
+      "start_not_before_end",
+      "access_close_before_end",
+      "cleanup_before_access_close"
+    )
+  },
+  HttpApiSchema.annotations({ status: 422 })
+) {}
+
+// Task 5: 新規 Contest 作成の edition 部分ユニーク違反(canceled は焼かない)。
+export class ContestEditionConflict extends Schema.TaggedError<ContestEditionConflict>()(
+  "ContestEditionConflict",
+  { edition: Schema.Int },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// Task 5: 楽観ロック競合。actual を載せて UI が再取得できるようにする。
+export class ContestRevisionConflict extends Schema.TaggedError<ContestRevisionConflict>()(
+  "ContestRevisionConflict",
+  { expected: Schema.Int, actual: Schema.Int },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// Task 5: 単一 operational Contest 制約違反。
+export class OperationalContestConflict extends Schema.TaggedError<OperationalContestConflict>()(
+  "OperationalContestConflict",
+  {},
   HttpApiSchema.annotations({ status: 409 })
 ) {}
 
@@ -427,6 +467,78 @@ export const adminGroup = HttpApiGroup.make("admin")
       .middleware(AdminOnly)
   )
 
+// Task 5: /api/admin/contests: draft wizard 用の contest scoped 管理 API。
+// - list は includeCanceled=true で canceled を返す監査経路も持つ
+// - detail は canceled も 200 で返す(public /api/contests は 404 にする)
+// - PATCH で expectedRevision + patch を受けて楽観ロック update
+// - prepare/cancel は expectedRevision のみを受けて明示的な状態遷移
+// - roster/copy は source contest から teams/members/invites を複製する
+export const contestAdminGroup = HttpApiGroup.make("contestAdmin")
+  .add(
+    HttpApiEndpoint.get("listAdminContests", "/api/admin/contests")
+      .setUrlParams(Schema.Struct({ includeCanceled: Schema.optional(Schema.String) }))
+      .addSuccess(Schema.Array(Contest))
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.post("createContestDraft", "/api/admin/contests")
+      .setPayload(CreateContestDraftRequest)
+      .addSuccess(Contest)
+      .addError(ContestEditionConflict)
+      .addError(InvalidContestSchedule)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.get("getAdminContest")`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}`
+      .addSuccess(Contest)
+      .addError(NotFound)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.patch("updateContestDraft")`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}`
+      .setPayload(UpdateContestDraftRequest)
+      .addSuccess(Contest)
+      .addError(NotFound)
+      .addError(ContestRevisionConflict)
+      .addError(InvalidContestTransition)
+      .addError(InvalidContestSchedule)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "beginContestPreparation"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/prepare`
+      .setPayload(ContestTransitionRequest)
+      .addSuccess(Contest)
+      .addError(NotFound)
+      .addError(ContestRevisionConflict)
+      .addError(OperationalContestConflict)
+      .addError(InvalidContestTransition)
+      .addError(InvalidContestSchedule)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "cancelAdminContest"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/cancel`
+      .setPayload(ContestTransitionRequest)
+      .addSuccess(Contest)
+      .addError(NotFound)
+      .addError(ContestRevisionConflict)
+      .addError(InvalidContestTransition)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "copyContestRoster"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/roster/copy`
+      .setPayload(CopyContestRosterRequest)
+      .addSuccess(Schema.Array(Team))
+      .addError(NotFound)
+      .addError(InvalidContestTransition)
+      .middleware(AdminOnly)
+  )
+
 // enqueue/cancel はチームメンバー(自チームのみ、ユースケース側で判定)。
 // 一覧(スコア・状態)は全員可。詳細(ログ含む)は自チーム + admin のみ
 // (ユースケース側で判定、他チームは Forbidden)。
@@ -501,6 +613,7 @@ export const api = HttpApi.make("inucon")
   .add(teamsGroup)
   .add(instancesGroup)
   .add(adminGroup)
+  .add(contestAdminGroup)
   .add(benchGroup)
   .add(runnerGroup)
   .add(scoreboardGroup)

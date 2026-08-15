@@ -101,6 +101,60 @@ export const Contest = Schema.Struct({
 })
 export type Contest = typeof Contest.Type
 
+// Task 5: admin draft wizard 用のリクエスト DTO。domain の Contest は Option
+// を持つが、wire は null 許容の Int にする(User.email と同じ規約)。schedule
+// の順序検査は portal usecase 側 (InvalidContestSchedule) が担うのでここでは
+// 値の presence だけを型で表現する。
+export const CreateContestDraftRequest = Schema.Struct({
+  edition: Schema.Int.pipe(Schema.positive()),
+  name: Schema.String,
+  problemKey: Schema.String,
+  problemRevision: Schema.String,
+  templateVmid: Schema.Int.pipe(Schema.positive()),
+  instanceQuota: Schema.Int.pipe(Schema.positive()),
+  scheduledStartAt: Schema.NullOr(Schema.Int),
+  scheduledEndAt: Schema.NullOr(Schema.Int),
+  accessClosesAt: Schema.NullOr(Schema.Int),
+  cleanupAt: Schema.NullOr(Schema.Int)
+})
+export type CreateContestDraftRequest = typeof CreateContestDraftRequest.Type
+
+// PATCH /api/admin/contests/:contestId(部分更新)。patch 内は「省略=変更なし」、
+// null = 明示的に unset(schedule フィールドのみ)。expectedRevision は楽観
+// ロック用。
+export const ContestDraftPatch = Schema.Struct({
+  name: Schema.optional(Schema.String),
+  problemKey: Schema.optional(Schema.String),
+  problemRevision: Schema.optional(Schema.String),
+  templateVmid: Schema.optional(Schema.Int.pipe(Schema.positive())),
+  instanceQuota: Schema.optional(Schema.Int.pipe(Schema.positive())),
+  scheduledStartAt: Schema.optional(Schema.NullOr(Schema.Int)),
+  scheduledEndAt: Schema.optional(Schema.NullOr(Schema.Int)),
+  accessClosesAt: Schema.optional(Schema.NullOr(Schema.Int)),
+  cleanupAt: Schema.optional(Schema.NullOr(Schema.Int))
+})
+export type ContestDraftPatch = typeof ContestDraftPatch.Type
+
+export const UpdateContestDraftRequest = Schema.Struct({
+  expectedRevision: Schema.Int.pipe(Schema.positive()),
+  patch: ContestDraftPatch
+})
+export type UpdateContestDraftRequest = typeof UpdateContestDraftRequest.Type
+
+// POST /api/admin/contests/:contestId/{prepare,cancel}: 楽観ロック用の
+// expectedRevision のみを受ける空 body 系のラッパ。
+export const ContestTransitionRequest = Schema.Struct({
+  expectedRevision: Schema.Int.pipe(Schema.positive())
+})
+export type ContestTransitionRequest = typeof ContestTransitionRequest.Type
+
+// POST /api/admin/contests/:contestId/roster/copy: source contest から現在の
+// draft contest へロスターを複製する。
+export const CopyContestRosterRequest = Schema.Struct({
+  sourceContestId: ContestId
+})
+export type CopyContestRosterRequest = typeof CopyContestRosterRequest.Type
+
 // GET /api/teams のメンバー表現。チームメイトの githubLogin を返す(auth の
 // User 全体を返すと isAdmin 等の不要な情報まで漏れるため最小限にする)。
 export const TeamMember = Schema.Struct({
