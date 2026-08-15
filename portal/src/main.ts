@@ -4,7 +4,20 @@ import { HttpApiBuilder, HttpMiddleware } from "@effect/platform"
 import { NodeHttpClient, NodeHttpServer, NodeRuntime } from "@effect/platform-node"
 import { Config, Effect, Layer, Option } from "effect"
 import { api } from "shared"
-import { AuthConfig, ProvisioningConfig, RunnerConfig } from "./application/ports.js"
+import {
+  AuthConfig,
+  OperationHandlerRegistry,
+  OperationWorkerConfig,
+  ProvisioningConfig,
+  RunnerConfig
+} from "./application/ports.js"
+import {
+  DEFAULT_OPERATION_LEASE_DURATION_MILLIS,
+  DEFAULT_OPERATION_MAX_ATTEMPTS,
+  DEFAULT_OPERATION_POLL_INTERVAL_MILLIS,
+  DEFAULT_OPERATION_RETRY_BASE_MILLIS,
+  DEFAULT_OPERATION_RETRY_MAX_MILLIS
+} from "./application/usecases/operations.js"
 import { CloudflareLive } from "./infrastructure/cloudflare/client.js"
 import { GithubKeysLive } from "./infrastructure/github/keys.js"
 import { GithubOAuthLive } from "./infrastructure/github/oauth.js"
@@ -34,6 +47,11 @@ import { TeamRepoLive } from "./infrastructure/sql/repos/teamRepo.js"
 import { UserRepoLive } from "./infrastructure/sql/repos/userRepo.js"
 import { UuidGenLive } from "./infrastructure/sql/uuid.js"
 import { ProvisionerLive } from "./infrastructure/worker/provisioner.js"
+import { ArtifactRepoLive } from "./infrastructure/sql/repos/artifactRepo.js"
+import { OperationRepoLive } from "./infrastructure/sql/repos/operationRepo.js"
+import { ResourceBindingRepoLive } from "./infrastructure/sql/repos/resourceBindingRepo.js"
+import { RunnerAgentRepoLive } from "./infrastructure/sql/repos/runnerAgentRepo.js"
+import { OperationWorkerLive } from "./infrastructure/worker/operationWorker.js"
 import { TimeoutSweeperLive } from "./infrastructure/worker/timeoutSweeper.js"
 
 // ADMIN_GITHUB_LOGINS(カンマ区切り)に載っている githubLogin はログイン時に
@@ -53,6 +71,42 @@ const AuthConfigLive = Layer.effect(
 
 // UserRepoLive は UuidGen に依存する。provideMerge で 1 インスタンスの
 // UuidGenLive を依存解決と公開の両方に使う(repos.test.ts と同じ理由)。
+// Task 6: Operation ワーカー設定は env で上書き可能。全て正の整数に
+// バリデートし、不正値は Layer 構築失敗として早期に気付く(RunnerConfig と同型)。
+const OperationWorkerConfigLive = Layer.effect(
+  OperationWorkerConfig,
+  Effect.gen(function* () {
+    const positive = (name: string, defaultValue: number) =>
+      Config.integer(name).pipe(
+        Config.withDefault(defaultValue),
+        Config.validate({
+          message: `${name} must be a positive integer`,
+          validation: (n) => n > 0
+        })
+      )
+    const pollIntervalMillis = yield* positive(
+      "OPERATION_POLL_INTERVAL_MILLIS",
+      DEFAULT_OPERATION_POLL_INTERVAL_MILLIS
+    )
+    const retryBaseMillis = yield* positive(
+      "OPERATION_RETRY_BASE_MILLIS",
+      DEFAULT_OPERATION_RETRY_BASE_MILLIS
+    )
+    const retryMaxMillis = yield* positive(
+      "OPERATION_RETRY_MAX_MILLIS",
+      DEFAULT_OPERATION_RETRY_MAX_MILLIS
+    )
+    const maxAttempts = yield* positive(
+      "OPERATION_MAX_ATTEMPTS",
+      DEFAULT_OPERATION_MAX_ATTEMPTS
+    )
+    const leaseDurationMillis = yield* positive(
+      "OPERATION_LEASE_DURATION_MILLIS",
+      DEFAULT_OPERATION_LEASE_DURATION_MILLIS
+    )
+    return { pollIntervalMillis, retryBaseMillis, retryMaxMillis, maxAttempts, leaseDurationMillis }
+  })
+)
 const ReposLive = Layer.mergeAll(
   UserRepoLive,
   SessionRepoLive,
@@ -61,9 +115,14 @@ const ReposLive = Layer.mergeAll(
   InstanceRepoLive,
   BenchJobRepoLive,
   InviteRepoLive,
+  OperationRepoLive,
+  ResourceBindingRepoLive,
+  ArtifactRepoLive,
+  RunnerAgentRepoLive,
   TransactionRunnerLive
 ).pipe(
   Layer.provideMerge(UuidGenLive),
+  Layer.provide(OperationWorkerConfigLive),
   Layer.provide(SqlLive)
 )
 
@@ -227,6 +286,26 @@ const WorkerLive = TimeoutSweeperLive.pipe(
   Layer.provide(MigratorLive)
 )
 
+
+// Task 6: registry は本タスクではハンドラを一切登録しない(Task 7 以降で
+// provider Layer に応じて拡張)。ハンドラ未登録の kind/stepKey の Step は
+// worker が blockStep で configuration_error を打つ(operator 介入待ち)ので、
+// DB-only Operation(Task 11 の start/finalize/archive など)が provider 設定
+// なしで動かせるという spec §Step 5 の要件を満たす。
+const OperationHandlerRegistryLive = Layer.succeed(OperationHandlerRegistry, {
+  lookup: () => Option.none()
+})
+
+// OperationWorkerLive は DB のみに依存する(handler 登録は現状無し)。
+// TimeoutSweeperLive と同じく MigratorLive を依存として明示し、migration 未完了
+// のうちの 1 tick が "no such table" にならないようにする。
+const OperationWorkerConditionalLive = OperationWorkerLive.pipe(
+  Layer.provide(OperationWorkerConfigLive),
+  Layer.provide(OperationHandlerRegistryLive),
+  Layer.provide(ReposLive),
+  Layer.provide(MigratorLive)
+)
+
 // 払い出し/撤収オーケストレーションのワーカー(Task 4 レビュー I3)。
 // ProvisionerLive の実行には実 port Live(ProxmoxLive / CloudflareLive /
 // GithubKeysLive)が必要だが、その配線は上記 InstancePortsLive に共通化した
@@ -254,6 +333,6 @@ const ProvisionerConditionalLive = Layer.unwrapEffect(
 // migration/seed は HttpLive・WorkerLive の依存(Layer.provide)経由で実行される
 // (メモ化により 1 回だけ)。トップレベルにはそれらを消費するコンポーネント
 // だけを並べ、順序は依存グラフに任せる。
-const MainLive = Layer.mergeAll(HttpLive, WorkerLive, ProvisionerConditionalLive)
+const MainLive = Layer.mergeAll(HttpLive, WorkerLive, ProvisionerConditionalLive, OperationWorkerConditionalLive)
 
 Layer.launch(MainLive).pipe(NodeRuntime.runMain)

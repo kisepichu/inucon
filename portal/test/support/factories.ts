@@ -4,9 +4,46 @@ import { BenchJob } from "../../src/domain/benchJob.js"
 import { Contest } from "../../src/domain/contest.js"
 import type { InstanceStatus, ProvisionStep } from "../../src/domain/instance.js"
 import { Instance } from "../../src/domain/instance.js"
-import { BenchJobId, ContestId, InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
+import { BenchJobId, ContestId, InstanceId, OperationId, TeamId, UserId } from "../../src/domain/ids.js"
+import { Operation } from "../../src/domain/operation.js"
+import type { OperationActor, OperationKind, OperationStatus } from "../../src/domain/operation.js"
 import { Team } from "../../src/domain/team.js"
 import { TeamInvite } from "../../src/domain/teamInvite.js"
+
+let operationSeq = 0
+
+export type MakeOperationOverrides = {
+  readonly id?: Operation["id"]
+  readonly contestId?: Operation["contestId"]
+  readonly kind?: OperationKind
+  readonly status?: OperationStatus
+  readonly actor?: OperationActor
+  readonly planDigest?: string
+  readonly contestRevision?: number
+  readonly sanitizedError?: Operation["sanitizedError"]
+  readonly createdAt?: number
+  readonly startedAt?: Operation["startedAt"]
+  readonly finishedAt?: Operation["finishedAt"]
+}
+
+export const makeOperation = (overrides: MakeOperationOverrides = {}): Operation => {
+  operationSeq += 1
+  const id =
+    overrides.id ?? OperationId.make(`00000000-0000-0000-0000-op${String(operationSeq).padStart(10, "0")}`)
+  return new Operation({
+    id,
+    contestId: overrides.contestId ?? DEFAULT_TEST_CONTEST_ID,
+    kind: overrides.kind ?? "prepare",
+    status: overrides.status ?? "queued",
+    actor: overrides.actor ?? { kind: "scheduler" },
+    planDigest: overrides.planDigest ?? "digest",
+    contestRevision: overrides.contestRevision ?? 1,
+    sanitizedError: overrides.sanitizedError ?? Option.none(),
+    createdAt: overrides.createdAt ?? 0,
+    startedAt: overrides.startedAt ?? Option.none(),
+    finishedAt: overrides.finishedAt ?? Option.none()
+  })
+}
 
 // Task 1: Contest スキーマが 20 フィールドに拡大したため、テストでは常に
 // makeContest(overrides) を経由して既定値を注入する。既定は「draft と互換な

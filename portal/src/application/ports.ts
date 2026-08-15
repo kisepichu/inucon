@@ -7,15 +7,35 @@ import {
   ContestRevisionConflict,
   DuplicateInstanceIndex,
   InvalidJobTransition,
+  InvalidOperationTransition,
   OperationalContestConflict,
   TeamJobAlreadyQueued,
   TeamNumberConflict
 } from "../domain/errors.js"
-import type { BenchJobId, ContestId, InstanceId, TeamId, UserId } from "../domain/ids.js"
+import type { Artifact } from "../domain/artifact.js"
+import type {
+  ArtifactId,
+  BenchJobId,
+  ContestId,
+  InstanceId,
+  OperationId,
+  OperationStepId,
+  ResourceBindingId,
+  TeamId,
+  UserId
+} from "../domain/ids.js"
 import type { Instance } from "../domain/instance.js"
+import type {
+  NewOperation,
+  Operation,
+  OperationStep,
+  SanitizedOperationError
+} from "../domain/operation.js"
+import type { ResourceBinding } from "../domain/resourceBinding.js"
 import type { Team } from "../domain/team.js"
 import type { TeamInvite } from "../domain/teamInvite.js"
 import type { User } from "../domain/user.js"
+import type { StepOutcome } from "./usecases/operations.js"
 import { InstanceNotRunning, MemberConflict, ProvisionInProgress, QuotaExceeded } from "./errors.js"
 
 // リポジトリ層(infrastructure、Task 4 が実装)の失敗はすべてこれに包む。
@@ -37,6 +57,17 @@ export class GithubKeysError extends Data.TaggedError("GithubKeysError")<{ cause
 export class ProvisionTimeout extends Data.TaggedError("ProvisionTimeout")<{
   vmid: number
   timeoutMillis: number
+}> {}
+
+// Task 6: Operation enqueue が「他に unfinished Operation あり」または
+// 「creating/deleting な Instance あり」で失敗したときの型付きエラー。
+// cross-lock は SQL 側の atomic ガードで検出する(TeamJobAlreadyQueued と同型)。
+export class OperationInProgress extends Data.TaggedError("OperationInProgress")<{}> {}
+
+// OperationHandler の run が呼び出し内部で失敗したときの包み。step の再試行
+// 判定は sanitizeOperationError の code を見て application 層が行う。
+export class OperationExecutionError extends Data.TaggedError("OperationExecutionError")<{
+  readonly cause: unknown
 }> {}
 
 export class UuidGen extends Context.Tag("app/UuidGen")<
@@ -213,12 +244,14 @@ export class InstanceRepo extends Context.Tag("app/InstanceRepo")<
     readonly remove: (id: InstanceId) => Effect.Effect<void, RepoError>
     readonly createIfAllowed: (
       i: Instance,
-      quota: number
-    ) => Effect.Effect<Instance, RepoError | QuotaExceeded | ProvisionInProgress | DuplicateInstanceIndex>
+      quota: number,
+      lock?: { readonly owningOperationId: Option.Option<OperationId> }
+    ) => Effect.Effect<Instance, RepoError | QuotaExceeded | ProvisionInProgress | DuplicateInstanceIndex | OperationInProgress>
     readonly beginDeletingIfAllowed: (
       instanceId: InstanceId,
-      now: number
-    ) => Effect.Effect<Option.Option<Instance>, RepoError>
+      now: number,
+      lock?: { readonly owningOperationId: Option.Option<OperationId> }
+    ) => Effect.Effect<Option.Option<Instance>, RepoError | OperationInProgress>
     readonly update: (i: Instance) => Effect.Effect<void, RepoError>
     readonly findNextForOrchestration: Effect.Effect<Option.Option<Instance>, RepoError>
   }
@@ -379,5 +412,128 @@ export class ProvisioningConfig extends Context.Tag("app/ProvisioningConfig")<
   {
     readonly minFreeMemBytes: number
     readonly guestAgentTimeoutMillis: number
+  }
+>() {}
+
+// Task 6: Operation の永続化 + atomic transition。単一 unfinished ロックは
+// operations テーブルの partial unique index が最終的な強制点、cross-lock
+// (creating/deleting Instance 中は enqueue 拒否)は enqueue の SQL に埋め込む。
+export class OperationRepo extends Context.Tag("app/OperationRepo")<
+  OperationRepo,
+  {
+    readonly enqueue: (
+      input: NewOperation
+    ) => Effect.Effect<Operation, RepoError | OperationInProgress>
+    readonly findById: (id: OperationId) => Effect.Effect<Option.Option<Operation>, RepoError>
+    readonly listSteps: (id: OperationId) => Effect.Effect<ReadonlyArray<OperationStep>, RepoError>
+    // claimNext: 「次に走らせるべき Step」を 1 件返す。同一 Operation で running
+    // 中の Step があればスキップ、retry_at <= now、lease 未取得 or 期限切れの
+    // queued Step のうち最も低 ordinal を lease する。attempt を +1 し、
+    // running に遷移させる。
+    readonly claimNext: (now: number) => Effect.Effect<Option.Option<OperationStep>, RepoError>
+    readonly completeStep: (
+      stepId: OperationStepId,
+      summary: string,
+      now: number
+    ) => Effect.Effect<void, RepoError>
+    readonly failStep: (
+      stepId: OperationStepId,
+      error: SanitizedOperationError,
+      retryAt: Option.Option<number>,
+      now: number
+    ) => Effect.Effect<void, RepoError>
+    readonly blockStep: (
+      stepId: OperationStepId,
+      error: SanitizedOperationError,
+      now: number
+    ) => Effect.Effect<void, RepoError>
+    // resumeExpired: cutoff 以前に lease_expires_at を持つ running Step を queued に戻す。
+    // ワーカー起動時 (restart 補償) と定期スイープの両方から呼ばれる。返り値は
+    // 実際に回収した Step 数(可観測性のため)。
+    readonly resumeExpired: (cutoff: number) => Effect.Effect<number, RepoError>
+    readonly retry: (
+      operationId: OperationId,
+      now: number
+    ) => Effect.Effect<Operation, RepoError | InvalidOperationTransition>
+    readonly cancel: (
+      operationId: OperationId,
+      now: number
+    ) => Effect.Effect<Operation, RepoError | InvalidOperationTransition>
+  }
+>() {}
+
+export class ResourceBindingRepo extends Context.Tag("app/ResourceBindingRepo")<
+  ResourceBindingRepo,
+  {
+    readonly upsert: (binding: ResourceBinding) => Effect.Effect<void, RepoError>
+    readonly listByContest: (
+      contestId: ContestId
+    ) => Effect.Effect<ReadonlyArray<ResourceBinding>, RepoError>
+    readonly deleteById: (id: ResourceBindingId) => Effect.Effect<void, RepoError>
+  }
+>() {}
+
+export class ArtifactRepo extends Context.Tag("app/ArtifactRepo")<
+  ArtifactRepo,
+  {
+    readonly upsert: (artifact: Artifact) => Effect.Effect<void, RepoError>
+    readonly listByContest: (contestId: ContestId) => Effect.Effect<ReadonlyArray<Artifact>, RepoError>
+    readonly findByKind: (
+      contestId: ContestId,
+      kind: Artifact["kind"]
+    ) => Effect.Effect<Option.Option<Artifact>, RepoError>
+    readonly markVerified: (id: ArtifactId, now: number) => Effect.Effect<void, RepoError>
+  }
+>() {}
+
+export class RunnerAgentRepo extends Context.Tag("app/RunnerAgentRepo")<
+  RunnerAgentRepo,
+  {
+    readonly upsert: (agent: {
+      readonly id: string
+      readonly revision: number
+      readonly benchReady: boolean
+      readonly healthSummary: string
+      readonly lastSeenAt: number
+    }) => Effect.Effect<void, RepoError>
+    readonly listAll: Effect.Effect<
+      ReadonlyArray<{
+        readonly id: string
+        readonly revision: number
+        readonly benchReady: boolean
+        readonly healthSummary: string
+        readonly lastSeenAt: number
+      }>,
+      RepoError
+    >
+  }
+>() {}
+
+// OperationHandler の実装は provider Layer に依存する(Task 7 以降で埋まる)。
+// 登録済みハンドラは (kind, stepKey) で lookup する。存在しないハンドラは
+// worker が「configuration_error」相当で step を blocked にする。
+export interface OperationHandler {
+  readonly run: (step: OperationStep) => Effect.Effect<StepOutcome, OperationExecutionError>
+}
+
+export class OperationHandlerRegistry extends Context.Tag("app/OperationHandlerRegistry")<
+  OperationHandlerRegistry,
+  {
+    readonly lookup: (
+      kind: Operation["kind"],
+      stepKey: string
+    ) => Option.Option<OperationHandler>
+  }
+>() {}
+
+// OperationWorker の tick / retry 動作の設定(Config から組み立てる)。
+export class OperationWorkerConfig extends Context.Tag("app/OperationWorkerConfig")<
+  OperationWorkerConfig,
+  {
+    readonly pollIntervalMillis: number
+    readonly retryBaseMillis: number
+    readonly retryMaxMillis: number
+    readonly maxAttempts: number
+    readonly leaseDurationMillis: number
   }
 >() {}

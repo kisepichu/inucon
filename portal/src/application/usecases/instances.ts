@@ -175,7 +175,7 @@ export const requestCreateInstance = (args: { user: User; teamId: TeamId }) =>
       now
     })
 
-    return yield* instances.createIfAllowed(instance, contest.instanceQuota)
+    return yield* instances.createIfAllowed(instance, contest.instanceQuota, { owningOperationId: Option.none() })
   })
 
 // DELETE /api/teams/:id/instances/:instanceId(セルフサービス削除)。
@@ -205,7 +205,7 @@ export const requestDeleteInstance = (args: { user: User; instanceId: InstanceId
     }
 
     const now = yield* Clock.currentTimeMillis
-    const updated = yield* instances.beginDeletingIfAllowed(instance.id, now)
+    const updated = yield* instances.beginDeletingIfAllowed(instance.id, now, { owningOperationId: Option.none() })
     if (Option.isSome(updated)) {
       return updated.value
     }

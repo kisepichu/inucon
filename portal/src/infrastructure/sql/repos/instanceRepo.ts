@@ -1,10 +1,10 @@
 import { SqlClient } from "@effect/sql"
 import { Effect, Layer, Option } from "effect"
-import type { ContestId, InstanceId, TeamId } from "../../../domain/ids.js"
+import type { ContestId, InstanceId, OperationId, TeamId } from "../../../domain/ids.js"
 import { Instance } from "../../../domain/instance.js"
 import { DuplicateInstanceIndex } from "../../../domain/errors.js"
 import { ProvisionInProgress, QuotaExceeded } from "../../../application/errors.js"
-import { InstanceRepo } from "../../../application/ports.js"
+import { InstanceRepo, OperationInProgress } from "../../../application/ports.js"
 import { RepoError } from "../../../application/ports.js"
 import { decodeRow, optionToNull, wrapSqlError } from "./support.js"
 
@@ -113,10 +113,38 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
       // 走らせるとエディション跨ぎの vmid 衝突(旧エディションの failed 行が
       // vmid を掴んだままなど)が SqlError→ 500 に化けてハンドラの
       // catchTags を素通りするので、SELECT で 0 行にして typed error に落とす。
-      createIfAllowed: (i: Instance, quota: number) =>
+      createIfAllowed: (
+        i: Instance,
+        quota: number,
+        lock?: { readonly owningOperationId: Option.Option<OperationId> }
+      ) =>
         wrapSqlError(
           sql.withTransaction(
             Effect.gen(function* () {
+              // Cross-lock (Operation ↔ Instance): unfinished Operation が
+              // あり、かつ「その Operation を owner として明示していない」
+              // Instance 作成は拒否する。owningOperationId=None は self-service
+              // 追加ボタン経路、Some(opId) は Operation の内部 step 経路。
+              // owningOperationId は「その 1 Operation だけを許可」する予約席
+              // なので、DB 側の他 unfinished Operation とは id が一致しない
+              // 限り常に競合とみなす(Task 6 review invariant)。
+              const ownerId = lock?.owningOperationId ?? Option.none<OperationId>()
+              const conflictOps = yield* Option.match(ownerId, {
+                onNone: () =>
+                  sql<{ id: string }>`
+                    SELECT id FROM operations
+                    WHERE status NOT IN ('succeeded','canceled') LIMIT 1
+                  `,
+                onSome: (opId) =>
+                  sql<{ id: string }>`
+                    SELECT id FROM operations
+                    WHERE status NOT IN ('succeeded','canceled') AND id <> ${opId} LIMIT 1
+                  `
+              })
+              if (conflictOps.length > 0) {
+                return yield* Effect.fail(new OperationInProgress())
+              }
+
               const rows = yield* sql<InstanceRow>`
                 INSERT INTO instances
                   (id, contest_id, team_id, idx, vmid, private_ip, status, progress, error_message, created_at, updated_at)
@@ -185,34 +213,63 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
           )
         ),
 
-      // 対象 instance の contest_id/team_id で scoping。全条件は 0004 の設計を踏襲。
-      beginDeletingIfAllowed: (instanceId: InstanceId, now: number) =>
+      // Cross-lock: unfinished Operation を保持したまま self-service
+      // 削除に入るのは禁止(owner=Some(opId) の internal 経路だけ通す)。
+      // 「Operation 競合 SELECT」と「Instance 状態 UPDATE」を単一の
+      // sql.withTransaction に閉じ込めることで、SELECT 通過後 UPDATE 前に
+      // 別セッションの enqueue が入り込む TOCTOU を塞ぐ(createIfAllowed と
+      // 同型: enqueue 側は creating/deleting instances を見るので、こちらが
+      // "running → deleting" の書き換えを同一 tx に閉じないと enqueue が
+      // 一瞬すり抜けて cross-lock 不変条件が破れる)。
+      beginDeletingIfAllowed: (
+        instanceId: InstanceId,
+        now: number,
+        lock?: { readonly owningOperationId: Option.Option<OperationId> }
+      ) =>
         wrapSqlError(
-          sql<InstanceRow>`
-            UPDATE instances
-            SET status = 'deleting', updated_at = ${now}
-            WHERE id = ${instanceId}
-              AND status IN ('running', 'failed')
-              AND NOT EXISTS (
-                SELECT 1 FROM instances i2
-                WHERE i2.contest_id = instances.contest_id
-                  AND i2.team_id = instances.team_id
-                  AND i2.id <> ${instanceId}
-                  AND i2.status IN ('creating', 'deleting')
-              )
-              AND NOT EXISTS (
-                SELECT 1 FROM bench_jobs bj
-                WHERE bj.contest_id = instances.contest_id
-                  AND bj.target_ip = instances.private_ip
-                  AND bj.status IN ('queued', 'running')
-              )
-            RETURNING ${columns}
-          `
-        ).pipe(
-          Effect.flatMap((rows) =>
-            rows.length === 0
-              ? Effect.succeed(Option.none<Instance>())
-              : decodeInstance(rows[0]).pipe(Effect.map(Option.some))
+          sql.withTransaction(
+            Effect.gen(function* () {
+              const ownerId = lock?.owningOperationId ?? Option.none<OperationId>()
+              const conflict = yield* Option.match(ownerId, {
+                onNone: () =>
+                  sql<{ id: string }>`
+                    SELECT id FROM operations
+                    WHERE status NOT IN ('succeeded','canceled') LIMIT 1
+                  `,
+                onSome: (opId) =>
+                  sql<{ id: string }>`
+                    SELECT id FROM operations
+                    WHERE status NOT IN ('succeeded','canceled') AND id <> ${opId} LIMIT 1
+                  `
+              })
+              if (conflict.length > 0) {
+                return yield* Effect.fail(new OperationInProgress())
+              }
+              const rows = yield* sql<InstanceRow>`
+                UPDATE instances
+                SET status = 'deleting', updated_at = ${now}
+                WHERE id = ${instanceId}
+                  AND status IN ('running', 'failed')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM instances i2
+                    WHERE i2.contest_id = instances.contest_id
+                      AND i2.team_id = instances.team_id
+                      AND i2.id <> ${instanceId}
+                      AND i2.status IN ('creating', 'deleting')
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM bench_jobs bj
+                    WHERE bj.contest_id = instances.contest_id
+                      AND bj.target_ip = instances.private_ip
+                      AND bj.status IN ('queued', 'running')
+                  )
+                RETURNING ${columns}
+              `
+              if (rows.length === 0) {
+                return Option.none<Instance>()
+              }
+              return yield* decodeInstance(rows[0]).pipe(Effect.map(Option.some))
+            })
           )
         ),
 

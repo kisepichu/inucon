@@ -2,6 +2,7 @@ import { Data } from "effect"
 import type { ContestStatus } from "./contest.js"
 import type { BenchJobStatus } from "./benchJob.js"
 import type { InstanceStatus } from "./instance.js"
+import type { OperationStatus } from "./operation.js"
 import type { BenchJobId, InstanceId, TeamId } from "./ids.js"
 
 // Data.TaggedError(データのみ、Effect runtime 非依存)。
@@ -12,6 +13,13 @@ import type { BenchJobId, InstanceId, TeamId } from "./ids.js"
 export class InvalidContestTransition extends Data.TaggedError("InvalidContestTransition")<{
   from: ContestStatus
   to: ContestStatus
+}> {}
+
+// Task 6: Durable Operation の状態機械(operation.ts)における不正遷移。
+// Contest/Job/Instance の InvalidXxxTransition と同型。
+export class InvalidOperationTransition extends Data.TaggedError("InvalidOperationTransition")<{
+  from: OperationStatus
+  to: OperationStatus
 }> {}
 
 // draft -> preparing の schedule 検証で unset/順序違反が見つかったときに返す。
