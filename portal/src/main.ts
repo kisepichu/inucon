@@ -11,7 +11,7 @@ import { GithubOAuthLive } from "./infrastructure/github/oauth.js"
 import { AdminLive } from "./infrastructure/http/handlers/admin.js"
 import { AuthLive } from "./infrastructure/http/handlers/auth.js"
 import { BenchLive } from "./infrastructure/http/handlers/bench.js"
-import { ContestLive } from "./infrastructure/http/handlers/contest.js"
+import { ContestLive, ContestsLive } from "./infrastructure/http/handlers/contest.js"
 import { HealthLive } from "./infrastructure/http/handlers/health.js"
 import { InstancesLive } from "./infrastructure/http/handlers/instances.js"
 import { RunnerLive } from "./infrastructure/http/handlers/runner.js"
@@ -148,6 +148,7 @@ const ApiLive = HttpApiBuilder.api(api).pipe(
       HealthLive,
       AuthLive,
       ContestLive,
+      ContestsLive,
       TeamsLive,
       InstancesLive,
       AdminLive,

@@ -1,5 +1,6 @@
 import { Clock, Effect, Either, Option } from "effect"
 import { beginFinalization, finishContest, startContest } from "../../domain/contest.js"
+import type { ContestId } from "../../domain/ids.js"
 import { ContestNotFound } from "../errors.js"
 import { BenchJobRepo, ContestRepo, RepoError } from "../ports.js"
 
@@ -111,3 +112,24 @@ export const finishContestUsecase = Effect.gen(function* () {
     )
   )
 })
+
+
+// Task 4: 公開 archive API 用の read use case。canceled は list からも detail
+// からも除外する(監査経路は admin の /api/admin/contests… で別 handler)。
+// list は edition 降順(list of contests シグネチャに合わせ最新回が先頭)。
+export const listPublicContests = ContestRepo.pipe(
+  Effect.flatMap((repo) => repo.list),
+  Effect.map((all) => all.filter((c) => c.status !== "canceled"))
+)
+
+export const getPublicContestById = (contestId: ContestId) =>
+  ContestRepo.pipe(
+    Effect.flatMap((repo) => repo.findById(contestId)),
+    Effect.flatMap(
+      Option.match({
+        onNone: () => Effect.fail(new ContestNotFound()),
+        onSome: (c) =>
+          c.status === "canceled" ? Effect.fail(new ContestNotFound()) : Effect.succeed(c)
+      })
+    )
+  )

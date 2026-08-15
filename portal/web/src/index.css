@@ -367,6 +367,40 @@ input.input:focus, select.input:focus {
   font-size: var(--fs-small);
 }
 
+/* Task 4: 公開 scoreboard の archive selector */
+.scoreboard-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--sp-4);
+}
+.contest-select {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  color: var(--text-muted);
+  font-size: var(--fs-small);
+}
+.contest-select select {
+  padding: var(--sp-1) var(--sp-2);
+  font-size: var(--fs-body);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-m);
+  color: var(--text);
+}
+.empty {
+  color: var(--text-muted);
+  background: var(--surface);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-l);
+  padding: var(--sp-5);
+  text-align: center;
+  font-size: var(--fs-small);
+}
+
 /* ---------- Sections ---------- */
 .section { margin-bottom: var(--sp-6); }
 .section-actions { margin-top: var(--sp-3); }
