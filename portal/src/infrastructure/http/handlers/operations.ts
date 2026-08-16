@@ -18,6 +18,7 @@ import {
   TeamJobAlreadyQueued
 } from "shared"
 import { CurrentUser } from "shared"
+import { ContestRepo, OperationRepo } from "../../../application/ports.js"
 import { enqueueRehearsal } from "../../../application/usecases/bench.js"
 import { requestContestStart } from "../../../application/usecases/contestAdmin.js"
 import {
@@ -224,5 +225,57 @@ export const OperationsLive = HttpApiBuilder.group(api, "operations", (handlers)
         }),
         Effect.orDie
       )
+    )
+    // Task 13: OperationDetail 用の Operation 単体取得。Operation + steps を
+    // ordinal 昇順で返す。domain の Option フィールド (retryAt / leaseExpiresAt /
+    // resultSummary / sanitizedError / startedAt / finishedAt) はすべて境界で
+    // null に畳む (BenchJob / Operation と同じ方針)。
+    .handle("getAdminOperation", ({ path }) =>
+      Effect.gen(function* () {
+        const ops = yield* OperationRepo
+        const opt = yield* ops.findById(path.operationId)
+        if (Option.isNone(opt)) {
+          return yield* Effect.fail(new NotFound())
+        }
+        const op = opt.value
+        const steps = yield* ops.listSteps(path.operationId)
+        return {
+          ...op,
+          sanitizedError: Option.getOrNull(op.sanitizedError),
+          startedAt: Option.getOrNull(op.startedAt),
+          finishedAt: Option.getOrNull(op.finishedAt),
+          steps: steps.map((s) => ({
+            ...s,
+            retryAt: Option.getOrNull(s.retryAt),
+            leaseExpiresAt: Option.getOrNull(s.leaseExpiresAt),
+            resultSummary: Option.getOrNull(s.resultSummary),
+            sanitizedError: Option.getOrNull(s.sanitizedError),
+            startedAt: Option.getOrNull(s.startedAt),
+            finishedAt: Option.getOrNull(s.finishedAt)
+          }))
+        }
+      }).pipe(Effect.orDie)
+    )
+    // Task 13: ContestAdmin の Operations タブ用一覧。limit は 20 既定 / 100 上限。
+    // Contest 存在チェックはリスト応答が空 [] と区別が付かなくなるのを避けるため
+    // 明示的に行う (findById → NotFound マップ)。
+    .handle("listContestOperations", ({ path, urlParams }) =>
+      Effect.gen(function* () {
+        const contests = yield* ContestRepo
+        const contest = yield* contests.findById(path.contestId)
+        if (Option.isNone(contest)) {
+          return yield* Effect.fail(new NotFound())
+        }
+        const raw = urlParams.limit === undefined ? 20 : Number.parseInt(urlParams.limit, 10)
+        const limit = Number.isFinite(raw) && raw > 0 ? Math.min(raw, 100) : 20
+        const ops = yield* OperationRepo
+        const rows = yield* ops.listByContest(path.contestId, limit)
+        return rows.map((op) => ({
+          ...op,
+          sanitizedError: Option.getOrNull(op.sanitizedError),
+          startedAt: Option.getOrNull(op.startedAt),
+          finishedAt: Option.getOrNull(op.finishedAt)
+        }))
+      }).pipe(Effect.orDie)
     )
 )

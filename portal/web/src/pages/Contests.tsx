@@ -83,7 +83,7 @@ export function Contests() {
           {contests.map((c) => (
             <tr key={c.id}>
               <td>#{c.edition}</td>
-              <td>{c.name}</td>
+              <td><Link to={`/admin/contests/${c.id}`}>{c.name}</Link></td>
               <td>{c.status}</td>
               <td>{c.problemKey} @ {c.problemRevision}</td>
               <td>{c.instanceQuota}</td>

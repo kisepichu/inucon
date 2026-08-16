@@ -34,6 +34,8 @@ import {
   JobAction,
   Me,
   Operation,
+  OperationId,
+  OperationWithSteps,
   PollJobResponse,
   ReadinessCheck,
   ReconciliationApplyRequest,
@@ -816,6 +818,29 @@ export const operationsGroup = HttpApiGroup.make("operations")
       .addError(OperationalContestConflict)
       .addError(ResidualManagedResource)
       .addError(InvalidContestTransition)
+      .middleware(AdminOnly)
+  )
+  // Task 13: OperationDetail UI 用の Operation 単体取得。step 一覧を ordinal
+  // 昇順で載せる。UI は terminal status (succeeded/failed/blocked/canceled) に
+  // 落ちるまで polling する。生 storagePath / bearer / email は載らない
+  // (境界の SanitizedOperationError と wire schema が保証する)。
+  .add(
+    HttpApiEndpoint.get(
+      "getAdminOperation"
+    )`/api/admin/operations/${HttpApiSchema.param("operationId", OperationId)}`
+      .addSuccess(OperationWithSteps)
+      .addError(NotFound)
+      .middleware(AdminOnly)
+  )
+  // Task 13: ContestAdmin の Operations タブ用一覧。createdAt DESC + limit。
+  // 生成者 (admin userId / scheduler) は Operation.actor に既に含まれる。
+  .add(
+    HttpApiEndpoint.get(
+      "listContestOperations"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/operations`
+      .setUrlParams(Schema.Struct({ limit: Schema.optional(Schema.String) }))
+      .addSuccess(Schema.Array(Operation))
+      .addError(NotFound)
       .middleware(AdminOnly)
   )
 

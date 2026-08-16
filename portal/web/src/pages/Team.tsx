@@ -157,7 +157,6 @@ export function Team({ me }: TeamProps) {
   const activeCount = instanceList.filter((instance) => ACTIVE_STATUSES.has(instance.status)).length
   const hasPendingOp = instanceList.some((instance) => PENDING_STATUSES.has(instance.status))
   const runningInstances = instanceList.filter((instance) => instance.status === "running")
-  const contestRunning = contest?.status === "running"
 
   // 追加ボタン: admin/team がコンテスト開催前にインスタンスを事前払い出しする
   // 運用を想定しており、backend もコンテスト running を要求しない(Task 6
@@ -212,10 +211,26 @@ export function Team({ me }: TeamProps) {
   }
 
   const hasActiveJob = jobs?.some((job) => job.status === "queued" || job.status === "running") ?? false
-  // ベンチ対象は running のインスタンスのみ許可する(Task 6 レビュー #3)。
-  // running が 1 つも無い場合は選択の余地が無いので専用の理由文言を出す。
-  const disabledReason = !contestRunning
-    ? "コンテストは開催されていません"
+  // Task 13: Contest.status ごとに理由を明示する。preparing 中は admin だけが
+  // ContestAdmin から rehearsal を投入し、team メンバーからの enqueue は不可
+  // (backend 側でも ContestNotRunning にマップされる)。finalizing / finished は
+  // 集計中/終了なのでライフサイクル理由を明示する。
+  const lifecycleDisableReason =
+    contest === null
+      ? "コンテストは開催されていません"
+      : contest.status === "preparing"
+        ? "準備中です。ベンチは管理者だけが rehearsal として実行できます"
+        : contest.status === "finalizing"
+          ? "確定処理中です。ジョブは投入できません"
+          : contest.status === "finished"
+            ? "コンテストは終了しました"
+            : contest.status === "canceled"
+              ? "コンテストはキャンセルされました"
+              : contest.status === "running"
+                ? null
+                : "コンテストはまだ開始していません"
+  const disabledReason = lifecycleDisableReason !== null
+    ? lifecycleDisableReason
     : hasActiveJob
       ? "既に実行中のジョブがあります"
       : !useManualTarget && runningInstances.length === 0
@@ -246,7 +261,7 @@ export function Team({ me }: TeamProps) {
 
   return (
     <div>
-      <h1>{team.name}</h1>
+      <h1>{team.name}{contest && ` — 第${contest.edition}回`}</h1>
 
       <section className="section">
         <h2>インスタンス</h2>

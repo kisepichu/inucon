@@ -1561,6 +1561,16 @@ export const makeOperationRepoTest = (): { layer: Layer.Layer<OperationRepo>; ge
       Ref.get(stepsRef).pipe(
         Effect.map((rows) => rows.filter((s) => s.operationId === id))
       ),
+    listByContest: (contestId, limit) =>
+      Ref.get(opsRef).pipe(
+        Effect.map((rows) =>
+          rows
+            .filter((o) => o.contestId === contestId)
+            .slice()
+            .sort((a, b) => b.createdAt - a.createdAt || (b.id > a.id ? 1 : -1))
+            .slice(0, limit)
+        )
+      ),
     claimNext: () => Effect.dieMessage("makeOperationRepoTest: claimNext not implemented"),
     completeStep: () => Effect.dieMessage("makeOperationRepoTest: completeStep not implemented"),
     failStep: () => Effect.dieMessage("makeOperationRepoTest: failStep not implemented"),
@@ -1616,6 +1626,7 @@ export const makeOperationRepoStubTest = (
     enqueue: () => Effect.dieMessage("makeOperationRepoStubTest: enqueue not implemented"),
     findById: () => Effect.succeed(Option.none()),
     listSteps: () => Effect.succeed([]),
+    listByContest: () => Effect.succeed([]),
     claimNext: () => Effect.succeed(Option.none()),
     completeStep: () => Effect.dieMessage("makeOperationRepoStubTest: completeStep not implemented"),
     failStep: () => Effect.dieMessage("makeOperationRepoStubTest: failStep not implemented"),

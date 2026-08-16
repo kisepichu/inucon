@@ -574,3 +574,147 @@ describe("POST /api/admin/contests/:contestId/return-normal-mode (Task 12)", () 
     )
   )
 })
+
+
+// Task 13: OperationDetail 用の single Operation 取得。step 一覧を ordinal
+// 昇順で載せる。生 storagePath / bearer / email は載せない。
+describe("GET /api/admin/operations/:operationId (Task 13)", () => {
+  it.effect("非 admin は403", () =>
+    Effect.gen(function* () {
+      const { cookieHeader: cookie } = yield* login({
+        githubLogin: "user1",
+        githubId: 1,
+        isAdmin: false
+      })
+      const client = yield* HttpClient.HttpClient
+      const res = yield* client.get("/api/admin/operations/op-1", { headers: { cookie } })
+      expect(res.status).toBe(403)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("存在しない operation は404", () =>
+    Effect.gen(function* () {
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const client = yield* HttpClient.HttpClient
+      const res = yield* client.get("/api/admin/operations/op-missing", { headers: { cookie } })
+      expect(res.status).toBe(404)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("admin は200で Operation と steps (ordinal 昇順) を返す", () =>
+    Effect.gen(function* () {
+      yield* seedLegacy
+      const ops = yield* OperationRepo
+      const enqueued = yield* ops.enqueue({
+        contestId: CONTEST_ID,
+        kind: "reconcile",
+        actor: { kind: "scheduler" },
+        planDigest: "digest-for-detail",
+        contestRevision: 1,
+        steps: [
+          { stepKey: "reconcile:step-a", ordinal: 0, inputSummary: "{}", continueOnError: false },
+          { stepKey: "reconcile:step-b", ordinal: 1, inputSummary: "{}", continueOnError: true }
+        ]
+      })
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const client = yield* HttpClient.HttpClient
+      const res = yield* client.get(`/api/admin/operations/${enqueued.id}`, { headers: { cookie } })
+      expect(res.status).toBe(200)
+      const body = (yield* res.json) as {
+        id: string
+        kind: string
+        status: string
+        planDigest: string
+        sanitizedError: unknown
+        steps: ReadonlyArray<{ stepKey: string; ordinal: number; attempt: number; continueOnError: boolean }>
+      }
+      expect(body.id).toBe(enqueued.id)
+      expect(body.kind).toBe("reconcile")
+      expect(body.planDigest).toBe("digest-for-detail")
+      expect(body.sanitizedError).toBeNull()
+      expect(body.steps.map((s) => s.stepKey)).toEqual(["reconcile:step-a", "reconcile:step-b"])
+      expect(body.steps[0].ordinal).toBe(0)
+      expect(body.steps[1].continueOnError).toBe(true)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+})
+
+// Task 13: ContestAdmin の Operations タブ用一覧。createdAt DESC + limit clamp。
+describe("GET /api/admin/contests/:contestId/operations (Task 13)", () => {
+  it.effect("非 admin は403", () =>
+    Effect.gen(function* () {
+      const { cookieHeader: cookie } = yield* login({
+        githubLogin: "user1",
+        githubId: 1,
+        isAdmin: false
+      })
+      const client = yield* HttpClient.HttpClient
+      const res = yield* client.get(`/api/admin/contests/${CONTEST_ID}/operations`, {
+        headers: { cookie }
+      })
+      expect(res.status).toBe(403)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("存在しない contest は404", () =>
+    Effect.gen(function* () {
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const client = yield* HttpClient.HttpClient
+      const res = yield* client.get(`/api/admin/contests/${ContestId.make("nope")}/operations`, {
+        headers: { cookie }
+      })
+      expect(res.status).toBe(404)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("createdAt DESC で最新 Operation を先頭に返す", () =>
+    Effect.gen(function* () {
+      yield* seedLegacy
+      const ops = yield* OperationRepo
+      const first = yield* ops.enqueue({
+        contestId: CONTEST_ID,
+        kind: "reconcile",
+        actor: { kind: "scheduler" },
+        planDigest: "d1",
+        contestRevision: 1,
+        steps: [{ stepKey: "s", ordinal: 0, inputSummary: "{}", continueOnError: false }]
+      })
+      yield* ops.cancel(first.id, 5000)
+      const second = yield* ops.enqueue({
+        contestId: CONTEST_ID,
+        kind: "backup",
+        actor: { kind: "scheduler" },
+        planDigest: "d2",
+        contestRevision: 1,
+        steps: [{ stepKey: "s", ordinal: 0, inputSummary: "{}", continueOnError: false }]
+      })
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const client = yield* HttpClient.HttpClient
+      const res = yield* client.get(`/api/admin/contests/${CONTEST_ID}/operations`, {
+        headers: { cookie }
+      })
+      expect(res.status).toBe(200)
+      const body = (yield* res.json) as ReadonlyArray<{ id: string; kind: string; createdAt: number }>
+      expect(body.length).toBe(2)
+      // createdAt DESC を検証。同 ms に落ちても id (先頭は second) を含めた 2 件が
+      // 返ることを確認する (実 SQL は created_at DESC, id DESC で tie-break)。
+      expect(body[0].createdAt).toBeGreaterThanOrEqual(body[1].createdAt)
+      const ids = new Set(body.map((op) => op.id))
+      expect(ids.has(first.id)).toBe(true)
+      expect(ids.has(second.id)).toBe(true)
+      expect(body.map((op) => op.kind).sort()).toEqual(["backup", "reconcile"])
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("limit=1000 は 100 に clamp する (200 で返る)", () =>
+    Effect.gen(function* () {
+      yield* seedLegacy
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const client = yield* HttpClient.HttpClient
+      const res = yield* client.get(`/api/admin/contests/${CONTEST_ID}/operations?limit=1000`, {
+        headers: { cookie }
+      })
+      expect(res.status).toBe(200)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+})

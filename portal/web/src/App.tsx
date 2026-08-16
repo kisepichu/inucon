@@ -4,6 +4,8 @@ import type { Contest, Me } from "shared/schemas"
 import { ApiError, api, loginUrl } from "./api.ts"
 import { Admin } from "./pages/Admin.tsx"
 import { Contests } from "./pages/Contests.tsx"
+import { ContestAdmin } from "./pages/ContestAdmin.tsx"
+import { OperationDetail } from "./pages/OperationDetail.tsx"
 import { ContestSetup } from "./pages/ContestSetup.tsx"
 import { JobDetail } from "./pages/JobDetail.tsx"
 import { Scoreboard } from "./pages/Scoreboard.tsx"
@@ -153,6 +155,14 @@ export function App() {
                 <Navigate to="/" replace />
               )
             }
+          />
+          <Route
+            path="/admin/contests/:contestId"
+            element={me?.user.isAdmin ? <ContestAdmin /> : <Navigate to="/" replace />}
+          />
+          <Route
+            path="/admin/operations/:operationId"
+            element={me?.user.isAdmin ? <OperationDetail /> : <Navigate to="/" replace />}
           />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

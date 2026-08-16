@@ -2,7 +2,7 @@ import { SqlClient } from "@effect/sql"
 import { Clock, Effect, Either, Layer, Option, Schema } from "effect"
 import type { SqlError } from "@effect/sql/SqlError"
 import { InvalidOperationTransition } from "../../../domain/errors.js"
-import type { OperationId, OperationStepId } from "../../../domain/ids.js"
+import type { ContestId, OperationId, OperationStepId } from "../../../domain/ids.js"
 import { Operation, OperationStep, SanitizedOperationError } from "../../../domain/operation.js"
 import type { NewOperation } from "../../../domain/operation.js"
 import {
@@ -390,6 +390,19 @@ export const OperationRepoLive: Layer.Layer<
         wrapSqlError(
           sql<StepRow>`SELECT ${stepColumns} FROM operation_steps WHERE operation_id = ${id} ORDER BY ordinal`
         ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeStep))),
+
+      // Task 13: ContestAdmin の Operations タブ用一覧。createdAt DESC + limit。
+      // 生 storagePath / bearer / email は載らない (sanitized_error は
+      // decodeOperation が SanitizedOperationError schema で検証する)。
+      listByContest: (id: ContestId, limit: number) =>
+        wrapSqlError(
+          sql<OperationRow>`
+            SELECT ${opColumns} FROM operations
+            WHERE contest_id = ${id}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ${limit}
+          `
+        ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeOperation))),
 
       // claimNext: unfinished operation の中で「先行するハルト条件が無く」
       // 「retry_at <= now」で「queued」な最小 ordinal Step を 1 件だけ拾い、

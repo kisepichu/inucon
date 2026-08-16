@@ -613,6 +613,12 @@ export class OperationRepo extends Context.Tag("app/OperationRepo")<
     ) => Effect.Effect<Operation, RepoError | OperationInProgress>
     readonly findById: (id: OperationId) => Effect.Effect<Option.Option<Operation>, RepoError>
     readonly listSteps: (id: OperationId) => Effect.Effect<ReadonlyArray<OperationStep>, RepoError>
+    // Task 13: ContestAdmin の Operations タブ用一覧。createdAt DESC + limit。
+    // limit を明示 number で受け取り、境界層で default 20 / max 100 にクランプする。
+    readonly listByContest: (
+      contestId: ContestId,
+      limit: number
+    ) => Effect.Effect<ReadonlyArray<Operation>, RepoError>
     // claimNext: 「次に走らせるべき Step」を 1 件返す。同一 Operation で running
     // 中の Step があればスキップ、retry_at <= now、lease 未取得 or 期限切れの
     // queued Step のうち最も低 ordinal を lease する。attempt を +1 し、

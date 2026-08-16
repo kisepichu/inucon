@@ -554,3 +554,45 @@ export const CleanupApplyRequest = Schema.Struct({
   planDigest: Schema.String
 })
 export type CleanupApplyRequest = typeof CleanupApplyRequest.Type
+
+// Task 13: OperationStep の wire schema。domain (OptionFromNullOr) との
+// 構造対応は BenchJob/Operation と同じ null 許容パターン。ハンドラは
+// Option.getOrNull で境界に畳んで返す。
+export const OperationStepStatus = Schema.Literal(
+  "queued",
+  "running",
+  "succeeded",
+  "failed",
+  "blocked",
+  "canceled"
+)
+export type OperationStepStatus = typeof OperationStepStatus.Type
+
+export const OperationStep = Schema.Struct({
+  id: OperationStepId,
+  operationId: OperationId,
+  ordinal: Schema.Int.pipe(Schema.nonNegative()),
+  stepKey: Schema.String,
+  status: OperationStepStatus,
+  attempt: Schema.Int.pipe(Schema.nonNegative()),
+  continueOnError: Schema.Boolean,
+  retryAt: Schema.NullOr(Schema.Int),
+  leaseExpiresAt: Schema.NullOr(Schema.Int),
+  inputSummary: Schema.String,
+  progressJson: Schema.String,
+  resultSummary: Schema.NullOr(Schema.String),
+  sanitizedError: Schema.NullOr(SanitizedOperationError),
+  createdAt: Schema.Int,
+  startedAt: Schema.NullOr(Schema.Int),
+  finishedAt: Schema.NullOr(Schema.Int)
+})
+export type OperationStep = typeof OperationStep.Type
+
+// Task 13: GET /api/admin/operations/:operationId の応答 body。
+// Operation aggregate に紐づく OperationStep 一覧を ordinal 昇順で載せる。
+// UI(OperationDetail)が step ごとの attempt/error/lease を可視化するために使う。
+export const OperationWithSteps = Schema.Struct({
+  ...Operation.fields,
+  steps: Schema.Array(OperationStep)
+})
+export type OperationWithSteps = typeof OperationWithSteps.Type

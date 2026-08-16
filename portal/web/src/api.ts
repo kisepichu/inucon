@@ -2,9 +2,13 @@
 // (同一 monorepo なので OpenAPI 生成は使わない。スペック §7)。
 // ランタイムの decode 検証はしない(サーバー契約を信頼する。UI は最小限)。
 import type {
+  Artifact,
+  ArtifactId,
   BenchJob,
   BenchJobDetail,
+  CleanupApplyRequest,
   Contest,
+  ContestId,
   ContestTransitionRequest,
   CopyContestRosterRequest,
   CreateContestDraftRequest,
@@ -12,23 +16,38 @@ import type {
   CreateTeamInstanceRequest,
   CreateTeamRequest,
   EnqueueBenchRequest,
+  EnqueueRehearsalRequest,
   Instance,
   InviteRequest,
   InviteResult,
   Me,
+  Operation,
+  OperationId,
+  OperationWithSteps,
+  ReadinessCheck,
+  ReconciliationApplyRequest,
+  ReconciliationPlan,
+  ReconciliationPlanRequest,
   ScoreboardEntry,
   SetTeamMembersRequest,
   Team,
   TeamInvite,
   TeamWithMembers,
-  UpdateContestDraftRequest
+  UpdateContestDraftRequest,
+  VerifyArtifactRequest
 } from "shared/schemas"
 
 // サーバーのエラーは `{ "_tag": "..." }` JSON + status で返る(スペック調査メモ §6)。
+// Task 13 追加: 409 stale / 422 ambiguous / 409 revision conflict 系は tag のみで
+// 分岐すれば十分 (詳細フィールド {expected, actual, hostnames, failingChecks} は
+// UI が透過的に表示するために payload に含めるが、この class は tag と status
+// だけを持ち、payload は catch サイトで json 再デシリアライズせず必要なら
+// 別途取得する)。
 export class ApiError extends Error {
   constructor(
     readonly tag: string,
-    readonly status: number
+    readonly status: number,
+    readonly details?: Readonly<Record<string, unknown>>
   ) {
     super(`API error: ${tag} (${status})`)
   }
@@ -51,15 +70,17 @@ const request = async <T>(path: string, options: RequestOptions = {}): Promise<T
 
   if (!res.ok) {
     let tag = "UnknownError"
+    let details: Readonly<Record<string, unknown>> | undefined
     try {
       const data: unknown = await res.json()
       if (typeof data === "object" && data !== null && "_tag" in data && typeof data._tag === "string") {
         tag = data._tag
+        details = data as Readonly<Record<string, unknown>>
       }
     } catch {
       // ボディが JSON でない場合はタグ不明のまま扱う。
     }
-    throw new ApiError(tag, res.status)
+    throw new ApiError(tag, res.status, details)
   }
 
   if (res.status === 204) {
@@ -127,5 +148,47 @@ export const api = {
   enqueueBench: (body: EnqueueBenchRequest) => request<BenchJob>("/api/bench-jobs", { method: "POST", body }),
   listBenchJobs: (teamId: string) => request<Array<BenchJob>>(`/api/bench-jobs?teamId=${encodeURIComponent(teamId)}`),
   getBenchJob: (id: string) => request<BenchJobDetail>(`/api/bench-jobs/${id}`),
-  cancelBenchJob: (id: string) => request<BenchJob>(`/api/bench-jobs/${id}/cancel`, { method: "POST" })
+  cancelBenchJob: (id: string) => request<BenchJob>(`/api/bench-jobs/${id}/cancel`, { method: "POST" }),
+
+  // Task 7-12: reconciliation / readiness / start / cleanup / return-normal-mode
+  // (durable Operation を返す admin 経路)。UI は返された Operation を polling する。
+  getContestReadiness: (contestId: ContestId) =>
+    request<Array<ReadinessCheck>>(`/api/admin/contests/${contestId}/readiness`),
+  planReconciliation: (contestId: ContestId, body: ReconciliationPlanRequest) =>
+    request<ReconciliationPlan>(`/api/admin/contests/${contestId}/reconciliation/plan`, {
+      method: "POST",
+      body
+    }),
+  applyReconciliation: (contestId: ContestId, body: ReconciliationApplyRequest) =>
+    request<Operation>(`/api/admin/contests/${contestId}/reconciliation/apply`, {
+      method: "POST",
+      body
+    }),
+  enqueueRehearsal: (contestId: ContestId, body: EnqueueRehearsalRequest) =>
+    request<BenchJob>(`/api/admin/contests/${contestId}/rehearsal`, { method: "POST", body }),
+  requestContestStart: (contestId: ContestId, body: ContestTransitionRequest) =>
+    request<Operation>(`/api/admin/contests/${contestId}/start`, { method: "POST", body }),
+  requestContestFinalize: (contestId: ContestId, body: ContestTransitionRequest) =>
+    request<Operation>(`/api/admin/contests/${contestId}/finalize`, { method: "POST", body }),
+  requestContestCleanup: (contestId: ContestId, body: CleanupApplyRequest) =>
+    request<Operation>(`/api/admin/contests/${contestId}/cleanup`, { method: "POST", body }),
+  requestReturnNormalMode: (contestId: ContestId) =>
+    request<Operation>(`/api/admin/contests/${contestId}/return-normal-mode`, { method: "POST" }),
+  requestContestArchive: (contestId: ContestId) =>
+    request<Operation>(`/api/admin/contests/${contestId}/archive`, { method: "POST" }),
+
+  // Task 11: artifact 一覧 / 検証。生 storagePath は返らない (id のみ)。
+  listContestArtifacts: (contestId: ContestId) =>
+    request<Array<Artifact>>(`/api/contests/${contestId}/artifacts`),
+  verifyArtifactChecksum: (artifactId: ArtifactId, body: VerifyArtifactRequest) =>
+    request<Artifact>(`/api/admin/artifacts/${artifactId}/verify`, { method: "POST", body }),
+
+  // Task 13: 単一 Operation 取得 (OperationDetail polling) と contest scoped 一覧。
+  // getAdminOperation は steps を含む OperationWithSteps を返す。
+  getAdminOperation: (operationId: OperationId) =>
+    request<OperationWithSteps>(`/api/admin/operations/${operationId}`),
+  listContestOperations: (contestId: ContestId, limit?: number) =>
+    request<Array<Operation>>(
+      `/api/admin/contests/${contestId}/operations${limit === undefined ? "" : `?limit=${limit}`}`
+    )
 }
