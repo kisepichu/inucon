@@ -741,6 +741,84 @@ describe("getNodeFreeMemBytes", () => {
   )
 })
 
+// Task 7: reconciliation 向けの inventory メソッド。qemu 一覧を叩いて
+// name が `^inucon-team[0-9]+-[0-9]+$` に一致する VM のみ返す(catch-all や
+// devvm/benchvm 等は絶対に混ぜない)。
+describe("listManagedVms", () => {
+  const inventoryClient = (vms: ReadonlyArray<{
+    vmid: number
+    name: string
+    status: "running" | "stopped"
+    mem?: number
+  }>) =>
+    HttpClient.make((request) => {
+      if (urlPath(request) === "/api2/json/nodes/eevee/qemu" && request.method === "GET") {
+        return Effect.succeed(
+          jsonResponse(request, {
+            data: vms.map((v) => ({
+              vmid: v.vmid,
+              name: v.name,
+              status: v.status,
+              maxmem: v.mem ?? 4 * 1024 * 1024 * 1024
+            }))
+          })
+        )
+      }
+      return Effect.succeed(jsonResponse(request, { errors: "not found" }, 404))
+    })
+
+  it.effect("`^inucon-team[0-9]+-[0-9]+$` に完全一致する VM のみを返す", () =>
+    Effect.gen(function* () {
+      const client = inventoryClient([
+        { vmid: 1101, name: "inucon-team1-1", status: "running" },
+        { vmid: 1102, name: "inucon-team1-2", status: "stopped" },
+        { vmid: 2201, name: "inucon-team2-1", status: "running" },
+        // 除外対象:
+        { vmid: 9100, name: "inucon-template", status: "stopped" },
+        { vmid: 9200, name: "devvm", status: "running" },
+        { vmid: 9300, name: "benchvm", status: "stopped" },
+        { vmid: 3000, name: "inucon-team1-1-clone", status: "stopped" },
+        { vmid: 3001, name: "team1-1", status: "running" }
+      ])
+      const layer = ProxmoxLive.pipe(
+        Layer.provide(Layer.succeed(HttpClient.HttpClient, client)),
+        Layer.provide(configLayer)
+      )
+      const vms = yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.listManagedVms),
+        Effect.provide(layer)
+      )
+      expect(vms.map((v) => v.name).sort()).toStrictEqual([
+        "inucon-team1-1",
+        "inucon-team1-2",
+        "inucon-team2-1"
+      ])
+      expect(vms.find((v) => v.name === "inucon-team1-1")).toMatchObject({
+        vmid: 1101,
+        status: "running"
+      })
+    })
+  )
+
+  it.effect("HTTP エラーは ProxmoxError", () =>
+    Effect.gen(function* () {
+      const brokenClient = HttpClient.make((request) =>
+        Effect.succeed(jsonResponse(request, { errors: "boom" }, 500))
+      )
+      const brokenLayer = ProxmoxLive.pipe(
+        Layer.provide(Layer.succeed(HttpClient.HttpClient, brokenClient)),
+        Layer.provide(configLayer)
+      )
+      const error = yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.listManagedVms),
+        Effect.provide(brokenLayer),
+        Effect.flip
+      )
+      expect(error).toBeInstanceOf(ProxmoxError)
+    })
+  )
+})
+
 describe("resolveProxmoxTlsPolicy(TLS 方針の決定、純粋関数)", () => {
   it("PROXMOX_TLS_INSECURE=true なら insecure(検証スキップ)", () => {
     const policy = resolveProxmoxTlsPolicy({ insecure: true, fingerprint: Option.none() })

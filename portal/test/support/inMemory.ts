@@ -11,12 +11,16 @@ import {
   OperationalContestConflict,
   TeamJobAlreadyQueued
 } from "../../src/domain/errors.js"
-import type { BenchJobId, ContestId, InstanceId, TeamId } from "../../src/domain/ids.js"
+import type { BenchJobId, ContestId, InstanceId, OperationId, OperationStepId, ResourceBindingId, TeamId } from "../../src/domain/ids.js"
 import { UserId } from "../../src/domain/ids.js"
 import { Instance } from "../../src/domain/instance.js"
 import { User } from "../../src/domain/user.js"
 import type { Team } from "../../src/domain/team.js"
 import type { TeamInvite } from "../../src/domain/teamInvite.js"
+import { ResourceBinding } from "../../src/domain/resourceBinding.js"
+import { Operation, OperationStep, isOperationUnfinished } from "../../src/domain/operation.js"
+import type { NewOperation, SanitizedOperationError } from "../../src/domain/operation.js"
+import { InvalidOperationTransition } from "../../src/domain/errors.js"
 import { MemberConflict, ProvisionInProgress, QuotaExceeded } from "../../src/application/errors.js"
 import {
   BenchJobRepo,
@@ -27,10 +31,13 @@ import {
   GithubKeysPort,
   InstanceRepo,
   InviteRepo,
+  OperationInProgress,
+  OperationRepo,
   ProvisioningConfig,
   ProvisionTimeout,
   ProxmoxError,
   ProxmoxPort,
+  ResourceBindingRepo,
   RunnerConfig,
   SessionRepo,
   TeamRepo,
@@ -949,6 +956,7 @@ export type ProxmoxOperation =
   | "guestExec"
   | "getNodeFreeMemBytes"
   | "vmExists"
+  | "listManagedVms"
 
 export interface ProxmoxTestState {
   readonly clonedVmids: ReadonlyArray<number>
@@ -997,6 +1005,15 @@ type ProxmoxFailWith = Partial<Record<Exclude<ProxmoxOperation, "waitForGuestAge
   waitForGuestAgent?: ProxmoxError | ProvisionTimeout
 }
 
+// Task 7: reconciliation の inventory 用に managedVms を直接シードできる。
+// listManagedVms は既定 [] を返す(既存テストは inventory を読まないため互換)。
+export interface ManagedVmSeed {
+  readonly vmid: number
+  readonly name: string
+  readonly status: "running" | "stopped"
+  readonly memoryBytes?: number
+}
+
 export const makeProxmoxPortTest = (
   options: {
     freeMemBytes?: number
@@ -1005,6 +1022,7 @@ export const makeProxmoxPortTest = (
     // 「クラッシュ前に clone だけ成功したが progress は保存されなかった」を
     // 直接シードするための初期 vmExists 状態(Task 4 レビュー C1)。
     existingVmids?: ReadonlyArray<number>
+    managedVms?: ReadonlyArray<ManagedVmSeed>
   } = {}
 ): { layer: Layer.Layer<ProxmoxPort>; getState: Effect.Effect<ProxmoxTestState> } => {
   const stateRef = Ref.unsafeMake({ ...emptyProxmoxState, existingVmids: options.existingVmids ?? [] })
@@ -1082,7 +1100,18 @@ export const makeProxmoxPortTest = (
       guarded(
         "vmExists",
         Ref.get(stateRef).pipe(Effect.map((s) => s.existingVmids.includes(vmid)))
+      ),
+    listManagedVms: guarded(
+      "listManagedVms",
+      Effect.succeed(
+        (options.managedVms ?? []).map((v) => ({
+          vmid: v.vmid,
+          name: v.name,
+          status: v.status,
+          memoryBytes: v.memoryBytes ?? 4 * 1024 * 1024 * 1024
+        }))
       )
+    )
   })
 
   return { layer, getState: Ref.get(stateRef) }
@@ -1095,10 +1124,34 @@ export interface CloudflareTestState {
 
 const emptyCloudflareState: CloudflareTestState = { routesByHostname: {}, accessEmailsByHostname: {} }
 
-export type CloudflareOperation = "ensureInstanceRoute" | "removeInstanceRoute" | "ensureAccessApp" | "removeAccessApp"
+export type CloudflareOperation =
+  | "ensureInstanceRoute"
+  | "removeInstanceRoute"
+  | "ensureAccessApp"
+  | "removeAccessApp"
+  | "getInstanceInventory"
+
+// Task 7: reconciliation inventory を直接シードするためのオプション。
+// 既定 { routes: [], apps: [] }(既存テストは inventory を読まない)。
+export interface CloudflareInventorySeed {
+  readonly routes: ReadonlyArray<{
+    readonly hostname: string
+    readonly dnsRecordIds: ReadonlyArray<string>
+    readonly ingressServices: ReadonlyArray<string>
+  }>
+  readonly apps: ReadonlyArray<{
+    readonly hostname: string
+    readonly appIds: ReadonlyArray<string>
+    readonly policyShape: "owned_exact" | "unknown"
+    readonly emailSetHash: string
+  }>
+}
 
 export const makeCloudflarePortTest = (
-  options: { failWith?: Partial<Record<CloudflareOperation, CloudflareError>> } = {}
+  options: {
+    failWith?: Partial<Record<CloudflareOperation, CloudflareError>>
+    inventory?: CloudflareInventorySeed
+  } = {}
 ): { layer: Layer.Layer<CloudflarePort>; getState: Effect.Effect<CloudflareTestState> } => {
   const stateRef = Ref.unsafeMake(emptyCloudflareState)
 
@@ -1138,7 +1191,11 @@ export const makeCloudflarePortTest = (
           const { [hostname]: _removed, ...rest } = s.accessEmailsByHostname
           return { ...s, accessEmailsByHostname: rest }
         })
-      )
+      ),
+    getInstanceInventory: guarded(
+      "getInstanceInventory",
+      Effect.succeed(options.inventory ?? { routes: [], apps: [] })
+    )
   })
 
   return { layer, getState: Ref.get(stateRef) }
@@ -1159,3 +1216,140 @@ export const makeGithubKeysPortTest = (
         : Effect.fail(new GithubKeysError({ cause: `no keys registered for ${login}` }))
     }
   })
+
+// Task 6/7: ResourceBinding のインメモリ実装。upsert は
+// (provider, resource_type, canonical_key) の 3-tuple を key に既存を差し替える。
+// listByContest は contestId でフィルタする。
+export const makeResourceBindingRepoTest = (
+  initial: ReadonlyArray<ResourceBinding> = []
+): Layer.Layer<ResourceBindingRepo> =>
+  Layer.effect(
+    ResourceBindingRepo,
+    Effect.gen(function* () {
+      const rowsRef = yield* Ref.make<ReadonlyArray<ResourceBinding>>(initial)
+      return {
+        upsert: (binding) =>
+          Ref.update(rowsRef, (rows) => {
+            const idx = rows.findIndex(
+              (r) =>
+                r.provider === binding.provider &&
+                r.resourceType === binding.resourceType &&
+                r.canonicalKey === binding.canonicalKey
+            )
+            if (idx < 0) return [...rows, binding]
+            const next = rows.slice()
+            next[idx] = binding
+            return next
+          }),
+        listByContest: (contestId) =>
+          Ref.get(rowsRef).pipe(Effect.map((rows) => rows.filter((r) => r.contestId === contestId))),
+        deleteById: (id) => Ref.update(rowsRef, (rows) => rows.filter((r) => r.id !== id))
+      }
+    })
+  )
+
+// Task 6/7: OperationRepo のインメモリ実装。SQL 実装と同じ意味論を素直に再現する。
+// - enqueue: 未完了 Operation(status ∉ succeeded/canceled)が 1 件でもあれば OperationInProgress。
+//            0-step は defect(SQL 側と同じ契約)。
+// - findById / listSteps は単純 lookup。claimNext / completeStep 等は Task 7 の
+//   apply テストでは使わない(HTTP テスト側で SQL 実装が動く)ため未実装で defect。
+//
+// UuidGen をコンテキストから受け取る形にすると Layer グラフが複雑になるため、
+// step id は Ref カウンタで局所発番する(id の一意性だけが必要で形式は不問)。
+export const makeOperationRepoTest = (): { layer: Layer.Layer<OperationRepo>; get: (id: OperationId) => Effect.Effect<Option.Option<Operation>> } => {
+  let seq = 0
+  const nextId = () => `test-${++seq}`
+  const opsRef = Ref.unsafeMake<ReadonlyArray<Operation>>([])
+  const stepsRef = Ref.unsafeMake<ReadonlyArray<OperationStep>>([])
+
+  const layer = Layer.succeed(OperationRepo, {
+    enqueue: (input: NewOperation) =>
+      Effect.gen(function* () {
+        if (input.steps.length === 0) {
+          return yield* Effect.dieMessage(`enqueue: kind '${input.kind}' has zero steps`)
+        }
+        const existing = yield* Ref.get(opsRef)
+        if (existing.some(isOperationUnfinished)) {
+          return yield* Effect.fail(new OperationInProgress())
+        }
+        const now = Date.now()
+        const op = new Operation({
+          id: nextId() as unknown as OperationId,
+          contestId: input.contestId,
+          kind: input.kind,
+          status: "queued",
+          actor: input.actor,
+          planDigest: input.planDigest,
+          contestRevision: input.contestRevision,
+          sanitizedError: Option.none(),
+          createdAt: now,
+          startedAt: Option.none(),
+          finishedAt: Option.none()
+        })
+        yield* Ref.update(opsRef, (rows) => [...rows, op])
+        const steps = input.steps.map(
+          (s) =>
+            new OperationStep({
+              id: nextId() as unknown as OperationStepId,
+              operationId: op.id,
+              ordinal: s.ordinal,
+              stepKey: s.stepKey,
+              status: "queued",
+              attempt: 0,
+              continueOnError: s.continueOnError,
+              retryAt: Option.none(),
+              leaseExpiresAt: Option.none(),
+              inputSummary: s.inputSummary,
+              progressJson: "{}",
+              resultSummary: Option.none(),
+              sanitizedError: Option.none(),
+              createdAt: now,
+              startedAt: Option.none(),
+              finishedAt: Option.none()
+            })
+        )
+        yield* Ref.update(stepsRef, (rows) => [...rows, ...steps])
+        return op
+      }),
+    findById: (id) =>
+      Ref.get(opsRef).pipe(
+        Effect.map((rows) => Option.fromNullable(rows.find((o) => o.id === id)))
+      ),
+    listSteps: (id) =>
+      Ref.get(stepsRef).pipe(
+        Effect.map((rows) => rows.filter((s) => s.operationId === id))
+      ),
+    claimNext: () => Effect.dieMessage("makeOperationRepoTest: claimNext not implemented"),
+    completeStep: () => Effect.dieMessage("makeOperationRepoTest: completeStep not implemented"),
+    failStep: () => Effect.dieMessage("makeOperationRepoTest: failStep not implemented"),
+    blockStep: () => Effect.dieMessage("makeOperationRepoTest: blockStep not implemented"),
+    resumeExpired: () => Effect.succeed(0),
+    // review #5: 実 SQL 実装(operationRepo.ts の retry/cancel)は current
+    // status を SELECT してから InvalidOperationTransition の from に載せる。
+    // in-memory 版もこれに揃えないと、retry 対象が blocked / failed のとき
+    // 「from='succeeded'」という嘘の from が返り、from に対する assertion で
+    // regression を見落とす(review #5 の指摘)。
+    retry: (id, _now) =>
+      Ref.get(opsRef).pipe(
+        Effect.flatMap((rows) => {
+          const row = rows.find((o) => o.id === id)
+          const from = row?.status ?? ("succeeded" as const)
+          return Effect.fail(new InvalidOperationTransition({ from, to: "running" }))
+        })
+      ),
+    cancel: (id, _now) =>
+      Ref.get(opsRef).pipe(
+        Effect.flatMap((rows) => {
+          const row = rows.find((o) => o.id === id)
+          const from = row?.status ?? ("succeeded" as const)
+          return Effect.fail(new InvalidOperationTransition({ from, to: "canceled" }))
+        })
+      )
+  })
+
+  return {
+    layer,
+    get: (id: OperationId) =>
+      Ref.get(opsRef).pipe(Effect.map((rows) => Option.fromNullable(rows.find((o) => o.id === id))))
+  }
+}

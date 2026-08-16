@@ -30,7 +30,11 @@ import {
   InviteResult,
   JobAction,
   Me,
+  Operation,
   PollJobResponse,
+  ReconciliationApplyRequest,
+  ReconciliationPlan,
+  ReconciliationPlanRequest,
   RunnerFinishRequest,
   RunnerProgressRequest,
   ScoreboardEntry,
@@ -216,6 +220,38 @@ export class OperationalContestConflict extends Schema.TaggedError<OperationalCo
   "OperationalContestConflict",
   {},
   HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// Task 7: reconciliation apply の失敗マッピング。
+// - StaleReconciliationPlan: plan digest / inventory が古い(409、UI は再取得)。
+// - AmbiguousReconciliation: 分類が blocked を含む(422、operator adopt 待ち)。
+export class StaleReconciliationPlan extends Schema.TaggedError<StaleReconciliationPlan>()(
+  "StaleReconciliationPlan",
+  {},
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+export class AmbiguousReconciliation extends Schema.TaggedError<AmbiguousReconciliation>()(
+  "AmbiguousReconciliation",
+  { hostnames: Schema.Array(Schema.String) },
+  HttpApiSchema.annotations({ status: 422 })
+) {}
+
+// Task 7 review #2: 「plan は正当だが actionable が 0 件」= 既に clean な状態は
+// AmbiguousReconciliation(422) と混同されるため、専用の 409 エラーで区別する。
+export class NothingToReconcile extends Schema.TaggedError<NothingToReconcile>()(
+  "NothingToReconcile",
+  {},
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// Task 7 review round 3 #1: 上流 provider (Proxmox / Cloudflare) の失敗を
+// 500 defect にせず、明示的に 503 でマップする。UI は「provider 一時障害、
+// 数分後に再試行」と示せる。details.provider は "proxmox" / "cloudflare"。
+export class ProviderUnavailable extends Schema.TaggedError<ProviderUnavailable>()(
+  "ProviderUnavailable",
+  { provider: Schema.Literal("proxmox", "cloudflare") },
+  HttpApiSchema.annotations({ status: 503 })
 ) {}
 
 // POST /api/bench-jobs: Contest が running でない(domain の
@@ -605,6 +641,38 @@ export const runnerGroup = HttpApiGroup.make("runner")
       .middleware(RunnerAuth)
   )
 
+// Task 7: reconciliation plan/apply (durable Operation) の admin API。
+// AdminOnly。POST /plan は inventory 読み取り + 分類 + digest 計算のみで
+// mutation 無し。POST /apply は planDigest + contestRevision + adoptHostnames
+// を突き合わせ、パスすれば `reconcile` Operation を enqueue する。
+// spec §Reconciliation: apply は「plan digest と Contest revision が現在値と
+// 一致するときだけ受け付ける」「ambiguous は apply を block」。
+export const operationsGroup = HttpApiGroup.make("operations")
+  .add(
+    HttpApiEndpoint.post(
+      "planReconciliation"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/reconciliation/plan`
+      .setPayload(ReconciliationPlanRequest)
+      .addSuccess(ReconciliationPlan)
+      .addError(NotFound)
+      .addError(ProviderUnavailable)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "applyReconciliation"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/reconciliation/apply`
+      .setPayload(ReconciliationApplyRequest)
+      .addSuccess(Operation)
+      .addError(NotFound)
+      .addError(ProviderUnavailable)
+      .addError(StaleReconciliationPlan)
+      .addError(AmbiguousReconciliation)
+      .addError(NothingToReconcile)
+      .addError(OperationalContestConflict)
+      .middleware(AdminOnly)
+  )
+
 export const api = HttpApi.make("inucon")
   .add(healthGroup)
   .add(authGroup)
@@ -617,3 +685,4 @@ export const api = HttpApi.make("inucon")
   .add(benchGroup)
   .add(runnerGroup)
   .add(scoreboardGroup)
+  .add(operationsGroup)

@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "@effect/platform"
 import { Config, Effect, Layer, Redacted, Schema } from "effect"
 import type { ConfigError } from "effect/ConfigError"
 import { CloudflareError, CloudflarePort } from "../../application/ports.js"
+import { MANAGED_HOSTNAME_PATTERN } from "../../domain/reconciliation.js"
 import { describeHttpFailure, requestPath } from "../httpClientErrors.js"
 
 // Cloudflare API v4。Phase 1-2 は手動(ダッシュボード)で運用していた
@@ -86,6 +88,7 @@ const summarizeCfErrors = (
       : "(no error detail)"
   return `Cloudflare API ${req.method} ${requestPath(req)} → success:false — ${detail}`
 }
+// review #4: 命名 filter は domain/reconciliation.ts の source-of-truth を再利用。
 
 export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient.HttpClient> = Layer.effect(
   CloudflarePort,
@@ -359,7 +362,133 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
           yield* requestJson(
             HttpClientRequest.del(`${CF_API_BASE}/accounts/${accountId}/access/apps/${existingApp.id}`)
           )
+        }),
+
+      // Task 7 §Reconciliation: inucon-team\d+-\d+ prefix の DNS / ingress /
+      // Access app + policies を横断し、hostname stem 単位に畳んで返す。
+      // Access policy の include(email) は生値ではなく sorted+normalized(小文字化)
+      // した集合の SHA-256 のみを返す(spec: "Access email 一覧を operation log /
+      // response に残さない")。planner は emailSetHash で drift を検出できる。
+      getInstanceInventory: Effect.gen(function* () {
+        const allDns = yield* request(
+          HttpClientRequest.get(`${CF_API_BASE}/zones/${zoneId}/dns_records`).pipe(
+            HttpClientRequest.setUrlParam("type", "CNAME"),
+            HttpClientRequest.setUrlParam("per_page", "5000")
+          ),
+          DnsRecordsList
+        )
+        const ingress = yield* getIngress()
+        const apps = yield* request(
+          HttpClientRequest.get(`${CF_API_BASE}/accounts/${accountId}/access/apps`).pipe(
+            HttpClientRequest.setUrlParam("per_page", "5000")
+          ),
+          AccessAppsList
+        )
+
+        const managedDns = allDns.filter((r) => {
+          const stem = r.name.split(".")[0]
+          return MANAGED_HOSTNAME_PATTERN.test(stem)
         })
+        const routesByStem = new Map<string, {
+          hostname: string
+          dnsRecordIds: Array<string>
+          ingressServices: Array<string>
+        }>()
+        const ensureRoute = (stem: string) => {
+          const existing = routesByStem.get(stem)
+          if (existing !== undefined) return existing
+          const created = { hostname: stem, dnsRecordIds: [], ingressServices: [] }
+          routesByStem.set(stem, created)
+          return created
+        }
+        for (const r of managedDns) {
+          ensureRoute(r.name.split(".")[0]).dnsRecordIds.push(r.id)
+        }
+        for (const e of ingress) {
+          if (e.hostname === undefined) continue
+          const stem = e.hostname.split(".")[0]
+          if (!MANAGED_HOSTNAME_PATTERN.test(stem)) continue
+          ensureRoute(stem).ingressServices.push(e.service)
+        }
+
+        // Access apps は domain(hostname)を持つ。同 hostname に複数 app が
+        // 張られている場合は appIds に全 ID を積む(planner が ambiguous を検出)。
+        // review round 8 #1: emailSetHash の集約は「全 per-app hash を集めきってから
+        // sort + SHA-256 1 回」で確定する。以前の incremental fold は
+        // 2 apps では commutative だが 3+ で CF API の返却順に依存し、同じ CF 状態でも
+        // plan 間で hash が揺れて drift 検出が壊れていた。final hashing を loop の
+        // 外に出せば app 数によらず決定的になる。
+        interface AppStemAccum {
+          readonly hostname: string
+          readonly appIds: Array<string>
+          policyShape: "owned_exact" | "unknown"
+          readonly perAppHashes: Array<string>
+        }
+        const appsAccumByStem = new Map<string, AppStemAccum>()
+        // review #3: getPolicies を管理対象 app 数だけ直列に叩くと 50 チーム
+        // 規模で 10 秒台の inventory になり、CF rate limiter 429 も踏みやすい。
+        // concurrency 10 で並列化しつつ、hostname 単位の集約は決定的に行う。
+        const managed = apps.filter((app) => MANAGED_HOSTNAME_PATTERN.test(app.domain.split(".")[0]))
+        const fetched = yield* Effect.forEach(
+          managed,
+          (app) =>
+            getPolicies(app.id).pipe(Effect.map((policies) => ({ app, policies }))),
+          { concurrency: 10 }
+        )
+        for (const { app, policies } of fetched) {
+          const stem = app.domain.split(".")[0]
+          // 「owned_exact」= 1 個の allow policy かつ include が email のみで
+          // 構成される、を満たす形。それ以外は unknown(誤って削除しない)。
+          const allowPolicies = policies.filter((p) => p.decision === "allow")
+          const only = allowPolicies.length === 1 ? allowPolicies[0] : undefined
+          const emailsOnly =
+            only !== undefined && only.include.length > 0 && only.include.every(isEmailInclude)
+          const emails = emailsOnly && only !== undefined
+            ? only.include
+                .filter(isEmailInclude)
+                .map((i) => i.email.email.trim().toLowerCase())
+            : []
+          const sortedUnique = Array.from(new Set(emails)).sort()
+          // 生 email はここで即破棄する。perAppHash だけを蓄積する。
+          const perAppHash = createHash("sha256").update(sortedUnique.join("\n")).digest("hex")
+          const existing = appsAccumByStem.get(stem)
+          if (existing === undefined) {
+            appsAccumByStem.set(stem, {
+              hostname: stem,
+              appIds: [app.id],
+              policyShape: emailsOnly ? "owned_exact" : "unknown",
+              perAppHashes: [perAppHash]
+            })
+          } else {
+            existing.appIds.push(app.id)
+            existing.policyShape = "unknown"
+            existing.perAppHashes.push(perAppHash)
+          }
+        }
+
+        const appsByStem = Array.from(appsAccumByStem.values()).map((accum) => {
+          // 1 app のときは per-app hash をそのまま使い、複数 app のときは全 hash を
+          // sort して concat し SHA-256 で 1 回だけ潰す(順序非依存)。
+          const emailSetHash =
+            accum.perAppHashes.length === 1
+              ? accum.perAppHashes[0]
+              : createHash("sha256")
+                  .update(accum.perAppHashes.slice().sort().join("|"))
+                  .digest("hex")
+          return {
+            hostname: accum.hostname,
+            appIds: accum.appIds,
+            policyShape: accum.policyShape,
+            emailSetHash
+          }
+        })
+
+        return {
+          routes: Array.from(routesByStem.values()),
+          apps: appsByStem
+        }
+      })
     }
   })
 )
+

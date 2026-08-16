@@ -368,3 +368,113 @@ export const ScoreboardEntry = Schema.Struct({
   latestAt: Schema.NullOr(Schema.Int)
 })
 export type ScoreboardEntry = typeof ScoreboardEntry.Type
+
+// Task 7: reconciliation plan の wire 表現。domain/reconciliation.ts と同型で、
+// 生 email / bearer / provider ID は含まない(hostname / classification /
+// action / 観測件数 / sanitized reason のみ)。
+export const ReconciliationClass = Schema.Literal(
+  "in_sync",
+  "missing",
+  "drifted",
+  "managed_orphan",
+  "unmanaged_orphan",
+  "ambiguous"
+)
+export type ReconciliationClass = typeof ReconciliationClass.Type
+
+export const ReconciliationAction = Schema.Literal("noop", "cleanup", "adopt_cleanup", "blocked")
+export type ReconciliationAction = typeof ReconciliationAction.Type
+
+export const ReconciliationEntry = Schema.Struct({
+  hostname: Schema.String,
+  classification: ReconciliationClass,
+  action: ReconciliationAction,
+  reason: Schema.String,
+  proxmoxVmObserved: Schema.Boolean,
+  cloudflareRouteCount: Schema.Int,
+  cloudflareIngressCount: Schema.Int,
+  cloudflareAppCount: Schema.Int,
+  bindingIds: Schema.Array(ResourceBindingId),
+  instanceId: Schema.NullOr(InstanceId)
+})
+export type ReconciliationEntry = typeof ReconciliationEntry.Type
+
+export const ReconciliationPlan = Schema.Struct({
+  contestId: ContestId,
+  contestRevision: Schema.Int.pipe(Schema.positive()),
+  planDigest: Schema.String,
+  generatedAt: Schema.Int,
+  entries: Schema.Array(ReconciliationEntry),
+  adoptHostnames: Schema.Array(Schema.String)
+})
+export type ReconciliationPlan = typeof ReconciliationPlan.Type
+
+export const ReconciliationPlanRequest = Schema.Struct({
+  adoptHostnames: Schema.Array(Schema.String)
+})
+export type ReconciliationPlanRequest = typeof ReconciliationPlanRequest.Type
+
+// review round 8 #2: 以前は planDigest と別に contestRevision を受けていたが、
+// planDigest は contestRevision を digest 材料に含むため、planDigest 一致 ⇒
+// contestRevision 一致で dead check になっていた(round 3 で dead 分岐を
+// 削除済み)。UI に「stale revision を弾く」誤解を招く dead surface だったので
+// wire からも外す。楽観ロックは planDigest のみで機能する。
+export const ReconciliationApplyRequest = Schema.Struct({
+  planDigest: Schema.String,
+  adoptHostnames: Schema.Array(Schema.String)
+})
+export type ReconciliationApplyRequest = typeof ReconciliationApplyRequest.Type
+
+// Task 7: Operation の wire 表現。durable operation の enqueue 応答 / 取得で使う。
+// sanitizedError は非機密 code + summary + details のみ(domain の
+// SanitizedOperationError と同型)。
+export const OperationKind = Schema.Literal(
+  "reconcile",
+  "enter_contest_mode",
+  "prepare",
+  "start",
+  "finish",
+  "revoke_access",
+  "cleanup",
+  "return_normal_mode",
+  "backup"
+)
+export type OperationKind = typeof OperationKind.Type
+
+export const OperationStatus = Schema.Literal(
+  "queued",
+  "running",
+  "succeeded",
+  "failed",
+  "blocked",
+  "canceled"
+)
+export type OperationStatus = typeof OperationStatus.Type
+
+export const SanitizedOperationError = Schema.Struct({
+  code: Schema.String,
+  summary: Schema.String,
+  details: Schema.Record({ key: Schema.String, value: Schema.String })
+})
+export type SanitizedOperationError = typeof SanitizedOperationError.Type
+
+export const OperationActor = Schema.Union(
+  Schema.Struct({ kind: Schema.Literal("admin"), userId: UserId }),
+  Schema.Struct({ kind: Schema.Literal("scheduler") })
+)
+export type OperationActor = typeof OperationActor.Type
+
+export const Operation = Schema.Struct({
+  id: OperationId,
+  contestId: ContestId,
+  kind: OperationKind,
+  status: OperationStatus,
+  actor: OperationActor,
+  planDigest: Schema.String,
+  contestRevision: Schema.Int.pipe(Schema.positive()),
+  sanitizedError: Schema.NullOr(SanitizedOperationError),
+  createdAt: Schema.Int,
+  startedAt: Schema.NullOr(Schema.Int),
+  finishedAt: Schema.NullOr(Schema.Int)
+})
+export type Operation = typeof Operation.Type

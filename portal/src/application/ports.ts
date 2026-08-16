@@ -372,6 +372,16 @@ export class ProxmoxPort extends Context.Tag("app/ProxmoxPort")<
       command: ReadonlyArray<string>
     }) => Effect.Effect<{ exitcode: number; out: string }, ProxmoxError>
     readonly getNodeFreeMemBytes: Effect.Effect<number, ProxmoxError>
+    // Task 7: reconciliation 向け inventory。qemu 一覧を叩き、name が
+    // `^inucon-team[0-9]+-[0-9]+$` に一致する VM のみを返す(template や
+    // devvm/benchvm 等は絶対に混ぜない)。memoryBytes は maxmem(config 上限)
+    // を採用し、可用性計算とは別関心とする(runtime free は getNodeFreeMemBytes)。
+    readonly listManagedVms: Effect.Effect<ReadonlyArray<{
+      readonly vmid: number
+      readonly name: string
+      readonly status: "running" | "stopped"
+      readonly memoryBytes: number
+    }>, ProxmoxError>
   }
 >() {}
 
@@ -392,6 +402,25 @@ export class CloudflarePort extends Context.Tag("app/CloudflarePort")<
       emails: ReadonlyArray<string>
     }) => Effect.Effect<void, CloudflareError>
     readonly removeAccessApp: (hostname: string) => Effect.Effect<void, CloudflareError>
+    // Task 7: reconciliation 向け inventory。DNS / tunnel ingress / Access app /
+    // policies を横断して読み、hostname prefix が `inucon-team\d+-\d+` の
+    // resource だけを stem(FQDN の先頭ラベル)にまとめて返す。生 email は
+    // 絶対に返さない — Access policy の include(email) は sorted+normalized
+    // (小文字化)後に SHA-256 のみを返す(spec §credential:「Access email
+    // 一覧を operation log / response に残さない」)。
+    readonly getInstanceInventory: Effect.Effect<{
+      readonly routes: ReadonlyArray<{
+        readonly hostname: string
+        readonly dnsRecordIds: ReadonlyArray<string>
+        readonly ingressServices: ReadonlyArray<string>
+      }>
+      readonly apps: ReadonlyArray<{
+        readonly hostname: string
+        readonly appIds: ReadonlyArray<string>
+        readonly policyShape: "owned_exact" | "unknown"
+        readonly emailSetHash: string
+      }>
+    }, CloudflareError>
   }
 >() {}
 
@@ -535,5 +564,16 @@ export class OperationWorkerConfig extends Context.Tag("app/OperationWorkerConfi
     readonly retryMaxMillis: number
     readonly maxAttempts: number
     readonly leaseDurationMillis: number
+  }
+>() {}
+
+// Task 7 review round 3 #2: hostname → FQDN の zone suffix を env に外出しする。
+// 従来は reconciliation.ts / usecases/provisioning.ts に `kisen.one` を hard-code
+// していたが、zone を切替えたときに片方だけ古い suffix を使い続けて silent
+// no-op を起こす事故があった。`CF_ZONE_NAME` を single source of truth にする。
+export class HostnameConfig extends Context.Tag("app/HostnameConfig")<
+  HostnameConfig,
+  {
+    readonly zoneName: string
   }
 >() {}

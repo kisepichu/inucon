@@ -27,14 +27,21 @@ export const ProxmoxPortStubLive: Layer.Layer<ProxmoxPort> = Layer.succeed(Proxm
   vmExists: () => Effect.fail(new ProxmoxError({ cause: DISABLED_MESSAGE })),
   waitForGuestAgent: () => Effect.fail(new ProxmoxError({ cause: DISABLED_MESSAGE })),
   guestExec: () => Effect.fail(new ProxmoxError({ cause: DISABLED_MESSAGE })),
-  getNodeFreeMemBytes: Effect.fail(new ProxmoxError({ cause: DISABLED_MESSAGE }))
+  getNodeFreeMemBytes: Effect.fail(new ProxmoxError({ cause: DISABLED_MESSAGE })),
+  // Task 7: 未設定時の reconciliation plan は「Proxmox 側は observation 無し」と
+  // して振る舞う(空配列)。ambiguous 誤検出を避けるため fail ではなく空を返す
+  // — CF 側の resource は unmanaged_orphan として現れるが blocked のままに
+  // なるので operator が明示 adopt しない限り安全側。
+  listManagedVms: Effect.succeed([])
 })
 
 export const CloudflarePortStubLive: Layer.Layer<CloudflarePort> = Layer.succeed(CloudflarePort, {
   ensureInstanceRoute: () => Effect.fail(new CloudflareError({ cause: DISABLED_MESSAGE })),
   removeInstanceRoute: () => Effect.fail(new CloudflareError({ cause: DISABLED_MESSAGE })),
   ensureAccessApp: () => Effect.fail(new CloudflareError({ cause: DISABLED_MESSAGE })),
-  removeAccessApp: () => Effect.fail(new CloudflareError({ cause: DISABLED_MESSAGE }))
+  removeAccessApp: () => Effect.fail(new CloudflareError({ cause: DISABLED_MESSAGE })),
+  // 上記 listManagedVms と同じ理由で inventory は空で返す(fail ではなく)。
+  getInstanceInventory: Effect.succeed({ routes: [], apps: [] })
 })
 
 export const GithubKeysPortStubLive: Layer.Layer<GithubKeysPort> = Layer.succeed(GithubKeysPort, {

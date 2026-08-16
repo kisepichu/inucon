@@ -4,6 +4,7 @@ import { Clock, Config, Effect, Either, Layer, Option, Redacted, Schema } from "
 import type { ConfigError } from "effect/ConfigError"
 import type * as Https from "node:https"
 import { ProvisionTimeout, ProxmoxError, ProxmoxPort } from "../../application/ports.js"
+import { MANAGED_HOSTNAME_PATTERN } from "../../domain/reconciliation.js"
 import { describeHttpFailure, requestPath } from "../httpClientErrors.js"
 
 // Proxmox VE API(https://192.0.2.10:8006/api2/json)。トークン認証。
@@ -55,6 +56,21 @@ const ExecStatusResponse = Schema.Struct({ data: ExecStatus })
 const NodeStatusResponse = Schema.Struct({
   data: Schema.Struct({ memory: Schema.Struct({ free: Schema.Int }) })
 })
+
+// Task 7 §Reconciliation: qemu 一覧の必要フィールドだけ抜き出す。
+// PVE の GET /nodes/<node>/qemu は maxmem/mem/status/name/vmid/template を返す。
+// template は既定 0(non-template)/1(template)で integer。managed VM の判定は
+// 名前パターンで別途行うため、ここでは template を除外しないでそのまま受ける。
+const VmListEntry = Schema.Struct({
+  vmid: Schema.Int,
+  name: Schema.optional(Schema.String),
+  status: Schema.String,
+  maxmem: Schema.optional(Schema.Union(Schema.Int, Schema.String)),
+  template: Schema.optional(Schema.Union(Schema.Int, Schema.String))
+})
+const VmListResponse = Schema.Struct({ data: Schema.Array(VmListEntry) })
+
+// review #4: 命名 filter は domain/reconciliation.ts の source-of-truth を再利用。
 
 // --- 汎用ポーリングヘルパー ---
 // TestClock 経由で決定的にテストできるよう、Clock.currentTimeMillis で
@@ -407,6 +423,25 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
 
       getNodeFreeMemBytes: request(HttpClientRequest.get(`${nodeUrl}/status`), NodeStatusResponse).pipe(
         Effect.map((r) => r.data.memory.free)
+      ),
+
+      // Task 7 §Reconciliation: qemu 一覧のうち name が
+      // `^inucon-team\d+-\d+$` に一致する VM のみを返す。template と
+      // devvm/benchvm 等の共有インフラ VM は絶対に混ぜない(cleanup が誤って
+      // 触らないよう source of truth 段階で除外する)。status は "running" /
+      // "stopped" 以外を PVE が返す可能性(paused 等)を安全側に "stopped" に
+      // 畳む(reconciliation は状態機械のガードには使わないため実害は無い)。
+      listManagedVms: request(HttpClientRequest.get(`${nodeUrl}/qemu`), VmListResponse).pipe(
+        Effect.map((r) =>
+          r.data
+            .filter((v) => v.name !== undefined && MANAGED_HOSTNAME_PATTERN.test(v.name))
+            .map((v) => ({
+              vmid: v.vmid,
+              name: v.name as string,
+              status: (v.status === "running" ? "running" : "stopped") as "running" | "stopped",
+              memoryBytes: typeof v.maxmem === "string" ? Number(v.maxmem) : (v.maxmem ?? 0)
+            }))
+        )
       )
     }
   })

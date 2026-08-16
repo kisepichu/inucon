@@ -6,6 +6,7 @@ import { Config, Effect, Layer, Option } from "effect"
 import { api } from "shared"
 import {
   AuthConfig,
+  HostnameConfig,
   OperationHandlerRegistry,
   OperationWorkerConfig,
   ProvisioningConfig,
@@ -18,6 +19,7 @@ import {
   DEFAULT_OPERATION_RETRY_BASE_MILLIS,
   DEFAULT_OPERATION_RETRY_MAX_MILLIS
 } from "./application/usecases/operations.js"
+import { makeReconciliationHandler } from "./application/usecases/reconciliation.js"
 import { CloudflareLive } from "./infrastructure/cloudflare/client.js"
 import { GithubKeysLive } from "./infrastructure/github/keys.js"
 import { GithubOAuthLive } from "./infrastructure/github/oauth.js"
@@ -28,6 +30,7 @@ import { ContestLive, ContestsLive } from "./infrastructure/http/handlers/contes
 import { ContestAdminLive } from "./infrastructure/http/handlers/contestAdmin.js"
 import { HealthLive } from "./infrastructure/http/handlers/health.js"
 import { InstancesLive } from "./infrastructure/http/handlers/instances.js"
+import { OperationsLive } from "./infrastructure/http/handlers/operations.js"
 import { RunnerLive } from "./infrastructure/http/handlers/runner.js"
 import { ScoreboardLive } from "./infrastructure/http/handlers/scoreboard.js"
 import { TeamsLive } from "./infrastructure/http/handlers/teams.js"
@@ -106,6 +109,16 @@ const OperationWorkerConfigLive = Layer.effect(
     )
     return { pollIntervalMillis, retryBaseMillis, retryMaxMillis, maxAttempts, leaseDurationMillis }
   })
+)
+
+// Task 7 review round 3 #2: reconciliation handler / provisioning が使う
+// zone suffix を env に外出しする。既定 "kisen.one"(現行本番と同値、後方互換)。
+const HostnameConfigLive = Layer.effect(
+  HostnameConfig,
+  Config.string("CF_ZONE_NAME").pipe(
+    Config.withDefault("kisen.one"),
+    Effect.map((zoneName) => ({ zoneName }))
+  )
 )
 const ReposLive = Layer.mergeAll(
   UserRepoLive,
@@ -217,7 +230,8 @@ const ApiLive = HttpApiBuilder.api(api).pipe(
       ContestAdminLive,
       BenchLive,
       RunnerLive,
-      ScoreboardLive
+      ScoreboardLive,
+      OperationsLive
     )
   ),
   Layer.provide(AuthenticationLive),
@@ -287,21 +301,34 @@ const WorkerLive = TimeoutSweeperLive.pipe(
 )
 
 
-// Task 6: registry は本タスクではハンドラを一切登録しない(Task 7 以降で
-// provider Layer に応じて拡張)。ハンドラ未登録の kind/stepKey の Step は
-// worker が blockStep で configuration_error を打つ(operator 介入待ち)ので、
-// DB-only Operation(Task 11 の start/finalize/archive など)が provider 設定
-// なしで動かせるという spec §Step 5 の要件を満たす。
-const OperationHandlerRegistryLive = Layer.succeed(OperationHandlerRegistry, {
-  lookup: () => Option.none()
-})
+// Task 7: reconcile Operation の step 実行 handler を登録。CloudflarePort
+// (InstancePortsLive) 経由で DNS/tunnel/Access を冪等に撤収する。他 kind
+// (start/finish/backup 等) の handler は Task 11/12 で追加する。
+const OperationHandlerRegistryLive = Layer.effect(
+  OperationHandlerRegistry,
+  Effect.gen(function* () {
+    const reconcileHandler = yield* makeReconciliationHandler
+    return {
+      lookup: (kind, stepKey) =>
+        kind === "reconcile" && stepKey.startsWith("reconcile:")
+          ? Option.some(reconcileHandler)
+          : Option.none()
+    }
+  })
+)
 
 // OperationWorkerLive は DB のみに依存する(handler 登録は現状無し)。
 // TimeoutSweeperLive と同じく MigratorLive を依存として明示し、migration 未完了
 // のうちの 1 tick が "no such table" にならないようにする。
 const OperationWorkerConditionalLive = OperationWorkerLive.pipe(
   Layer.provide(OperationWorkerConfigLive),
-  Layer.provide(OperationHandlerRegistryLive),
+  Layer.provide(
+    OperationHandlerRegistryLive.pipe(
+      Layer.provide(InstancePortsLive),
+      Layer.provide(ReposLive),
+      Layer.provide(HostnameConfigLive)
+    )
+  ),
   Layer.provide(ReposLive),
   Layer.provide(MigratorLive)
 )

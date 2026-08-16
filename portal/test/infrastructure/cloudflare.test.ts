@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "@effect/platform"
 import { it } from "@effect/vitest"
 import { ConfigProvider, Effect, Layer } from "effect"
@@ -63,7 +64,9 @@ const makeFakeCf = (initial?: Partial<FakeState>) => {
     // --- DNS records ---
     if (path === "/client/v4/zones/zone-1/dns_records" && method === "GET") {
       const name = url.searchParams.get("name")
-      const matches = state.dnsRecords.filter((r) => r.name === name)
+      const matches = name === null
+        ? state.dnsRecords
+        : state.dnsRecords.filter((r) => r.name === name)
       return Effect.succeed(jsonResponse(request, { success: true, result: matches }))
     }
     if (path === "/client/v4/zones/zone-1/dns_records" && method === "POST") {
@@ -621,6 +624,113 @@ describe("removeAccessApp", () => {
       expect(cause).toContain("7003")
       expect(cause).toContain("Not authorized")
       expect(cause).not.toContain("test-cf-token")
+    })
+  )
+})
+
+// Task 7: reconciliation 向け inventory メソッド。DNS + tunnel ingress + Access
+// app + policies を横断し、hostname prefix (inucon-team\d+-\d+) の resource
+// だけを sanitized な形で返す。email 値は生では返さない(SHA-256 のみ)。
+describe("getInstanceInventory", () => {
+  it.effect("inucon-team* prefix の DNS / ingress / app / policy をまとめて返す。email は SHA-256 で返し、生の値は残さない", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeCf({
+        dnsRecords: [
+          { id: "dns-1", type: "CNAME", name: "inucon-team1-1.kisen.one", content: "tunnel.cfargotunnel.com", proxied: true },
+          { id: "dns-2", type: "CNAME", name: "inucon-team2-1.kisen.one", content: "tunnel.cfargotunnel.com", proxied: true },
+          { id: "dns-x", type: "CNAME", name: "portal.kisen.one", content: "tunnel.cfargotunnel.com", proxied: true }
+        ],
+        ingress: [
+          { hostname: "inucon-team1-1.kisen.one", service: "ssh://10.100.1.11:22" },
+          { hostname: "inucon-team2-1.kisen.one", service: "ssh://10.100.2.11:22" },
+          { hostname: "portal.kisen.one", service: "http://10.0.0.1:3000" },
+          { hostname: undefined, service: "http_status:404" }
+        ],
+        accessApps: [
+          {
+            id: "app-1",
+            domain: "inucon-team1-1.kisen.one",
+            policies: [
+              {
+                id: "policy-1",
+                decision: "allow",
+                include: [
+                  { email: { email: "Alice@Example.com" } },
+                  { email: { email: "bob@example.com" } }
+                ]
+              }
+            ]
+          },
+          {
+            id: "app-2",
+            domain: "inucon-team2-1.kisen.one",
+            policies: [
+              {
+                id: "policy-2",
+                decision: "allow",
+                include: [
+                  { email_domain: { domain: "example.com" } }
+                ]
+              }
+            ]
+          },
+          {
+            id: "app-portal",
+            domain: "portal.kisen.one",
+            policies: []
+          }
+        ]
+      })
+      const inventory = yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) => cf.getInstanceInventory),
+        Effect.provide(portLayer(fake))
+      )
+
+      // portal.kisen.one / catch-all は絶対に含まれない
+      expect(inventory.routes.map((r) => r.hostname).sort()).toEqual([
+        "inucon-team1-1",
+        "inucon-team2-1"
+      ])
+      expect(inventory.apps.map((a) => a.hostname).sort()).toEqual([
+        "inucon-team1-1",
+        "inucon-team2-1"
+      ])
+
+      const t1 = inventory.apps.find((a) => a.hostname === "inucon-team1-1")!
+      expect(t1.policyShape).toBe("owned_exact")
+      // email は生の値を含まず、sorted+normalized(小文字) の SHA-256 hex
+      // top-level static import は import 群にまとめてある(createHash)。
+      const expectedHash = createHash("sha256")
+        .update("alice@example.com\nbob@example.com")
+        .digest("hex")
+      expect(t1.emailSetHash).toBe(expectedHash)
+
+      const t2 = inventory.apps.find((a) => a.hostname === "inucon-team2-1")!
+      // email_domain のみ → owned_exact ではない
+      expect(t2.policyShape).toBe("unknown")
+
+      // response 全体を JSON 化して生 email が含まれないことを確認
+      const serialized = JSON.stringify(inventory)
+      expect(serialized).not.toContain("alice")
+      expect(serialized).not.toContain("Alice")
+      expect(serialized).not.toContain("bob@")
+    })
+  )
+
+  it.effect("DNS レコードが重複していれば dnsRecordIds に複数入り、planner が ambiguous を判定できる", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeCf({
+        dnsRecords: [
+          { id: "dns-a", type: "CNAME", name: "inucon-team1-1.kisen.one", content: "tunnel.cfargotunnel.com", proxied: true },
+          { id: "dns-b", type: "CNAME", name: "inucon-team1-1.kisen.one", content: "tunnel.cfargotunnel.com", proxied: true }
+        ]
+      })
+      const inventory = yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) => cf.getInstanceInventory),
+        Effect.provide(portLayer(fake))
+      )
+      const t1 = inventory.routes.find((r) => r.hostname === "inucon-team1-1")!
+      expect(t1.dnsRecordIds.slice().sort()).toEqual(["dns-a", "dns-b"])
     })
   )
 })

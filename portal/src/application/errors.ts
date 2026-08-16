@@ -81,3 +81,22 @@ export class InstanceInUse extends Data.TaggedError("InstanceInUse")<{
 export class InstanceNotRunning extends Data.TaggedError("InstanceNotRunning")<{
   instanceId: InstanceId
 }> {}
+
+// Task 7: reconciliation apply の失敗。plan digest が現在の (inventory + DB)
+// から再計算した digest と食い違う = ブラウザが古い plan を送っている / 別 admin
+// が既に変えた等。詳細は返さない(生 inventory を含まない一様な typed error)。
+// spec §Reconciliation: "ambiguous は apply を block し、runbook と対象 ID を
+// 表示する" — その典型が unmanaged_orphan + adopt 未確認、および ambiguous 分類。
+// 呼び出し元は plan.entries に何が blocked かを見て操作者に確認を促す。
+export class StaleReconciliationPlan extends Data.TaggedError("StaleReconciliationPlan")<{}> {}
+
+export class AmbiguousReconciliation extends Data.TaggedError("AmbiguousReconciliation")<{
+  readonly hostnames: ReadonlyArray<string>
+}> {}
+
+// Task 7 review #2: 「plan は正当だが actionable な entry が 0 件」= 既に clean
+// を、AmbiguousReconciliation(hostnames=[]) で表現していたが、これは blocked
+// orphan と同じ 422 応答になり client 側から区別できなかった。専用エラーを
+// 用意して 409 (Conflict: 適用対象なし) に落とす。UI は「既に clean です」
+// と表示できる。
+export class NothingToReconcile extends Data.TaggedError("NothingToReconcile")<{}> {}

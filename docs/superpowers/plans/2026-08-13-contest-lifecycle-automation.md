@@ -744,6 +744,40 @@ git add shared/src/schemas.ts shared/src/api.ts portal/src/domain/reconciliation
 git commit --no-gpg-sign -m "feat(ops): reconcile provider resources"
 ```
 
+#### Task 7 follow-ups (2026-08-16, PR #61 review)
+
+PR #61 (feat/contest-reconciliation) は vertical slice として merge。以下の Claude
+review findings は本 PR の scope 外として、明示的に後続 task へ移送する:
+
+- **[Task 12 (cleanup Operation) 領域]** reconciliation step handler の
+  provider inventory 再取得を「plan で観測した resource ID を step の
+  `inputSummary` に持ち込み、CloudflarePort に追加する `getHostnameObservation`
+  (per-hostname point check) で確認する」形に refactor する。現行 vertical slice
+  では team slot が 2 個なので `getInstanceInventory` を step ごとに呼んでも
+  CF 1200 req/5min limit の 33% 未満で顕在化しないが、Task 9(複数 team
+  prepare)/Task 12(全 team cleanup)で N が伸びると rate limit を踏むリスクが
+  ある。port shape の変更は Task 12 の cleanup Operation と一括で入れる。
+- **[Task 12 領域]** cleanup handler は現在 Cloudflare binding + CF resource
+  だけを撤収する。Proxmox VM binding の削除と Instance の
+  `deleting → deleted` 遷移は Task 12 の cleanup Operation が引き取る前提で
+  reason=`missing_clean_pending_db` / `managed_orphan_clean` を返す設計に
+  している(review round 5/6)。Task 12 実装時に:
+  - VM binding を削除する経路(`stopAndDestroyVm` 成功後の
+    `resource_bindings` 行削除)
+  - Instance を `deleted` に落とす経路(readiness `previous_cleanup` gate と
+    整合)
+  を追加する。
+- **[Task 13 (Reconciliation UI) 領域]** reason 文字列
+  (`unmanaged_clean` / `missing_clean_pending_db` /
+  `drifted_awaiting_reprovision` / `managed_orphan_clean` /
+  `ambiguous_on_reobserve` / `hostname_adopted_concurrently` /
+  `duplicate_provider_records` / `requires_adopt_confirmation` /
+  `adopted_for_cleanup` / `in_sync` / `vm_missing` /
+  `cloudflare_missing` / `instance_deleted_bindings_remain`)を UI で明示的に
+  表示し、operator が「今何が blocked/pending か」を機械的に区別できるように
+  する(現状は wire で reason が渡っているだけで UI 側の label mapping は
+  未実装)。
+
 ---
 
 ### Task 8: Infrastructure readiness and safe contest-mode operation
