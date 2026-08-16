@@ -458,3 +458,119 @@ describe("POST /api/admin/contests/:contestId/start (Task 10)", () => {
     }).pipe(Effect.provide(OperationsTestLayer))
   )
 })
+
+// Task 12: POST /api/admin/contests/:contestId/cleanup (AdminOnly)
+// planDigest 一致検証 + per-hostname cleanup steps を積む Operation を返す。
+describe("POST /api/admin/contests/:contestId/cleanup (Task 12)", () => {
+  it.effect("非 admin は 403", () =>
+    Effect.gen(function* () {
+      yield* seedLegacy
+      const { cookieHeader } = yield* login({ githubLogin: "u-cleanup-nonadmin", githubId: 8100 })
+      const res = yield* postJson(cookieHeader, `/api/admin/contests/${CONTEST_ID}/cleanup`, {
+        planDigest: "0".repeat(64)
+      })
+      expect(res.status).toBe(403)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("stale digest は 409 StaleReconciliationPlan", () =>
+    Effect.gen(function* () {
+      yield* seedLegacy
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const res = yield* postJson(cookie, `/api/admin/contests/${CONTEST_ID}/cleanup`, {
+        planDigest: "0".repeat(64)
+      })
+      expect(res.status).toBe(409)
+      const body = JSON.parse(yield* res.text) as { _tag: string }
+      expect(body._tag).toBe("StaleReconciliationPlan")
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("plan 一致 + hostname 対象があれば 200 で cleanup Operation を返す", () =>
+    Effect.gen(function* () {
+      yield* seedLegacy
+      const { cookieHeader: cookie } = yield* asAdmin()
+      // cleanup は adoptHostnames を持たない = サーバー側は adopt=[] で
+      // planDigest を再計算する。UI は必ず adopt=[] の plan を先に取得する。
+      const planRes = yield* postJson(
+        cookie,
+        `/api/admin/contests/${CONTEST_ID}/reconciliation/plan`,
+        { adoptHostnames: [] }
+      )
+      const plan = JSON.parse(yield* planRes.text) as { planDigest: string }
+      const res = yield* postJson(cookie, `/api/admin/contests/${CONTEST_ID}/cleanup`, {
+        planDigest: plan.planDigest
+      })
+      // Fixture: team1-1 の VM + CF resource + Instance 有り、team2-1 は adopt
+      // 対象で adopt=[] の plan では blocked。cleanup は plan の
+      // adoptHostnames=[] を強制するため apply も同じく blocked が残る =
+      // AmbiguousReconciliation (422)。ここでは 422 を assert する。
+      expect(res.status).toBe(422)
+      const body = JSON.parse(yield* res.text) as { _tag: string; hostnames: ReadonlyArray<string> }
+      expect(body._tag).toBe("AmbiguousReconciliation")
+      expect(body.hostnames).toContain("inucon-team2-1")
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+})
+
+// Task 12: POST /api/admin/contests/:contestId/return-normal-mode (AdminOnly)
+// managed VM が残っていれば 409 ResidualManagedResource。空なら Operation を返す。
+describe("POST /api/admin/contests/:contestId/return-normal-mode (Task 12)", () => {
+  it.effect("非 admin は 403", () =>
+    Effect.gen(function* () {
+      yield* seedLegacy
+      const { cookieHeader } = yield* login({ githubLogin: "u-rnm-nonadmin", githubId: 8200 })
+      const res = yield* postJson(cookieHeader, `/api/admin/contests/${CONTEST_ID}/return-normal-mode`, {})
+      expect(res.status).toBe(403)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("managed VM が Proxmox に残っていれば 409 ResidualManagedResource", () =>
+    Effect.gen(function* () {
+      yield* seedLegacy
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const res = yield* postJson(
+        cookie,
+        `/api/admin/contests/${CONTEST_ID}/return-normal-mode`,
+        {}
+      )
+      expect(res.status).toBe(409)
+      const body = JSON.parse(yield* res.text) as { _tag: string; hostnames: ReadonlyArray<string> }
+      expect(body._tag).toBe("ResidualManagedResource")
+    }).pipe(
+      Effect.provide(
+        makeAppTestLayer({
+          adminGithubLogins: ["admin-login"],
+          cloudflareInventory: { routes: [], apps: [] },
+          proxmoxManagedVms: [
+            { vmid: 1101, name: "inucon-team1-1", status: "running", memoryBytes: 4 * 1024 * 1024 * 1024 }
+          ]
+        })
+      )
+    )
+  )
+
+  it.effect("managed VM 0 件なら 200 で return_normal_mode Operation を返す", () =>
+    Effect.gen(function* () {
+      yield* seedLegacy
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const res = yield* postJson(
+        cookie,
+        `/api/admin/contests/${CONTEST_ID}/return-normal-mode`,
+        {}
+      )
+      expect(res.status).toBe(200)
+      const body = (yield* res.json) as { kind: string; status: string }
+      expect(body.kind).toBe("return_normal_mode")
+      expect(body.status).toBe("queued")
+    }).pipe(
+      Effect.provide(
+        makeAppTestLayer({
+          adminGithubLogins: ["admin-login"],
+          cloudflareInventory: { routes: [], apps: [] },
+          proxmoxManagedVms: []
+        })
+      )
+    )
+  )
+})

@@ -38,6 +38,14 @@ import {
   makeStartContestHandler,
   START_CONTEST_STEP_KEY
 } from "./application/usecases/startOperation.js"
+import {
+  CLEANUP_MARK_COMPLETED_STEP_KEY,
+  makeCleanupHandler,
+  makeReturnNormalModeHandler,
+  makeRevokeAccessHandler,
+  RETURN_NORMAL_MODE_STEP_KEYS,
+  REVOKE_ACCESS_STEP_KEY
+} from "./application/usecases/cleanup.js"
 import { CloudflareLive } from "./infrastructure/cloudflare/client.js"
 import { BackupPortLive } from "./infrastructure/backup/sqlite.js"
 import { GithubKeysLive } from "./infrastructure/github/keys.js"
@@ -368,6 +376,10 @@ const OperationHandlerRegistryLive = Layer.effect(
     const startHandler = yield* makeStartContestHandler
     const finalizationHandler = yield* makeContestFinalizationHandler
     const enterModeStepKeys: ReadonlyArray<string> = ENTER_CONTEST_MODE_STEP_KEYS
+    const revokeAccessHandler = yield* makeRevokeAccessHandler
+    const cleanupHandler = yield* makeCleanupHandler
+    const returnNormalModeHandler = yield* makeReturnNormalModeHandler
+    const returnNormalModeStepKeys: ReadonlyArray<string> = RETURN_NORMAL_MODE_STEP_KEYS
     return {
       lookup: (kind, stepKey) => {
         if (kind === "reconcile" && stepKey.startsWith("reconcile:")) {
@@ -384,6 +396,15 @@ const OperationHandlerRegistryLive = Layer.effect(
         }
         if ((kind === "finish" || kind === "backup") && FINALIZATION_STEP_KEYS.includes(stepKey)) {
           return Option.some(finalizationHandler)
+        }
+        if (kind === "revoke_access" && stepKey === REVOKE_ACCESS_STEP_KEY) {
+          return Option.some(revokeAccessHandler)
+        }
+        if (kind === "cleanup" && (stepKey.startsWith("cleanup:") || stepKey === CLEANUP_MARK_COMPLETED_STEP_KEY)) {
+          return Option.some(cleanupHandler)
+        }
+        if (kind === "return_normal_mode" && returnNormalModeStepKeys.includes(stepKey)) {
+          return Option.some(returnNormalModeHandler)
         }
         return Option.none()
       }
@@ -441,8 +462,12 @@ const ProvisionerConditionalLive = Layer.unwrapEffect(
 // migration/seed は HttpLive・WorkerLive の依存(Layer.provide)経由で実行される
 // (メモ化により 1 回だけ)。トップレベルにはそれらを消費するコンポーネント
 // だけを並べ、順序は依存グラフに任せる。
+// Task 12: scheduler は cleanup 判定で reconciliation plan を再計算するため、
+// Proxmox/Cloudflare port も要求するようになった (revoke_access は Contest scope
+// のみ触るので Cloudflare のみで足りるが、cleanup は inventory を読むため両方)。
 const ContestSchedulerConditionalLive = ContestSchedulerLive.pipe(
   Layer.provide(ReposLive),
+  Layer.provide(InstancePortsLive),
   Layer.provide(MigratorLive)
 )
 

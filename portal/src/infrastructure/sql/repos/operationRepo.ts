@@ -270,6 +270,20 @@ export const OperationRepoLive: Layer.Layer<
         `
       ).pipe(Effect.map((rows) => rows.length > 0)),
 
+      // Task 12: per-(contest_id, kind) の未完了 Operation 判定。scheduler が
+      // `revoke_access` / `cleanup` を再 enqueue するかを決めるガード。
+      // status 集合は plan spec §Step 3/4 と同じく queued/running/blocked/failed
+      // (succeeded/canceled のみを「再 enqueue OK」と見なす)。
+      hasUnfinishedByContestAndKind: (contestId, kind) =>
+        wrapSqlError(
+          sql<{ hit: number }>`
+            SELECT 1 AS hit FROM operations
+            WHERE contest_id = ${contestId} AND kind = ${kind}
+              AND status IN ('queued','running','blocked','failed')
+            LIMIT 1
+          `
+        ).pipe(Effect.map((rows) => rows.length > 0)),
+
       enqueue: (input: NewOperation) =>
         wrapSqlError(
           sql.withTransaction(

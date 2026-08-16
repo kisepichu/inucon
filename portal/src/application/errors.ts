@@ -122,3 +122,11 @@ export class ArtifactNotFound extends Data.TaggedError("ArtifactNotFound")<{}> {
 export class InvalidArchiveState extends Data.TaggedError("InvalidArchiveState")<{
   readonly status: ContestStatus
 }> {}
+
+// Task 12: return_normal_mode の verify_no_managed_vms step が「まだ inucon-team*
+// の managed VM が Proxmox に存在する」ことを検出した場合に返す。cleanup を
+// 先に完了させる必要があることを operator に明示する。生 VMID / hostname は
+// summary に残すが、raw provider payload は載せない。
+export class ResidualManagedResource extends Data.TaggedError("ResidualManagedResource")<{
+  readonly hostnames: ReadonlyArray<string>
+}> {}

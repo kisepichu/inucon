@@ -49,6 +49,7 @@ import {
   TeamInvite,
   TeamWithMembers,
   UpdateContestDraftRequest,
+  CleanupApplyRequest,
   User,
   VerifyArtifactRequest
 } from "./schemas.js"
@@ -345,6 +346,16 @@ export class ArtifactChecksumMismatch extends Schema.TaggedError<ArtifactChecksu
 export class InvalidArchiveState extends Schema.TaggedError<InvalidArchiveState>()(
   "InvalidArchiveState",
   { status: ContestStatus },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// Task 12: return_normal_mode Operation の verify_no_managed_vms step が
+// 「まだ inucon-team* の managed VM が Proxmox に残っている」ことを検出したときに
+// 返す。UI は「先に cleanup を完了させてください」と提示できる。生の VMID / IP は
+// 載せず、hostname stem (inucon-team1-1 等) のみ返す。
+export class ResidualManagedResource extends Schema.TaggedError<ResidualManagedResource>()(
+  "ResidualManagedResource",
+  { hostnames: Schema.Array(Schema.String) },
   HttpApiSchema.annotations({ status: 409 })
 ) {}
 
@@ -772,6 +783,38 @@ export const operationsGroup = HttpApiGroup.make("operations")
       .addError(NotFound)
       .addError(ContestRevisionConflict)
       .addError(OperationalContestConflict)
+      .addError(InvalidContestTransition)
+      .middleware(AdminOnly)
+  )
+  // Task 12: cleanup Operation を enqueue する。reconciliation apply と同型の
+  // planDigest + adoptHostnames を受け、per-hostname の cleanup steps
+  // (continueOnError=true) を持つ Operation を返す。
+  .add(
+    HttpApiEndpoint.post(
+      "requestContestCleanup"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/cleanup`
+      .setPayload(CleanupApplyRequest)
+      .addSuccess(Operation)
+      .addError(NotFound)
+      .addError(ProviderUnavailable)
+      .addError(StaleReconciliationPlan)
+      .addError(AmbiguousReconciliation)
+      .addError(NothingToReconcile)
+      .addError(OperationalContestConflict)
+      .middleware(AdminOnly)
+  )
+  // Task 12: return_normal_mode Operation を enqueue する。benchvm→devvm の
+  // graceful power transition + 事前検証 (verify_no_managed_vms) を含む 8-step。
+  // まだ managed VM が残っていれば ResidualManagedResource で 409 を返す。
+  .add(
+    HttpApiEndpoint.post(
+      "requestReturnNormalMode"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/return-normal-mode`
+      .addSuccess(Operation)
+      .addError(NotFound)
+      .addError(ProviderUnavailable)
+      .addError(OperationalContestConflict)
+      .addError(ResidualManagedResource)
       .addError(InvalidContestTransition)
       .middleware(AdminOnly)
   )

@@ -597,6 +597,17 @@ export class OperationRepo extends Context.Tag("app/OperationRepo")<
     // 全体に 1 件でも存在するか」の単発判定。単一 operation 不変条件を守るために
     // 楽観ロック的に確認するので、返り値は boolean のみ(件数や list は返さない)。
     readonly hasUnfinished: Effect.Effect<boolean, RepoError>
+    // Task 12: scheduler が `revoke_access` / `cleanup` を「同一 Contest かつ
+    // 同一 kind の未完了 (queued/running/blocked/failed) Operation」が既にあれば
+    // 再 enqueue しないための guard。plan spec §Step 3/4 の
+    //   NOT EXISTS (SELECT 1 FROM operations WHERE contest_id=? AND kind=?
+    //    AND status IN ('queued','running','blocked','failed'))
+    // と同じ predicate。unique index は「globally 1 unfinished」しか強制しない
+    // ため、per-(contest, kind) の再 enqueue 抑止はこの述語で明示的に行う。
+    readonly hasUnfinishedByContestAndKind: (
+      contestId: ContestId,
+      kind: Operation["kind"]
+    ) => Effect.Effect<boolean, RepoError>
     readonly enqueue: (
       input: NewOperation
     ) => Effect.Effect<Operation, RepoError | OperationInProgress>

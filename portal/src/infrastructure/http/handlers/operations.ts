@@ -12,6 +12,7 @@ import {
   OperationalContestConflict,
   ProviderUnavailable,
   RehearsalInstanceNotRunning,
+  ResidualManagedResource,
   StaleReconciliationPlan,
   TargetIpOutOfSubnet,
   TeamJobAlreadyQueued
@@ -24,6 +25,7 @@ import {
   planReconciliation
 } from "../../../application/usecases/reconciliation.js"
 import { computeReadiness } from "../../../application/usecases/readiness.js"
+import { cleanupContestResources, returnNormalMode } from "../../../application/usecases/cleanup.js"
 
 // Task 7: reconciliation plan/apply の HTTP handler。AdminOnly middleware は
 // shared/api の group 定義側で付与済みなので、handler は CurrentUser を
@@ -161,6 +163,64 @@ export const OperationsLive = HttpApiBuilder.group(api, "operations", (handlers)
             ),
           // 既に別 Operation が走っているときは 409 に落とす (reconciliation apply と同型)。
           OperationInProgress: () => Effect.fail(new OperationalContestConflict())
+        }),
+        Effect.orDie
+      )
+    )
+    // Task 12: cleanup Operation の enqueue。planDigest 一致検証 + blocked / adopt 判定は
+    // reconciliation apply と同型。生 hostname/vmid は返さない (ambiguous なら hostname のみ)。
+    .handle("requestContestCleanup", ({ path, payload }) =>
+      Effect.gen(function* () {
+        const user = yield* CurrentUser
+        return yield* cleanupContestResources({
+          contestId: path.contestId,
+          planDigest: payload.planDigest,
+          actorUserId: user.id
+        })
+      }).pipe(
+        Effect.map((op) => ({
+          ...op,
+          sanitizedError: Option.getOrNull(op.sanitizedError),
+          startedAt: Option.getOrNull(op.startedAt),
+          finishedAt: Option.getOrNull(op.finishedAt)
+        })),
+        Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound()),
+          ProxmoxError: () => Effect.fail(new ProviderUnavailable({ provider: "proxmox" })),
+          CloudflareError: () => Effect.fail(new ProviderUnavailable({ provider: "cloudflare" })),
+          StaleReconciliationPlan: () => Effect.fail(new StaleReconciliationPlan()),
+          AmbiguousReconciliation: (e: { readonly hostnames: ReadonlyArray<string> }) =>
+            Effect.fail(new AmbiguousReconciliation({ hostnames: e.hostnames })),
+          NothingToReconcile: () => Effect.fail(new NothingToReconcile()),
+          OperationInProgress: () => Effect.fail(new OperationalContestConflict())
+        }),
+        Effect.orDie
+      )
+    )
+    // Task 12: return_normal_mode Operation の enqueue。ResidualManagedResource は
+    // 「先に cleanup を完了させてください」を UI に伝えるための 409。
+    .handle("requestReturnNormalMode", ({ path }) =>
+      Effect.gen(function* () {
+        const user = yield* CurrentUser
+        return yield* returnNormalMode({ contestId: path.contestId, actorUserId: user.id })
+      }).pipe(
+        Effect.map((op) => ({
+          ...op,
+          sanitizedError: Option.getOrNull(op.sanitizedError),
+          startedAt: Option.getOrNull(op.startedAt),
+          finishedAt: Option.getOrNull(op.finishedAt)
+        })),
+        Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound()),
+          ProxmoxError: () => Effect.fail(new ProviderUnavailable({ provider: "proxmox" })),
+          OperationInProgress: () => Effect.fail(new OperationalContestConflict()),
+          ResidualManagedResource: (e: { readonly hostnames: ReadonlyArray<string> }) =>
+            Effect.fail(new ResidualManagedResource({ hostnames: e.hostnames })),
+          // review round 3 #2: return_normal_mode は finished / canceled 以外の
+          // Contest に対する呼び出しを弾く。UI へは既存の InvalidContestTransition
+          // (409) を使い、from/to の状態を透過的に伝える。
+          InvalidContestTransition: (e: { readonly from: unknown; readonly to: unknown }) =>
+            Effect.fail(new InvalidContestTransition({ from: e.from as never, to: e.to as never }))
         }),
         Effect.orDie
       )

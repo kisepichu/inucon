@@ -544,3 +544,13 @@ export const VerifyArtifactRequest = Schema.Struct({
   sha256: Schema.String.pipe(Schema.pattern(/^[0-9a-f]{64}$/))
 })
 export type VerifyArtifactRequest = typeof VerifyArtifactRequest.Type
+
+// Task 12: /api/admin/contests/:contestId/cleanup の payload。cleanup は
+// unmanaged_orphan の adopt 経路を持たない (reconciliation 責務)。plan は
+// サーバー側で adoptHostnames=[] 固定で再計算するため、payload は planDigest のみ。
+// review round 1 finding 1: adoptHostnames を残すと「非空を送ると必ず 409」と
+// なる罠なので、wire から外して曖昧さを排除する。
+export const CleanupApplyRequest = Schema.Struct({
+  planDigest: Schema.String
+})
+export type CleanupApplyRequest = typeof CleanupApplyRequest.Type

@@ -1491,6 +1491,20 @@ export const makeOperationRepoTest = (): { layer: Layer.Layer<OperationRepo>; ge
 
   const layer = Layer.succeed(OperationRepo, {
     hasUnfinished: Ref.get(opsRef).pipe(Effect.map((rows) => rows.some(isOperationUnfinished))),
+    hasUnfinishedByContestAndKind: (contestId, kind) =>
+      Ref.get(opsRef).pipe(
+        Effect.map((rows) =>
+          rows.some(
+            (o) =>
+              o.contestId === contestId &&
+              o.kind === kind &&
+              (o.status === "queued" ||
+                o.status === "running" ||
+                o.status === "blocked" ||
+                o.status === "failed")
+          )
+        )
+      ),
     enqueue: (input: NewOperation) =>
       Effect.gen(function* () {
         if (input.steps.length === 0) {
@@ -1598,6 +1612,7 @@ export const makeOperationRepoStubTest = (
 ): Layer.Layer<OperationRepo> =>
   Layer.succeed(OperationRepo, {
     hasUnfinished: Effect.succeed(args.hasUnfinished),
+    hasUnfinishedByContestAndKind: () => Effect.succeed(false),
     enqueue: () => Effect.dieMessage("makeOperationRepoStubTest: enqueue not implemented"),
     findById: () => Effect.succeed(Option.none()),
     listSteps: () => Effect.succeed([]),
