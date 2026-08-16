@@ -367,3 +367,94 @@ describe("GET /api/admin/contests/:contestId/readiness", () => {
     }).pipe(Effect.provide(OperationsTestLayer))
   )
 })
+
+// Task 10: POST /api/admin/contests/:contestId/start は AdminOnly、Operation を
+// 返す 202 相当のエンドポイント。fresh readiness の再検査は worker が動かす
+// step handler の責務なので、ここでは「enqueue まで」の 200/4xx を検証する。
+describe("POST /api/admin/contests/:contestId/start (Task 10)", () => {
+  const startSetup = () =>
+    Effect.gen(function* () {
+      const contests = yield* ContestRepo
+      const contest = makeContest({
+        id: ContestId.make("c-start-1"),
+        edition: 2,
+        status: "preparing",
+        revision: 1
+      })
+      yield* contests.create(contest)
+      return contest
+    })
+
+  it.effect("非 admin は 403", () =>
+    Effect.gen(function* () {
+      const contest = yield* startSetup()
+      const { cookieHeader } = yield* login({ githubLogin: "u-start-nonadmin", githubId: 7100 })
+      const res = yield* postJson(cookieHeader, `/api/admin/contests/${contest.id}/start`, {
+        expectedRevision: contest.revision
+      })
+      expect(res.status).toBe(403)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("admin + preparing + revision 一致 → 200 で Operation を返す (kind='start')", () =>
+    Effect.gen(function* () {
+      const contest = yield* startSetup()
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const res = yield* postJson(cookie, `/api/admin/contests/${contest.id}/start`, {
+        expectedRevision: contest.revision
+      })
+      expect(res.status).toBe(200)
+      const body = (yield* res.json) as { kind: string; status: string; contestId: string }
+      expect(body.kind).toBe("start")
+      expect(body.status).toBe("queued")
+      expect(body.contestId).toBe(contest.id)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("revision drift は 409 ContestRevisionConflict", () =>
+    Effect.gen(function* () {
+      const contest = yield* startSetup()
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const res = yield* postJson(cookie, `/api/admin/contests/${contest.id}/start`, {
+        expectedRevision: contest.revision + 42
+      })
+      expect(res.status).toBe(409)
+      const body = (yield* res.json) as { _tag: string; expected: number; actual: number }
+      expect(body._tag).toBe("ContestRevisionConflict")
+      expect(body.expected).toBe(contest.revision + 42)
+      expect(body.actual).toBe(contest.revision)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("preparing でない Contest は 409 InvalidContestTransition", () =>
+    Effect.gen(function* () {
+      const contests = yield* ContestRepo
+      const draft = makeContest({
+        id: ContestId.make("c-start-draft"),
+        edition: 3,
+        status: "draft",
+        revision: 1
+      })
+      yield* contests.create(draft)
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const res = yield* postJson(cookie, `/api/admin/contests/${draft.id}/start`, {
+        expectedRevision: 1
+      })
+      expect(res.status).toBe(409)
+      const body = (yield* res.json) as { _tag: string }
+      expect(body._tag).toBe("InvalidContestTransition")
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("存在しない contest は 404", () =>
+    Effect.gen(function* () {
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const res = yield* postJson(
+        cookie,
+        `/api/admin/contests/${ContestId.make("no-such-contest")}/start`,
+        { expectedRevision: 1 }
+      )
+      expect(res.status).toBe(404)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+})

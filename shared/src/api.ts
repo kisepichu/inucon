@@ -23,6 +23,7 @@ import {
   CreateTeamInstanceRequest,
   CreateTeamRequest,
   EnqueueBenchRequest,
+  EnqueueRehearsalRequest,
   Instance,
   InstanceId,
   InstanceStatus,
@@ -37,6 +38,7 @@ import {
   ReconciliationPlan,
   ReconciliationPlanRequest,
   RunnerFinishRequest,
+  RunnerPollRequest,
   RunnerProgressRequest,
   ScoreboardEntry,
   SetTeamMembersRequest,
@@ -288,6 +290,31 @@ export class CannotCancelRunning extends Schema.TaggedError<CannotCancelRunning>
   "CannotCancelRunning",
   { jobId: BenchJobId },
   HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// POST /api/admin/contests/:contestId/rehearsal: 対象 Instance が running でない
+// (creating/deleting/deleted/failed。application 側 InstanceNotRunning と同型)。
+export class RehearsalInstanceNotRunning extends Schema.TaggedError<RehearsalInstanceNotRunning>()(
+  "RehearsalInstanceNotRunning",
+  { instanceId: InstanceId },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// POST /api/admin/contests/:contestId/rehearsal: Contest が preparing でない。
+// contest.status を返して UI がリカバリを提示できるようにする。
+export class ContestNotPreparing extends Schema.TaggedError<ContestNotPreparing>()(
+  "ContestNotPreparing",
+  { status: ContestStatus },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// POST /api/admin/contests/:contestId/rehearsal: instanceId が存在しない
+// (もしくは他 contest/team の Instance を指している)。生の privateIp を
+// 漏らさないよう 404 に統一する。
+export class InstanceNotFound extends Schema.TaggedError<InstanceNotFound>()(
+  "InstanceNotFound",
+  { instanceId: InstanceId },
+  HttpApiSchema.annotations({ status: 404 })
 ) {}
 
 // POST /api/runner/jobs/:id/{progress,finish}: ジョブが running でない状態
@@ -636,6 +663,7 @@ export const scoreboardGroup = HttpApiGroup.make("scoreboard").add(
 export const runnerGroup = HttpApiGroup.make("runner")
   .add(
     HttpApiEndpoint.post("pollJob", "/api/runner/jobs/poll")
+      .setPayload(RunnerPollRequest)
       .addSuccess(PollJobResponse)
       .middleware(RunnerAuth)
   )
@@ -691,6 +719,39 @@ export const operationsGroup = HttpApiGroup.make("operations")
     )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/readiness`
       .addSuccess(Schema.Array(ReadinessCheck))
       .addError(NotFound)
+      .middleware(AdminOnly)
+  )
+  // Task 10: rehearsal は preparing Contest の admin 専用エンドポイント。
+  // 指定 Instance に対して purpose='rehearsal' の BenchJob を投入する。
+  // 参加者は running 以降で /api/bench-jobs 経由でしか enqueue できない
+  // (ContestNotRunning にマップ)。
+  .add(
+    HttpApiEndpoint.post(
+      "enqueueRehearsal"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/rehearsal`
+      .setPayload(EnqueueRehearsalRequest)
+      .addSuccess(BenchJob)
+      .addError(NotFound)
+      .addError(InstanceNotFound)
+      .addError(RehearsalInstanceNotRunning)
+      .addError(ContestNotPreparing)
+      .addError(TeamJobAlreadyQueued)
+      .addError(TargetIpOutOfSubnet)
+      .middleware(AdminOnly)
+  )
+  // Task 10: start は preparing → running 遷移を含む Operation を enqueue する
+  // (202 相当、UI は Operation を polling)。fresh readiness を Operation 実行時に
+  // 再計算し、失敗した required check があれば blocked に落とす。
+  .add(
+    HttpApiEndpoint.post(
+      "requestContestStart"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/start`
+      .setPayload(ContestTransitionRequest)
+      .addSuccess(Operation)
+      .addError(NotFound)
+      .addError(ContestRevisionConflict)
+      .addError(OperationalContestConflict)
+      .addError(InvalidContestTransition)
       .middleware(AdminOnly)
   )
 

@@ -52,7 +52,9 @@ describe("E2E: チーム作成からベンチ実行・スコアボード反映�
 
       // 6. runner が poll し、problemKey 込みでジョブを受け取る。
       const runnerClient = yield* makeRunnerApiClient()
-      const polled = yield* runnerClient.runner.pollJob()
+      const polled = yield* runnerClient.runner.pollJob({
+        payload: { runnerId: "e2e-runner", revision: "test", benchReady: true, healthSummary: "ok" }
+      })
       expect(polled.job?.id).toBe(job.id)
       expect(polled.job?.teamId).toBe(team.id)
       expect(polled.job?.problemKey).toBe("private-isu")

@@ -3,13 +3,22 @@ import { Effect, Option } from "effect"
 import {
   AmbiguousReconciliation,
   api,
+  ContestNotPreparing,
+  ContestRevisionConflict,
+  InstanceNotFound,
+  InvalidContestTransition,
   NotFound,
   NothingToReconcile,
   OperationalContestConflict,
   ProviderUnavailable,
-  StaleReconciliationPlan
+  RehearsalInstanceNotRunning,
+  StaleReconciliationPlan,
+  TargetIpOutOfSubnet,
+  TeamJobAlreadyQueued
 } from "shared"
 import { CurrentUser } from "shared"
+import { enqueueRehearsal } from "../../../application/usecases/bench.js"
+import { requestContestStart } from "../../../application/usecases/contestAdmin.js"
 import {
   applyReconciliation,
   planReconciliation
@@ -83,6 +92,75 @@ export const OperationsLive = HttpApiBuilder.group(api, "operations", (handlers)
           ContestNotFound: () => Effect.fail(new NotFound())
           // provider unavailability は readiness の各 check が個別に fail を
           // 返すので readiness 全体としては 200 で返る(UI が summary を表示)。
+        }),
+        Effect.orDie
+      )
+    )
+    // Task 10: admin rehearsal enqueue。domain / application 側で決めた
+    // TaggedError を wire schema にマップする (privateIp / bearer は絶対に載せない)。
+    .handle("enqueueRehearsal", ({ path, payload }) =>
+      Effect.gen(function* () {
+        const user = yield* CurrentUser
+        return yield* enqueueRehearsal({
+          contestId: path.contestId,
+          instanceId: payload.instanceId,
+          actor: user
+        })
+      }).pipe(
+        // domain BenchJob は Option フィールドを持つため wire schema (null 許容) に
+        // 畳んで返す (benchGroup と同じ方針)。
+        Effect.map((job) => ({
+          ...job,
+          score: Option.getOrNull(job.score),
+          passed: Option.getOrNull(job.passed),
+          errorMessage: Option.getOrNull(job.errorMessage),
+          startedAt: Option.getOrNull(job.startedAt),
+          finishedAt: Option.getOrNull(job.finishedAt),
+          lastProgressAt: Option.getOrNull(job.lastProgressAt)
+        })),
+        Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound()),
+          InstanceNotFound: () =>
+            Effect.fail(new InstanceNotFound({ instanceId: payload.instanceId })),
+          // 非 admin は URL の存在自体を隠す (privateIp / VMID を漏らさない)。
+          // rehearsal はそもそも admin 専用エンドポイントで、middleware で 403
+          // に落とすため application 側 Forbidden は防御的ケース。
+          Forbidden: () => Effect.fail(new NotFound()),
+          ContestNotPreparing: (e) => Effect.fail(new ContestNotPreparing({ status: e.status })),
+          InstanceNotRunning: (e) =>
+            Effect.fail(new RehearsalInstanceNotRunning({ instanceId: e.instanceId })),
+          TeamJobAlreadyQueued: (e) =>
+            Effect.fail(new TeamJobAlreadyQueued({ teamId: e.teamId })),
+          TargetIpOutOfSubnet: (e) =>
+            Effect.fail(new TargetIpOutOfSubnet({ ip: e.ip, teamNumber: e.teamNumber }))
+        }),
+        Effect.orDie
+      )
+    )
+    // Task 10: preparing → running を Operation 経由で開始する。202 相当で
+    // Operation を返し、UI は他 mutation と同じく Operation を polling する。
+    // 実 readiness 再計算 / saveIfRevision は worker が動かす start handler で行う。
+    .handle("requestContestStart", ({ path, payload }) =>
+      Effect.gen(function* () {
+        const user = yield* CurrentUser
+        return yield* requestContestStart(path.contestId, payload.expectedRevision, user.id)
+      }).pipe(
+        Effect.map((op) => ({
+          ...op,
+          sanitizedError: Option.getOrNull(op.sanitizedError),
+          startedAt: Option.getOrNull(op.startedAt),
+          finishedAt: Option.getOrNull(op.finishedAt)
+        })),
+        Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound()),
+          ContestRevisionConflict: (e: { readonly expected: number; readonly actual: number }) =>
+            Effect.fail(new ContestRevisionConflict({ expected: e.expected, actual: e.actual })),
+          InvalidContestTransition: (e: { readonly from: unknown; readonly to: unknown }) =>
+            Effect.fail(
+              new InvalidContestTransition({ from: e.from as never, to: e.to as never })
+            ),
+          // 既に別 Operation が走っているときは 409 に落とす (reconciliation apply と同型)。
+          OperationInProgress: () => Effect.fail(new OperationalContestConflict())
         }),
         Effect.orDie
       )

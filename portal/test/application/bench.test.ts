@@ -10,13 +10,15 @@ import {
   TargetIpOutOfSubnet,
   TeamJobAlreadyQueued
 } from "../../src/domain/errors.js"
-import { BenchJobId, TeamId, UserId } from "../../src/domain/ids.js"
+import { BenchJobId, InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
 import { User } from "../../src/domain/user.js"
-import { Forbidden, NotInTeam } from "../../src/application/errors.js"
+import { Forbidden, InstanceNotRunning, NotInTeam } from "../../src/application/errors.js"
 import { BenchJobRepo } from "../../src/application/ports.js"
 import {
   cancelBench,
+  ContestNotPreparing,
   enqueueBench,
+  enqueueRehearsal,
   listBenchJobs,
   pollNextJobFor,
   reportFinish,
@@ -24,10 +26,11 @@ import {
   sweepTimedOutJobs
 } from "../../src/application/usecases/bench.js"
 import { startContestUsecase } from "../../src/application/usecases/contest.js"
-import { DEFAULT_TEST_CONTEST_ID, makeContest, makeTeam } from "../support/factories.js"
+import { DEFAULT_TEST_CONTEST_ID, makeContest, makeInstance, makeTeam } from "../support/factories.js"
 import {
   makeBenchJobRepoTest,
   makeContestRepoTest,
+  makeInstanceRepoTest,
   makeTeamRepoTest,
   RunnerConfigTest,
   UuidGenTest
@@ -193,6 +196,111 @@ describe("startContestUsecase: preparing 中の queued rehearsal を running 遷
         expect(found.value.status).toBe("canceled")
       }
     }).pipe(Effect.provide(testLayer("preparing")))
+  )
+})
+
+// Task 10: enqueueRehearsal は admin 専用エンドポイントの usecase。
+// rehearsal は preparing / running Instance / TeamJobAlreadyQueued 契約を検証する。
+describe("enqueueRehearsal (Task 10)", () => {
+  const adminUser = new User({ ...user1, isAdmin: true })
+  const rehearsalInstanceId = InstanceId.make("i-team1-1")
+
+  const rehearsalLayer = (contestStatus: Contest["status"]) =>
+    Layer.mergeAll(
+      UuidGenTest,
+      makeContestRepoTest([makeContest({ id: DEFAULT_TEST_CONTEST_ID, status: contestStatus })]),
+      teamRepoLayer,
+      makeInstanceRepoTest([
+        makeInstance({
+          id: rehearsalInstanceId,
+          teamId: team1Id,
+          contestId: DEFAULT_TEST_CONTEST_ID,
+          index: 1,
+          vmid: 1101,
+          privateIp: "10.100.1.11",
+          status: "running"
+        })
+      ]),
+      makeBenchJobRepoTest([]),
+      RunnerConfigTest(600_000)
+    )
+
+  it.effect("admin + preparing + running Instance → rehearsal BenchJob が queued で返る", () =>
+    Effect.gen(function* () {
+      const job = yield* enqueueRehearsal({
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        instanceId: rehearsalInstanceId,
+        actor: adminUser
+      })
+      expect(job.status).toBe("queued")
+      expect(job.purpose).toBe("rehearsal")
+      expect(job.targetIp).toBe("10.100.1.11")
+      expect(job.teamId).toBe(team1Id)
+    }).pipe(Effect.provide(rehearsalLayer("preparing")))
+  )
+
+  it.effect("非 admin は Forbidden (privateIp / VMID を漏らさない)", () =>
+    Effect.gen(function* () {
+      const exit = yield* Effect.exit(
+        enqueueRehearsal({
+          contestId: DEFAULT_TEST_CONTEST_ID,
+          instanceId: rehearsalInstanceId,
+          actor: user1
+        })
+      )
+      expect(exit).toStrictEqual(Exit.fail(new Forbidden()))
+    }).pipe(Effect.provide(rehearsalLayer("preparing")))
+  )
+
+  it.effect("Contest が running のときは ContestNotPreparing で拒否 (競争中に rehearsal は投げない)", () =>
+    Effect.gen(function* () {
+      const exit = yield* Effect.exit(
+        enqueueRehearsal({
+          contestId: DEFAULT_TEST_CONTEST_ID,
+          instanceId: rehearsalInstanceId,
+          actor: adminUser
+        })
+      )
+      expect(exit).toStrictEqual(Exit.fail(new ContestNotPreparing({ status: "running" })))
+    }).pipe(Effect.provide(rehearsalLayer("running")))
+  )
+
+  it.effect("Instance が running でなければ InstanceNotRunning", () =>
+    Effect.gen(function* () {
+      const exit = yield* Effect.exit(
+        enqueueRehearsal({
+          contestId: DEFAULT_TEST_CONTEST_ID,
+          instanceId: rehearsalInstanceId,
+          actor: adminUser
+        })
+      )
+      expect(exit).toStrictEqual(
+        Exit.fail(new InstanceNotRunning({ instanceId: rehearsalInstanceId }))
+      )
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          UuidGenTest,
+          makeContestRepoTest([
+            makeContest({ id: DEFAULT_TEST_CONTEST_ID, status: "preparing" })
+          ]),
+          teamRepoLayer,
+          makeInstanceRepoTest([
+            makeInstance({
+              id: rehearsalInstanceId,
+              teamId: team1Id,
+              contestId: DEFAULT_TEST_CONTEST_ID,
+              index: 1,
+              vmid: 1101,
+              privateIp: "10.100.1.11",
+              status: "creating"
+            })
+          ]),
+          makeBenchJobRepoTest([]),
+          RunnerConfigTest(600_000)
+        )
+      )
+    )
   )
 })
 

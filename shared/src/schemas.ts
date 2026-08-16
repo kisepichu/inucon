@@ -167,6 +167,13 @@ export const CopyContestRosterRequest = Schema.Struct({
 })
 export type CopyContestRosterRequest = typeof CopyContestRosterRequest.Type
 
+// POST /api/admin/contests/:contestId/rehearsal: 指定 Instance に対して
+// purpose='rehearsal' の BenchJob を投入する(admin + preparing のみ)。
+export const EnqueueRehearsalRequest = Schema.Struct({
+  instanceId: InstanceId
+})
+export type EnqueueRehearsalRequest = typeof EnqueueRehearsalRequest.Type
+
 // GET /api/teams のメンバー表現。チームメイトの githubLogin を返す(auth の
 // User 全体を返すと isAdmin 等の不要な情報まで漏れるため最小限にする)。
 export const TeamMember = Schema.Struct({
@@ -347,6 +354,20 @@ export const RunnerJob = Schema.Struct({
   problemKey: Schema.String
 })
 export type RunnerJob = typeof RunnerJob.Type
+
+// POST /api/runner/jobs/poll: Task 10 で追加した heartbeat 兼 poll。
+// runnerId は複数 runner を将来サポートするための識別子(現行は "benchvm" 固定
+// 相当)、revision は動作している runner バイナリの識別子(git commit hash / dev)、
+// benchReady はランナー側で BENCH_DIR / adapter 実行可能性を確認した結果、
+// healthSummary は非機密の短文サマリ(bearer / 生 cause / email を含まない、
+// 長さは DB 側の CHECK と同じ 256 文字以内)。
+export const RunnerPollRequest = Schema.Struct({
+  runnerId: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(64)),
+  revision: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(64)),
+  benchReady: Schema.Boolean,
+  healthSummary: Schema.String.pipe(Schema.maxLength(256))
+})
+export type RunnerPollRequest = typeof RunnerPollRequest.Type
 
 // POST /api/runner/jobs/poll
 export const PollJobResponse = Schema.Struct({ job: Schema.NullOr(RunnerJob) })

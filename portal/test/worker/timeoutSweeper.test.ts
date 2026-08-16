@@ -104,6 +104,7 @@ describe("TimeoutSweeperLive", () => {
         cancelIfQueued: notUsed,
         cancelQueuedRehearsalsForContest: notUsed,
         scoreboard: () => Effect.succeed([]),
+        countSuccessfulRehearsals: () => Effect.succeed(0),
         // 常に RepoError を返す(sweep が失敗し続けるケースを再現する)。
         failTimedOutJobs: () =>
           Ref.updateAndGet(callsRef, (n) => n + 1).pipe(

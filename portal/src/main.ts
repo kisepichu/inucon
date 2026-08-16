@@ -29,7 +29,12 @@ import {
   PREPARE_STEP_KEY,
   PrepareConfigDefault
 } from "./application/usecases/prepare.js"
+import {
+  makeStartContestHandler,
+  START_CONTEST_STEP_KEY
+} from "./application/usecases/startOperation.js"
 import { CloudflareLive } from "./infrastructure/cloudflare/client.js"
+import { BackupPortLive } from "./infrastructure/backup/sqlite.js"
 import { GithubKeysLive } from "./infrastructure/github/keys.js"
 import { GithubOAuthLive } from "./infrastructure/github/oauth.js"
 import { AdminLive } from "./infrastructure/http/handlers/admin.js"
@@ -148,18 +153,29 @@ const ReposLive = Layer.mergeAll(
   Layer.provide(SqlLive)
 )
 
-// JOB_TIMEOUT_MILLIS: running のハートビート(進捗報告)がこの時間途絶えたら
-// failed にする(スペック §BenchJob 不変条件 4)。既定 10 分。
+// RunnerConfig: JOB_TIMEOUT_MILLIS は running のハートビート(進捗報告)が
+// この時間途絶えたら failed にする既定 10 分 (spec §BenchJob 不変条件 4)。
+// Task 10: RUNNER_MAX_AGE_MILLIS は runner heartbeat の readiness / start gate
+// 判定に使う。既定 60_000ms (readiness spec)。両方とも env で上書き可能で、
+// 不正値 (<=0) は Layer 構築失敗として早期に気付く。
 const RunnerConfigLive = Layer.effect(
   RunnerConfig,
-  Config.integer("JOB_TIMEOUT_MILLIS").pipe(
-    Config.withDefault(600_000),
-    Config.validate({
-      message: "JOB_TIMEOUT_MILLIS must be a positive integer",
-      validation: (n) => n > 0
-    }),
-    Effect.map((jobTimeoutMillis) => ({ jobTimeoutMillis }))
-  )
+  Effect.all({
+    jobTimeoutMillis: Config.integer("JOB_TIMEOUT_MILLIS").pipe(
+      Config.withDefault(600_000),
+      Config.validate({
+        message: "JOB_TIMEOUT_MILLIS must be a positive integer",
+        validation: (n) => n > 0
+      })
+    ),
+    maxAgeMillis: Config.integer("RUNNER_MAX_AGE_MILLIS").pipe(
+      Config.withDefault(60_000),
+      Config.validate({
+        message: "RUNNER_MAX_AGE_MILLIS must be a positive integer",
+        validation: (n) => n > 0
+      })
+    )
+  })
 )
 
 // 払い出しガードの閾値・タイムアウト(Phase 3、Task 4)。既定は spike メモ
@@ -254,6 +270,11 @@ const ApiLive = HttpApiBuilder.api(api).pipe(
   // 閾値(ProvisioningConfig)を要求する(Task 4 で実装済みの既定値付き
   // Config、ProvisionerConditionalLive と同一参照でメモ化される)。
   Layer.provide(ProvisioningConfigLive),
+  // Task 10: readiness の backup key と Task 11 の snapshot API 用に
+  // BackupPortLive を配線する。BACKUP_PATH 未設定の環境 (dev/test 直起動) では
+  // probe が not_configured で fail するだけで HTTP サーバー自体は起動する
+  // (readiness の 1 key が fail するのみ)。
+  Layer.provide(BackupPortLive),
   Layer.provide(ReposLive)
 )
 
@@ -310,17 +331,19 @@ const WorkerLive = TimeoutSweeperLive.pipe(
 )
 
 
-// Task 7/8/9: Operation kind 別の step handler を登録する。
+// Task 7/8/9/10: Operation kind 別の step handler を登録する。
 //  - reconcile: Cloudflare/Proxmox の inventory-driven cleanup
 //  - enter_contest_mode: devvm → benchvm の graceful power transition
 //  - prepare: preparing Contest の全 team を desiredInstanceCount まで
 //    「1 台ずつ + memory recheck + KSM settle」で収束させる (Task 9)
+//  - start: preparing → running の readiness 再検査 + saveIfRevision (Task 10)
 const OperationHandlerRegistryLive = Layer.effect(
   OperationHandlerRegistry,
   Effect.gen(function* () {
     const reconcileHandler = yield* makeReconciliationHandler
     const modeHandler = yield* makeEnterContestModeHandler
     const prepareHandler = yield* makePrepareHandler
+    const startHandler = yield* makeStartContestHandler
     const enterModeStepKeys: ReadonlyArray<string> = ENTER_CONTEST_MODE_STEP_KEYS
     return {
       lookup: (kind, stepKey) => {
@@ -332,6 +355,9 @@ const OperationHandlerRegistryLive = Layer.effect(
         }
         if (kind === "prepare" && stepKey === PREPARE_STEP_KEY) {
           return Option.some(prepareHandler)
+        }
+        if (kind === "start" && stepKey === START_CONTEST_STEP_KEY) {
+          return Option.some(startHandler)
         }
         return Option.none()
       }
@@ -351,9 +377,11 @@ const OperationWorkerConditionalLive = OperationWorkerLive.pipe(
       Layer.provide(HostnameConfigLive),
       Layer.provide(ProvisioningConfigLive),
       // Task 9: prepare Operation の handler が使う KSM/PVE 待機設定。
-      // env で上書き可能な wiring は本 task の実装スコープ外 (spec の DEFAULT_
-      // 既定値を使う)。
-      Layer.provide(PrepareConfigDefault)
+      Layer.provide(PrepareConfigDefault),
+      // Task 10: start Operation の handler が readiness を再計算するために
+      // BackupPort / RunnerConfig を要求する (readiness の backup / runner check)。
+      Layer.provide(BackupPortLive),
+      Layer.provide(RunnerConfigLive)
     )
   ),
   Layer.provide(ReposLive),

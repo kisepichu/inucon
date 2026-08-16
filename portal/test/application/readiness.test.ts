@@ -1,7 +1,8 @@
 import { it } from "@effect/vitest"
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Option, TestClock } from "effect"
 import { describe, expect } from "vitest"
 import {
+  BackupError,
   CloudflareError,
   ProxmoxError
 } from "../../src/application/ports.js"
@@ -23,13 +24,21 @@ import type {
   ProxmoxTestOptions
 } from "../support/inMemory.js"
 import {
+  makeBackupPortTest,
+  makeBenchJobRepoTest,
   makeCloudflarePortTest,
   makeContestRepoTest,
   makeInstanceRepoTest,
   makeProxmoxPortTest,
   makeResourceBindingRepoTest,
-  makeTeamRepoTest
+  makeRunnerAgentRepoTest,
+  makeTeamRepoTest,
+  RunnerConfigTest
 } from "../support/inMemory.js"
+import type { BenchJob } from "../../src/domain/benchJob.js"
+import type { RunnerAgentTestRow } from "../support/inMemory.js"
+import { makeBenchJob } from "../support/factories.js"
+import { BenchJobId } from "../../src/domain/ids.js"
 
 // Task 8 Step 1: readiness aggregation の application-level 契約を検証する。
 //
@@ -89,8 +98,18 @@ interface ReadinessLayerOptions {
   readonly proxmoxFail?: ProxmoxTestOptions
   readonly cloudflareInventory?: CloudflareInventorySeed
   readonly cloudflareFail?: CloudflareTestOptions
+  // Task 10: runner heartbeat / backup / rehearsal を差し込むオプション。
+  // healthy な既定は「fresh runner 1 台 + backup probe 成功 + rehearsal 1 件成功」。
+  readonly runnerAgents?: ReadonlyArray<RunnerAgentTestRow>
+  readonly backupFailWith?: BackupError
+  readonly benchJobs?: ReadonlyArray<BenchJob>
+  readonly runnerMaxAgeMillis?: number
+  readonly nowForFactories?: number
 }
 
+// 既定の nowForFactories: readiness の runnerCheck は Effect.clockWith で
+// currentTimeMillis を取る。テスト内で Clock を差し替えないため実時刻を使う。
+// initial の runnerAgents.lastSeenAt は「Date.now() - a few seconds」を渡す。
 const buildLayer = (opts: ReadinessLayerOptions = {}) => {
   const contests = opts.contests ?? [preparingContest]
   const teams = opts.teams ?? [team1]
@@ -102,12 +121,36 @@ const buildLayer = (opts: ReadinessLayerOptions = {}) => {
   const cloudflare = makeCloudflarePortTest({
     ...(opts.cloudflareFail ?? {})
   }).layer
+  const now = opts.nowForFactories ?? 0
+  const defaultRunner: RunnerAgentTestRow = {
+    id: "benchvm",
+    revision: "test",
+    benchReady: true,
+    healthSummary: "ok",
+    lastSeenAt: now
+  }
+  const defaultRehearsal = makeBenchJob({
+    id: BenchJobId.make("bench-rehearsal-1"),
+    contestId: CONTEST_ID,
+    teamId: TEAM1_ID,
+    targetIp: "10.100.1.11",
+    status: "finished",
+    purpose: "rehearsal",
+    passed: Option.some(true),
+    score: Option.some(100),
+    enqueuedAt: now,
+    startedAt: Option.some(now),
+    finishedAt: Option.some(now)
+  })
   return Layer.mergeAll(
     makeContestRepoTest(contests),
     makeInstanceRepoTest(instances),
     makeTeamRepoTest({ teams, memberships: [] }),
-    // Task 9: readiness の cloudflare_write_proven key は ResourceBindingRepo を舐める。
     makeResourceBindingRepoTest(opts.bindings ?? []),
+    makeBenchJobRepoTest(opts.benchJobs ?? [defaultRehearsal]),
+    makeRunnerAgentRepoTest(opts.runnerAgents ?? [defaultRunner]),
+    makeBackupPortTest({ failWith: opts.backupFailWith }),
+    RunnerConfigTest(600_000, opts.runnerMaxAgeMillis ?? 60_000),
     proxmox,
     cloudflare
   )
@@ -117,7 +160,6 @@ describe("computeReadiness の必須 key set", () => {
   it.effect("healthy な状態では start required key がすべて pass、warn-until-later は warn を返す", () =>
     Effect.gen(function* () {
       const checks = yield* computeReadiness(CONTEST_ID)
-      // 少なくとも仕様に列挙された stable key を返す(順序は問わない)。
       const expectedKeys: ReadonlyArray<string> = [
         "portal_db",
         "previous_cleanup",
@@ -140,11 +182,146 @@ describe("computeReadiness の必須 key set", () => {
       for (const k of START_REQUIRED_CHECK_KEYS) {
         expect(findCheck(checks, k).status).toBe("pass")
       }
-      // Task 10/11 未実装は warn。
-      for (const k of ["cloudflare_write_proven", "runner", "backup", "rehearsal"]) {
-        expect(findCheck(checks, k).status).toBe("warn")
-      }
+      // cloudflare_write_proven は依然として warn (portal-owned binding が 0 件)。
+      // capacity_estimate は memory 実測未実施の warn。
+      expect(findCheck(checks, "cloudflare_write_proven").status).toBe("warn")
     }).pipe(Effect.provide(buildLayer()))
+  )
+})
+
+describe("Task 10: runner heartbeat readiness", () => {
+  it.effect("heartbeat が maxAgeMillis を超えて stale なら runner=fail", () =>
+    Effect.gen(function* () {
+      // TestClock を maxAge を大きく超えた時刻に進めておくと、lastSeenAt=0 の
+      // heartbeat が「ancient」として getFresh に None を返させられる。
+      yield* TestClock.adjust("60 seconds")
+      const checks = yield* computeReadiness(CONTEST_ID)
+      const runner = findCheck(checks, "runner")
+      expect(runner.status).toBe("fail")
+      expect(runner.summary).toContain("no runner heartbeat")
+      // 生 bearer / 生 cause を含まない (schema max 256; ここでは spot check)。
+      expect(runner.summary).not.toMatch(/Bearer/i)
+    }).pipe(
+      Effect.provide(
+        buildLayer({
+          runnerAgents: [
+            {
+              id: "benchvm",
+              revision: "test",
+              benchReady: true,
+              healthSummary: "ok",
+              lastSeenAt: 0
+            }
+          ],
+          runnerMaxAgeMillis: 30_000
+        })
+      )
+    )
+  )
+
+  it.effect("heartbeat が新鮮でも benchReady=false なら runner=fail", () =>
+    Effect.gen(function* () {
+      const checks = yield* computeReadiness(CONTEST_ID)
+      const runner = findCheck(checks, "runner")
+      expect(runner.status).toBe("fail")
+      expect(runner.summary).toContain("benchReady=false")
+    }).pipe(
+      Effect.provide(
+        buildLayer({
+          runnerAgents: [
+            {
+              id: "benchvm",
+              revision: "test",
+              benchReady: false,
+              healthSummary: "adapter missing",
+              lastSeenAt: 0
+            }
+          ]
+        })
+      )
+    )
+  )
+
+  it.effect("healthSummary は非機密文字列で 256 文字以内(schema 側の CHECK と揃える)", () =>
+    Effect.gen(function* () {
+      const checks = yield* computeReadiness(CONTEST_ID)
+      const runner = findCheck(checks, "runner")
+      expect(runner.summary.length).toBeLessThanOrEqual(256)
+      // 生 email / bearer を含まない。
+      expect(runner.summary).not.toMatch(/@/)
+      expect(runner.summary).not.toMatch(/Bearer/i)
+    }).pipe(Effect.provide(buildLayer()))
+  )
+})
+
+describe("Task 10: backup probe readiness", () => {
+  it.effect("BackupPort.probe が成功すれば backup=pass", () =>
+    Effect.gen(function* () {
+      const checks = yield* computeReadiness(CONTEST_ID)
+      expect(findCheck(checks, "backup").status).toBe("pass")
+    }).pipe(Effect.provide(buildLayer()))
+  )
+
+  it.effect("BackupError.reason が summary に載る (但し詳細メッセージは載せない)", () =>
+    Effect.gen(function* () {
+      const checks = yield* computeReadiness(CONTEST_ID)
+      const backup = findCheck(checks, "backup")
+      expect(backup.status).toBe("fail")
+      expect(backup.summary).toContain("not_writable")
+      expect(backup.summary).not.toContain("EACCES")
+    }).pipe(
+      Effect.provide(
+        buildLayer({
+          backupFailWith: new BackupError({
+            reason: "not_writable",
+            detail: "open failed: EACCES on /backups/.probe-xyz"
+          })
+        })
+      )
+    )
+  )
+})
+
+describe("Task 10: rehearsal readiness", () => {
+  it.effect("passed=true の rehearsal が 1 件でもあれば rehearsal=pass", () =>
+    Effect.gen(function* () {
+      const checks = yield* computeReadiness(CONTEST_ID)
+      expect(findCheck(checks, "rehearsal").status).toBe("pass")
+    }).pipe(Effect.provide(buildLayer()))
+  )
+
+  it.effect("rehearsal 0 件なら rehearsal=fail (start required)", () =>
+    Effect.gen(function* () {
+      const checks = yield* computeReadiness(CONTEST_ID)
+      expect(findCheck(checks, "rehearsal").status).toBe("fail")
+    }).pipe(Effect.provide(buildLayer({ benchJobs: [] })))
+  )
+
+  it.effect("finished でも passed=false は rehearsal 実績にならない", () =>
+    Effect.gen(function* () {
+      const checks = yield* computeReadiness(CONTEST_ID)
+      expect(findCheck(checks, "rehearsal").status).toBe("fail")
+    }).pipe(
+      Effect.provide(
+        buildLayer({
+          benchJobs: [
+            makeBenchJob({
+              id: BenchJobId.make("bench-rehearsal-fail"),
+              contestId: CONTEST_ID,
+              teamId: TEAM1_ID,
+              targetIp: "10.100.1.11",
+              status: "finished",
+              purpose: "rehearsal",
+              passed: Option.some(false),
+              score: Option.some(0),
+              enqueuedAt: 1,
+              startedAt: Option.some(2),
+              finishedAt: Option.some(3)
+            })
+          ]
+        })
+      )
+    )
   )
 })
 
@@ -394,6 +571,10 @@ describe("readiness は provider 状態を一切 mutate しない", () => {
             makeInstanceRepoTest([]),
             makeTeamRepoTest({ teams: [team1], memberships: [] }),
             makeResourceBindingRepoTest([]),
+            makeBenchJobRepoTest([]),
+            makeRunnerAgentRepoTest([]),
+            makeBackupPortTest(),
+            RunnerConfigTest(600_000, 60_000),
             proxmox.layer,
             cloudflare.layer
           )

@@ -8,14 +8,18 @@
 // 同じ生存性優先の思想)。
 import { Command, CommandExecutor } from "@effect/platform"
 import { Context, Duration, Effect, Either, Fiber, Option, Ref, Schedule, Stream } from "effect"
-import type { BenchJobId, RunnerFinishRequest, RunnerJob, RunnerProgressRequest } from "shared/schemas"
+import { existsSync, statSync } from "node:fs"
+import type { BenchJobId, RunnerFinishRequest, RunnerJob, RunnerPollRequest, RunnerProgressRequest } from "shared/schemas"
 import type { ProblemAdapter } from "./adapters/types.js"
 
 // --- ポータル(shared/api の runner グループ)を薄く抜いたインタフェース。
 // loop.ts はこの形にだけ依存し、実体(HttpApiClient 経由か、テストのスタブか)は
 // Layer 側で差し替える。 ---
+// PortalClientShape.poll は RunnerPollRequest (heartbeat + poll) を受ける形に
+// 変わった。実装(HttpApiClient / テストスタブ)がヘルスデータを body に載せ、
+// ポータルは runner_agents を touch した後で「benchReady=true なら」dequeue する。
 export interface PortalClientShape {
-  readonly poll: Effect.Effect<Option.Option<RunnerJob>, unknown>
+  readonly poll: (request: RunnerPollRequest) => Effect.Effect<Option.Option<RunnerJob>, unknown>
   readonly reportProgress: (jobId: BenchJobId, request: RunnerProgressRequest) => Effect.Effect<void, unknown>
   readonly reportFinish: (jobId: BenchJobId, request: RunnerFinishRequest) => Effect.Effect<void, unknown>
 }
@@ -32,9 +36,15 @@ export class AdapterRegistry extends Context.Tag("runner/AdapterRegistry")<
   AdapterRegistryShape
 >() {}
 
+// LoopConfig: pollIntervalMillis / progressIntervalMillis に加え、Task 10 で
+// heartbeat 用の runnerId / revision / BENCH_DIR を追加した。main.ts が env 経由で
+// 埋め、テストは Layer.succeed で fixed value を渡す。
 export interface LoopConfigShape {
   readonly pollIntervalMillis: number
   readonly progressIntervalMillis: number
+  readonly runnerId: string
+  readonly runnerRevision: string
+  readonly benchDir: string
 }
 
 export class LoopConfig extends Context.Tag("runner/LoopConfig")<LoopConfig, LoopConfigShape>() {}
@@ -208,15 +218,47 @@ const runJob = (job: RunnerJob) =>
     yield* reportOrLog("reportFinish", portal.reportFinish(job.id, finishRequest))
   })
 
+// ローカルヘルスチェック: BENCH_DIR が実在するディレクトリなら bench の起動が
+// 見込める、そうでなければ benchReady=false + summary で portal に heartbeat する。
+// 内容は非機密で 256 文字以内 (shared schema の CHECK と揃える)。adapter レジストリ
+// が空なら「未知の problemKey しか処理できない」= benchReady=false 相当。
+const evaluateBenchHealth = Effect.gen(function* () {
+  const config = yield* LoopConfig
+  const adapters = yield* AdapterRegistry
+  const adapterKeys = Object.keys(adapters)
+  if (adapterKeys.length === 0) {
+    return { benchReady: false, healthSummary: "no adapters registered" } as const
+  }
+  const dirCheck = yield* Effect.sync(() => {
+    try {
+      if (!existsSync(config.benchDir)) return { ok: false as const, summary: "bench dir missing" }
+      const stat = statSync(config.benchDir)
+      if (!stat.isDirectory()) return { ok: false as const, summary: "bench dir not directory" }
+      return { ok: true as const, summary: `bench dir ok (adapters=${adapterKeys.length})` }
+    } catch {
+      return { ok: false as const, summary: "bench dir stat failed" }
+    }
+  })
+  return { benchReady: dirCheck.ok, healthSummary: dirCheck.summary } as const
+})
+
 // poll 1 回分(ジョブが無ければ pollIntervalMillis だけ待つ)。
 const iteration = Effect.gen(function* () {
   const portal = yield* PortalClient
-  const { pollIntervalMillis } = yield* LoopConfig
+  const config = yield* LoopConfig
 
-  const jobOption = yield* portal.poll
+  const { benchReady, healthSummary } = yield* evaluateBenchHealth
+  // healthSummary は 256 文字以内に丸める (shared schema の CHECK と揃える)。
+  const bounded = healthSummary.length > 256 ? healthSummary.slice(0, 256) : healthSummary
+  const jobOption = yield* portal.poll({
+    runnerId: config.runnerId,
+    revision: config.runnerRevision,
+    benchReady,
+    healthSummary: bounded
+  })
 
   yield* Option.match(jobOption, {
-    onNone: () => Effect.sleep(Duration.millis(pollIntervalMillis)),
+    onNone: () => Effect.sleep(Duration.millis(config.pollIntervalMillis)),
     onSome: runJob
   })
 })

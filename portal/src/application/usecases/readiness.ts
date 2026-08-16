@@ -4,12 +4,16 @@ import type { Contest } from "../../domain/contest.js"
 import type { ContestId } from "../../domain/ids.js"
 import { ContestNotFound } from "../errors.js"
 import {
+  BackupPort,
+  BenchJobRepo,
   CloudflarePort,
   ContestRepo,
   InstanceRepo,
   ProxmoxPort,
   RepoError,
-  ResourceBindingRepo
+  ResourceBindingRepo,
+  RunnerAgentRepo,
+  RunnerConfig
 } from "../ports.js"
 import type { ProxmoxInfrastructureInventory } from "../ports.js"
 
@@ -27,7 +31,17 @@ import type { ProxmoxInfrastructureInventory } from "../ports.js"
 // spec §readiness key set。実装は「見つからない key を start で pass 扱いに
 // しない」ため、start required は明示的に列挙する。capacity_estimate は
 // start までに benchvm が実起動しているので post-mode の実測が正となり、
-// このリストからは除外する(warn 扱い)。
+// このリストからは除外する(warn 扱い)。cloudflare_write_proven も start
+// までは書き込み実績が無くて自然なので warn に留める。
+//
+// Task 10 で runner / backup / rehearsal を required に昇格した:
+// - runner: heartbeat が新鮮かつ benchReady=true でないと start は事故る
+//   (dequeue しても runner が拾えず job が timeout する)。
+// - backup: 開始後に snapshot 取得の口が無い状態で走らせない (Task 11 の
+//   finalization が blocked になる)。
+// - rehearsal: 少なくとも 1 回 admin が rehearsal を成功させてから start する
+//   (Access + route + adapter の end-to-end 疎通が実証されていない状態で
+//   一斉開始しないためのセーフティ)。
 export const START_REQUIRED_CHECK_KEYS: ReadonlyArray<string> = [
   "portal_db",
   "previous_cleanup",
@@ -37,7 +51,10 @@ export const START_REQUIRED_CHECK_KEYS: ReadonlyArray<string> = [
   "memory",
   "benchvm",
   "cloudflare_token",
-  "cloudflare_inventory"
+  "cloudflare_inventory",
+  "runner",
+  "backup",
+  "rehearsal"
 ]
 
 // preparing 遷移(beginContestPreparation)前検査で必ず pass を要求する key。
@@ -309,25 +326,96 @@ const cloudflareWriteProvenCheck = (
     } satisfies ReadinessCheck
   })
 
-// Task 10/11 が実装するまで warn を返す key set。start required からは
-// 外れているため start は通るが、UI 側に警告を出す口として維持する。
-const deferredWarnChecks: ReadonlyArray<ReadinessCheck> = [
-  {
-    key: "runner",
-    status: "warn",
-    summary: "runner heartbeat check not yet implemented (Task 10)"
-  },
-  {
-    key: "backup",
-    status: "warn",
-    summary: "backup probe not yet implemented (Task 10)"
-  },
-  {
-    key: "rehearsal",
-    status: "warn",
-    summary: "rehearsal proof not yet implemented (Task 10)"
+// Task 10: runner heartbeat / backup writability / rehearsal 成功実績を
+// readiness key に落とす。すべて fail は「そのまま start すると事故が起きる」
+// 状態なので required に昇格した (START_REQUIRED_CHECK_KEYS 参照)。
+
+// runner: RunnerAgentRepo.getFresh が Some かつ benchReady=true なら pass。
+// stale (maxAgeMillis 超過で None) または benchReady=false は fail。
+// summary には runner id / revision / lastSeenAt を載せる(bearer/生 cause は
+// 一切載せない — schema 側で length<=256 に強制)。
+const runnerCheck: Effect.Effect<
+  ReadinessCheck,
+  never,
+  RunnerAgentRepo | RunnerConfig
+> = Effect.gen(function* () {
+  const config = yield* RunnerConfig
+  const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis)
+  const repo = yield* RunnerAgentRepo
+  const result = yield* Effect.either(repo.getFresh(now, config.maxAgeMillis))
+  if (result._tag === "Left") {
+    return {
+      key: "runner",
+      status: "fail",
+      summary: "portal DB unreachable while reading runner heartbeat"
+    } satisfies ReadinessCheck
   }
-]
+  const fresh = result.right
+  if (Option.isNone(fresh)) {
+    return {
+      key: "runner",
+      status: "fail",
+      summary: `no runner heartbeat within ${config.maxAgeMillis}ms`
+    } satisfies ReadinessCheck
+  }
+  const agent = fresh.value
+  if (!agent.benchReady) {
+    return {
+      key: "runner",
+      status: "fail",
+      summary: `runner ${agent.id} rev ${agent.revision} reports benchReady=false`
+    } satisfies ReadinessCheck
+  }
+  const ageMillis = now - agent.lastSeenAt
+  return {
+    key: "runner",
+    status: "pass",
+    summary: `runner ${agent.id} rev ${agent.revision} healthy (age=${ageMillis}ms)`
+  } satisfies ReadinessCheck
+})
+
+// backup: BackupPort.probe の成否をそのまま反映する。probe は create/fsync/
+// delete まで通ったら pass、それ以外は fail (BackupError の reason はそのまま
+// 短い summary に落とす。詳細エラーメッセージは載せない)。
+const backupCheck: Effect.Effect<ReadinessCheck, never, BackupPort> = Effect.gen(function* () {
+  const backup = yield* BackupPort
+  const result = yield* Effect.either(backup.probe)
+  return result._tag === "Right"
+    ? { key: "backup", status: "pass" as const, summary: "backup canary create/fsync/delete succeeded" }
+    : { key: "backup", status: "fail" as const, summary: `backup probe failed: ${result.left.reason}` }
+})
+
+// rehearsal: 対象 Contest で少なくとも 1 回、passed=true の finished rehearsal
+// が存在すれば pass。未実施なら fail (start 前に at-least-once の疎通実証を
+// 強制する)。生 job id / score / errorMessage は載せない (readiness は
+// 非機密 summary のみ)。
+const rehearsalCheck = (
+  contestId: ContestId
+): Effect.Effect<ReadinessCheck, never, BenchJobRepo> =>
+  Effect.gen(function* () {
+    const jobs = yield* BenchJobRepo
+    const result = yield* Effect.either(jobs.countSuccessfulRehearsals(contestId))
+    if (result._tag === "Left") {
+      return {
+        key: "rehearsal",
+        status: "fail",
+        summary: "portal DB unreachable while counting rehearsals"
+      } satisfies ReadinessCheck
+    }
+    const count = result.right
+    if (count === 0) {
+      return {
+        key: "rehearsal",
+        status: "fail",
+        summary: "no successful rehearsal recorded for this contest yet"
+      } satisfies ReadinessCheck
+    }
+    return {
+      key: "rehearsal",
+      status: "pass",
+      summary: `${count} successful rehearsal(s) recorded`
+    } satisfies ReadinessCheck
+  })
 
 // computeReadiness の DB 失敗分離(review round 2 finding 3):
 // portal DB が read できない状態でも readiness endpoint は 200 で
@@ -340,7 +428,7 @@ const deferredWarnChecks: ReadonlyArray<ReadinessCheck> = [
 const dbFailurePayload = (summary: string): ReadonlyArray<ReadinessCheck> => [
   { key: "portal_db", status: "fail" as const, summary },
   // 生 error message は summary に載せない(非機密のみ)。DB が落ちている
-  // 間は残り check は「観測できず」を表す warn に畳んで返す。
+  // 間は残り check は「観測できず」を表す warn / fail に畳んで返す。
   { key: "previous_cleanup", status: "warn" as const, summary: "portal DB unreachable; skipping" },
   { key: "template", status: "warn" as const, summary: "portal DB unreachable; skipping" },
   { key: "team_slots", status: "warn" as const, summary: "portal DB unreachable; skipping" },
@@ -350,7 +438,16 @@ const dbFailurePayload = (summary: string): ReadonlyArray<ReadinessCheck> => [
   { key: "benchvm", status: "warn" as const, summary: "portal DB unreachable; skipping" },
   { key: "cloudflare_token", status: "warn" as const, summary: "portal DB unreachable; skipping" },
   { key: "cloudflare_inventory", status: "warn" as const, summary: "portal DB unreachable; skipping" },
-  ...deferredWarnChecks
+  { key: "cloudflare_write_proven", status: "warn" as const, summary: "portal DB unreachable; skipping" },
+  // review round 1 #2: portal DB が読めない状態は observability が壊れて
+  // start required に必要な heartbeat 行 / rehearsal 実績 / backup 出力先の
+  // 整合が確認できない。runner / rehearsal は DB 依存で fail が自然、backup は
+  // FS-based だが probe を試行していない (preamble fail で早期リターン) ので
+  // "warn" ではなく "fail" として start required を defensive にブロックする。
+  // 直前 comment との整合も揃える (3 key とも fail = start required で防止)。
+  { key: "runner", status: "fail" as const, summary: "portal DB unreachable; runner heartbeat unknown" },
+  { key: "backup", status: "fail" as const, summary: "portal DB unreachable; backup probe not attempted" },
+  { key: "rehearsal", status: "fail" as const, summary: "portal DB unreachable; rehearsal history unknown" }
 ]
 
 export const computeReadiness = (
@@ -358,14 +455,18 @@ export const computeReadiness = (
 ): Effect.Effect<
   ReadonlyArray<ReadinessCheck>,
   ContestNotFound,
-  ContestRepo | InstanceRepo | ProxmoxPort | CloudflarePort | ResourceBindingRepo
+  | BackupPort
+  | BenchJobRepo
+  | CloudflarePort
+  | ContestRepo
+  | InstanceRepo
+  | ProxmoxPort
+  | ResourceBindingRepo
+  | RunnerAgentRepo
+  | RunnerConfig
 > =>
   Effect.gen(function* () {
     const contests = yield* ContestRepo
-    // preamble(findById + list)を Effect.either で fence する。DB 失敗は
-    // Left になり、synthetic な portal_db=fail 配列を返す(handler の 200)。
-    // ContestNotFound は「存在しない contest」なので DB 到達可能かつ Some=None、
-    // このケースは Effect.fail(new ContestNotFound()) を残して handler で 404 に。
     const preamble = yield* Effect.either(
       Effect.gen(function* () {
         const target = yield* contests.findById(contestId)
@@ -382,7 +483,17 @@ export const computeReadiness = (
     }
     const contest = preamble.right.contest
     const all = preamble.right.all
-    const [portalDb, inventory, cfToken, cfInventory, previousCleanup, cfWriteProven] = yield* Effect.all(
+    const [
+      portalDb,
+      inventory,
+      cfToken,
+      cfInventory,
+      previousCleanup,
+      cfWriteProven,
+      runnerResult,
+      backupResult,
+      rehearsalResult
+    ] = yield* Effect.all(
       [
         portalDbCheck,
         optionalInventory,
@@ -392,10 +503,17 @@ export const computeReadiness = (
           Effect.map((r) =>
             r._tag === "Right"
               ? r.right
-              : ({ key: "previous_cleanup", status: "fail" as const, summary: "portal DB unreachable while listing instances" } as ReadinessCheck)
+              : ({
+                  key: "previous_cleanup",
+                  status: "fail" as const,
+                  summary: "portal DB unreachable while listing instances"
+                } as ReadinessCheck)
           )
         ),
-        cloudflareWriteProvenCheck(contestId)
+        cloudflareWriteProvenCheck(contestId),
+        runnerCheck,
+        backupCheck,
+        rehearsalCheck(contestId)
       ],
       { concurrency: "unbounded" }
     )
@@ -411,7 +529,9 @@ export const computeReadiness = (
       cfToken,
       cfInventory,
       cfWriteProven,
-      ...deferredWarnChecks
+      runnerResult,
+      backupResult,
+      rehearsalResult
     ]
   })
 

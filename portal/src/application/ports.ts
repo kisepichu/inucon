@@ -352,6 +352,10 @@ export class BenchJobRepo extends Context.Tag("app/BenchJobRepo")<
       }>,
       RepoError
     >
+    // Task 10: readiness の rehearsal key が使う。指定 Contest スコープで
+    // status='finished' AND passed=1 AND purpose='rehearsal' の件数を返す。
+    // 0 件なら「まだ疎通実証されていない」= start required で fail に落とす。
+    readonly countSuccessfulRehearsals: (contestId: ContestId) => Effect.Effect<number, RepoError>
   }
 >() {}
 
@@ -365,9 +369,15 @@ export class GithubOAuthPort extends Context.Tag("app/GithubOAuthPort")<
   }
 >() {}
 
+// RunnerConfig: bench job のタイムアウト + Task 10 で追加した runner heartbeat の
+// 「stale と見なすまでの猶予」。readiness の runner check と start Operation は
+// この閾値を使う(env 未指定時の既定は spec §readiness の RUNNER_MAX_AGE_MILLIS)。
 export class RunnerConfig extends Context.Tag("app/RunnerConfig")<
   RunnerConfig,
-  { readonly jobTimeoutMillis: number }
+  {
+    readonly jobTimeoutMillis: number
+    readonly maxAgeMillis: number
+  }
 >() {}
 
 // 認証まわりの設定(ADMIN_GITHUB_LOGINS 由来)。Layer は main.ts で
@@ -649,26 +659,65 @@ export class ArtifactRepo extends Context.Tag("app/ArtifactRepo")<
   }
 >() {}
 
+// Task 10: runner_agents は runner heartbeat (poll payload) を反映する。
+// touch は upsert 相当だが「別 runner id が混入したら別行になる」自然な
+// upsert 契約を明示するため rename した(spec の RunnerAgentRepo.touch)。
+// getFresh は「now - lastSeenAt <= maxAgeMillis の直近 1 件」を返す。複数
+// runner が並走した場合は最新 heartbeat の 1 台を採る(現運用は runner=1 台前提)。
 export class RunnerAgentRepo extends Context.Tag("app/RunnerAgentRepo")<
   RunnerAgentRepo,
   {
-    readonly upsert: (agent: {
+    readonly touch: (agent: {
       readonly id: string
-      readonly revision: number
+      readonly revision: string
       readonly benchReady: boolean
       readonly healthSummary: string
       readonly lastSeenAt: number
     }) => Effect.Effect<void, RepoError>
-    readonly listAll: Effect.Effect<
-      ReadonlyArray<{
+    readonly getFresh: (
+      now: number,
+      maxAgeMillis: number
+    ) => Effect.Effect<
+      Option.Option<{
         readonly id: string
-        readonly revision: number
+        readonly revision: string
         readonly benchReady: boolean
         readonly healthSummary: string
         readonly lastSeenAt: number
       }>,
       RepoError
     >
+    readonly listAll: Effect.Effect<
+      ReadonlyArray<{
+        readonly id: string
+        readonly revision: string
+        readonly benchReady: boolean
+        readonly healthSummary: string
+        readonly lastSeenAt: number
+      }>,
+      RepoError
+    >
+  }
+>() {}
+
+// Task 10: portal DB 以外の backup 用ストレージへの書き込み可否 probe。
+// Live 実装 (better-sqlite3) は canary create/fsync/delete でルート
+// (BACKUP_PATH) が directory + writable であることを確認する。readiness の
+// backup check と Task 11 の snapshot API が同じポートを共有する。
+export class BackupError extends Data.TaggedError("BackupError")<{
+  readonly reason:
+    | "path_missing"
+    | "path_not_directory"
+    | "not_writable"
+    | "canary_failed"
+    | "not_configured"
+  readonly detail: string
+}> {}
+
+export class BackupPort extends Context.Tag("app/BackupPort")<
+  BackupPort,
+  {
+    readonly probe: Effect.Effect<void, BackupError>
   }
 >() {}
 

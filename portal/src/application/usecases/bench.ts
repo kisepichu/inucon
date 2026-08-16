@@ -1,13 +1,28 @@
-import { Clock, Effect, Either, Option } from "effect"
+import { Clock, Data, Effect, Either, Option } from "effect"
 import type { BenchJob, BenchJobPurpose } from "../../domain/benchJob.js"
 import { checkEnqueueAllowed, newJob } from "../../domain/benchJob.js"
 import { ContestNotRunning } from "../../domain/errors.js"
-import type { Contest } from "../../domain/contest.js"
+import type { Contest, ContestStatus } from "../../domain/contest.js"
 import type { User } from "../../domain/user.js"
 import type { ContestId } from "../../domain/ids.js"
 import { BenchJobId, InstanceId, TeamId } from "../../domain/ids.js"
-import { Forbidden, InstanceNotFound, InstanceNotRunning, NotInTeam } from "../errors.js"
-import { BenchJobRepo, ContestRepo, InstanceRepo, RunnerConfig, TeamRepo, UuidGen } from "../ports.js"
+import { ContestNotFound, Forbidden, InstanceNotFound, InstanceNotRunning, NotInTeam } from "../errors.js"
+import {
+  BenchJobRepo,
+  ContestRepo,
+  InstanceRepo,
+  RunnerAgentRepo,
+  RunnerConfig,
+  TeamRepo,
+  UuidGen
+} from "../ports.js"
+
+// Task 10: preparing 以外の contest に rehearsal を投げたときの診断エラー。
+// domain の ContestNotRunning (競合エラー) と別 tag にして HTTP レイヤ側で
+// admin rehearsal 用の 409 (wire: ContestNotPreparing) に分岐マップできる。
+export class ContestNotPreparing extends Data.TaggedError("ContestNotPreparing")<{
+  readonly status: ContestStatus
+}> {}
 
 // Task 3: enqueue は「operational な contest を取得 → その contest スコープで
 // team/instance を突き合わせる」形。preparing なら rehearsal、running なら
@@ -235,29 +250,56 @@ export interface RunnerJobView {
 // rehearsal + competition が並行で走り得るので、process manager 側で単一
 // runner を保証すること(将来 Task 10 以降で runner heartbeat + 同時実行
 // ガードを DB 側に持たせる可能性がある)。
-export const pollNextRunnerJob = Effect.gen(function* () {
-  const contests = yield* ContestRepo
-  const contest = yield* contests.getOperational
-  return yield* Option.match(contest, {
-    onNone: () => Effect.succeed(Option.none<RunnerJobView>()),
-    onSome: (c) => {
-      const purpose: BenchJobPurpose | null =
-        c.status === "running" ? "competition" : c.status === "preparing" ? "rehearsal" : null
-      if (purpose === null) return Effect.succeed(Option.none<RunnerJobView>())
-      return pollNextJobFor({ contestId: c.id, purpose }).pipe(
-        Effect.map(
-          Option.map((job) => ({
-            id: job.id,
-            teamId: job.teamId,
-            targetIp: job.targetIp,
-            targetPort: job.targetPort,
-            problemKey: c.problemKey
-          }))
-        )
-      )
+// Task 10: HTTP handler が受けた RunnerPollRequest を丸ごと渡してくる。
+// 順序は spec §heartbeat の通り:
+//   1. runner_agents を touch (heartbeat lastSeenAt/revision/benchReady 更新)。
+//   2. benchReady=false ならここで Option.none() を返し dequeue しない
+//      (spec: "heartbeat failure prevents dequeue rather than silently running")。
+//   3. operational Contest を解決し、running なら competition、preparing なら
+//      rehearsal を dequeue する。両方外れる (finalizing / 未作成) と None。
+export interface RunnerHeartbeat {
+  readonly runnerId: string
+  readonly revision: string
+  readonly benchReady: boolean
+  readonly healthSummary: string
+}
+
+export const pollNextRunnerJob = (heartbeat: RunnerHeartbeat) =>
+  Effect.gen(function* () {
+    const now = yield* Clock.currentTimeMillis
+    const agents = yield* RunnerAgentRepo
+    yield* agents.touch({
+      id: heartbeat.runnerId,
+      revision: heartbeat.revision,
+      benchReady: heartbeat.benchReady,
+      healthSummary: heartbeat.healthSummary,
+      lastSeenAt: now
+    })
+    if (!heartbeat.benchReady) {
+      return Option.none<RunnerJobView>()
     }
+    const contests = yield* ContestRepo
+    const contest = yield* contests.getOperational
+    return yield* Option.match(contest, {
+      onNone: () => Effect.succeed(Option.none<RunnerJobView>()),
+      onSome: (c) => {
+        const purpose: BenchJobPurpose | null =
+          c.status === "running" ? "competition" : c.status === "preparing" ? "rehearsal" : null
+        if (purpose === null) return Effect.succeed(Option.none<RunnerJobView>())
+        return pollNextJobFor({ contestId: c.id, purpose }).pipe(
+          Effect.map(
+            Option.map((job) => ({
+              id: job.id,
+              teamId: job.teamId,
+              targetIp: job.targetIp,
+              targetPort: job.targetPort,
+              problemKey: c.problemKey
+            }))
+          )
+        )
+      }
+    })
   })
-})
 
 // GET /api/bench-jobs?teamId=。表示は「今 display すべき contest」に固定する
 // (running/finalizing > 最新 finished > preparing)。finished でも履歴が
@@ -291,3 +333,101 @@ export const getBenchJobDetail = (args: { user: User; jobId: BenchJobId }) =>
     const log = yield* jobs.getLog(args.jobId)
     return { job, log }
   })
+
+// Task 10: rehearsal は admin 専用エンドポイント。参加者は running 以降に
+// /api/bench-jobs 経由で(enqueueBench の purpose 自動判定)入れる。
+// スペック §Task 10: `enqueueRehearsal(contestId, instanceId, actor)`。
+//
+// エラー種別:
+//   - Forbidden: 非 admin
+//   - ContestNotFound: 指定 contestId が存在しない
+//   - ContestNotPreparing: preparing 以外 (draft/running/finalizing/finished/canceled)
+//   - InstanceNotFound: instanceId が存在しない、または他 contest / 他 team
+//     (privateIp を漏らさないよう Forbidden に潰さず 404 のまま — 呼び出し元
+//     admin は自身のみ、非 admin は Forbidden で既に弾かれている)
+//   - InstanceNotRunning: 対象 Instance が running でない
+//   - TeamJobAlreadyQueued: 対象チームに同 purpose の active ジョブがある
+//   - TargetIpOutOfSubnet: (Instance の privateIp は subnet 内なので通常発火しないが
+//     domain の checkEnqueueAllowed が返す可能性があるため型に含める)
+// ContestNotPreparing はドメイン側 (ContestNotRunning) と別型で表現し、
+// HTTP handler が admin rehearsal に固有の 409 (wire: ContestNotPreparing) に
+// マップできるようにする。TargetIpOutOfSubnet は domain error をそのまま透過。
+export const enqueueRehearsal = (args: {
+  contestId: ContestId
+  instanceId: InstanceId
+  actor: User
+}) =>
+  Effect.gen(function* () {
+    if (!args.actor.isAdmin) {
+      return yield* Effect.fail(new Forbidden())
+    }
+    const contests = yield* ContestRepo
+    const contest = yield* (yield* contests.findById(args.contestId)).pipe(
+      Option.match({
+        onNone: () => Effect.fail(new ContestNotFound()),
+        onSome: Effect.succeed
+      })
+    )
+    if (contest.status !== "preparing") {
+      return yield* Effect.fail(new ContestNotPreparing({ status: contest.status }))
+    }
+    const instances = yield* InstanceRepo
+    const instance = yield* (yield* instances.findById(args.instanceId)).pipe(
+      Option.match({
+        onNone: () => Effect.fail(new InstanceNotFound()),
+        onSome: Effect.succeed
+      })
+    )
+    if (instance.contestId !== contest.id) {
+      return yield* Effect.fail(new InstanceNotFound())
+    }
+    if (instance.status !== "running") {
+      return yield* Effect.fail(new InstanceNotRunning({ instanceId: instance.id }))
+    }
+    // admin は自身の team member でなくても他 team の rehearsal を叩けるが、
+    // Instance には必ず所属 team が紐づいているのでそれを使う。domain の
+    // checkEnqueueAllowed は teamNumber + subnet を突き合わせるので、
+    // team を lookup する。
+    const teams = yield* TeamRepo
+    const team = yield* (yield* teams.findById(contest.id, instance.teamId)).pipe(
+      Option.match({
+        // team が存在しないのは DB 不整合 (Instance.teamId が孤児) — 呼び出し元
+        // からは診断できない状況なので defect にする。
+        onNone: () => Effect.dieMessage(`instance ${instance.id} references missing team ${instance.teamId}`),
+        onSome: Effect.succeed
+      })
+    )
+    yield* Either.match(
+      checkEnqueueAllowed({
+        contest,
+        purpose: "rehearsal",
+        teamNumber: team.teamNumber,
+        targetIp: instance.privateIp
+      }),
+      { onLeft: Effect.fail, onRight: Effect.succeed }
+    )
+    const uuidGen = yield* UuidGen
+    const id = BenchJobId.make(yield* uuidGen.next)
+    const now = yield* Clock.currentTimeMillis
+    const jobs = yield* BenchJobRepo
+    return yield* jobs.insertIfAllowed(
+      newJob({
+        id,
+        contestId: contest.id,
+        teamId: team.id,
+        targetIp: instance.privateIp,
+        targetPort: 80,
+        purpose: "rehearsal",
+        now
+      }),
+      { instanceId: instance.id, teamId: team.id }
+    )
+  }).pipe(
+    Effect.catchTag("ContestNotRunning", (e) =>
+      // domain checkEnqueueAllowed は contest.status ≠ preparing のときも
+      // ContestNotRunning を返す。ここに来たらプリチェックの後で contest.status が
+      // 変わった (race) — 診断名を rehearsal 用に載せ替える。
+      Effect.fail(new ContestNotPreparing({ status: e.status }))
+    )
+  )
+

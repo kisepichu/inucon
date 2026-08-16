@@ -337,7 +337,21 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
               latestAt: row.latestAt
             }))
           )
-        )
+        ),
+
+      // Task 10: readiness の rehearsal key が使う。start required は「少なくとも
+      // 1 回 passed=1 の rehearsal を通した Contest だけを許す」ため、単純な
+      // COUNT(*) で十分。生 job id / score は非機密境界を跨がないよう返さない。
+      countSuccessfulRehearsals: (contestId: ContestId) =>
+        wrapSqlError(
+          sql<{ count: number }>`
+            SELECT COUNT(*) AS count FROM bench_jobs
+            WHERE contest_id = ${contestId}
+              AND purpose = 'rehearsal'
+              AND status = 'finished'
+              AND passed = 1
+          `
+        ).pipe(Effect.map((rows) => rows[0]?.count ?? 0))
     }
   })
 )

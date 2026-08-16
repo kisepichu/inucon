@@ -24,6 +24,8 @@ import { InvalidOperationTransition } from "../../src/domain/errors.js"
 import { MemberConflict, ProvisionInProgress, QuotaExceeded } from "../../src/application/errors.js"
 import {
   AmbiguousAccessPolicy,
+  BackupError,
+  BackupPort,
   BenchJobRepo,
   CloudflareError,
   CloudflarePort,
@@ -41,6 +43,7 @@ import {
   ProxmoxPort,
   RepoError,
   ResourceBindingRepo,
+  RunnerAgentRepo,
   RunnerConfig,
   SessionRepo,
   TeamRepo,
@@ -858,14 +861,33 @@ export const makeBenchJobRepoTest = (
                   latestAt: latest === undefined ? null : Option.getOrNull(latest.finishedAt)
                 }
               })
-          })
+          }),
+        // Task 10: 「passed=1 かつ purpose='rehearsal' かつ finished」件数を数える。
+        countSuccessfulRehearsals: (contestId: ContestId) =>
+          Ref.get(jobsRef).pipe(
+            Effect.map(
+              (jobs) =>
+                jobs.filter(
+                  (j) =>
+                    j.contestId === contestId &&
+                    j.purpose === "rehearsal" &&
+                    j.status === "finished" &&
+                    Option.match(j.passed, { onNone: () => false, onSome: (p) => p })
+                ).length
+            )
+          )
       }
     })
   )
 
 
-export const RunnerConfigTest = (jobTimeoutMillis: number): Layer.Layer<RunnerConfig> =>
-  Layer.succeed(RunnerConfig, { jobTimeoutMillis })
+// Task 10 で maxAgeMillis が RunnerConfig に加わった。既定は 60_000ms
+// (readiness の runner check で使う。個別テストは短い値に上書きして stale
+// テストケースを作る)。
+export const RunnerConfigTest = (
+  jobTimeoutMillis: number,
+  maxAgeMillis: number = 60_000
+): Layer.Layer<RunnerConfig> => Layer.succeed(RunnerConfig, { jobTimeoutMillis, maxAgeMillis })
 
 // 払い出しガードの閾値・タイムアウト(Task 4)。既定は本番既定と同じ
 // 5GiB(minFreeMemBytes)/ 120 秒(guestAgentTimeoutMillis)。テストで
@@ -1566,4 +1588,61 @@ export const makeOperationRepoStubTest = (
     resumeExpired: () => Effect.succeed(0),
     retry: () => Effect.dieMessage("makeOperationRepoStubTest: retry not implemented"),
     cancel: () => Effect.dieMessage("makeOperationRepoStubTest: cancel not implemented")
+  })
+
+// Task 10: RunnerAgentRepo のインメモリ実装。touch は id 一意で upsert し、
+// getFresh は now - lastSeenAt <= maxAgeMillis の最新 1 台を返す。
+// initial 行は now 相対時刻を渡してテスト側で「新鮮 / stale」を作り分ける。
+export type RunnerAgentTestRow = {
+  readonly id: string
+  readonly revision: string
+  readonly benchReady: boolean
+  readonly healthSummary: string
+  readonly lastSeenAt: number
+}
+
+export const makeRunnerAgentRepoTest = (
+  initial: ReadonlyArray<RunnerAgentTestRow> = []
+): Layer.Layer<RunnerAgentRepo> =>
+  Layer.effect(
+    RunnerAgentRepo,
+    Effect.gen(function* () {
+      const rowsRef = yield* Ref.make<ReadonlyArray<RunnerAgentTestRow>>(initial)
+      return {
+        touch: (agent) =>
+          Ref.update(rowsRef, (rows) => {
+            const idx = rows.findIndex((r) => r.id === agent.id)
+            if (idx < 0) return [...rows, agent]
+            const next = rows.slice()
+            next[idx] = agent
+            return next
+          }),
+        getFresh: (now, maxAgeMillis) =>
+          Ref.get(rowsRef).pipe(
+            Effect.map((rows) => {
+              const fresh = rows
+                .filter((r) => now - r.lastSeenAt <= maxAgeMillis)
+                .sort((a, b) => b.lastSeenAt - a.lastSeenAt)
+              return fresh.length === 0 ? Option.none() : Option.some(fresh[0])
+            })
+          ),
+        listAll: Ref.get(rowsRef).pipe(Effect.map((rows) => rows.slice().sort((a, b) => (a.id < b.id ? -1 : 1))))
+      }
+    })
+  )
+
+// Task 10: BackupPort のインメモリ実装。probe は options.failWith が渡されて
+// いればその BackupError で常に fail し、それ以外は成功する(readiness の
+// backup=pass 分岐 / fail 分岐を切り替えるだけの最小実装)。実 FS canary を
+// 触るテストは test/infrastructure/backupProbe.test.ts が担当する。
+export interface BackupPortTestOptions {
+  readonly failWith?: BackupError
+}
+
+export const makeBackupPortTest = (options: BackupPortTestOptions = {}): Layer.Layer<BackupPort> =>
+  Layer.succeed(BackupPort, {
+    probe:
+      options.failWith === undefined
+        ? Effect.void
+        : Effect.fail(options.failWith)
   })

@@ -33,7 +33,29 @@ const LoopConfigLive = Layer.effect(
   LoopConfig,
   Effect.all({
     pollIntervalMillis: Config.integer("POLL_INTERVAL_MILLIS").pipe(Config.withDefault(2000)),
-    progressIntervalMillis: Config.integer("PROGRESS_INTERVAL_MILLIS").pipe(Config.withDefault(5000))
+    progressIntervalMillis: Config.integer("PROGRESS_INTERVAL_MILLIS").pipe(Config.withDefault(5000)),
+    // Task 10: heartbeat 用の識別子。RUNNER_ID は spec §Global Constraints の
+    // team slot と同じく複数 runner を将来サポートするための識別子で、既定は
+    // "benchvm" (現行 1 台構成)。RUNNER_REVISION は spec の「Dev may use 'dev'」
+    // 節に沿って既定 "dev" とし、production では agenix secret (Task 14) で
+    // 具体的な git commit hash 等を明示的に注入する運用にする (空文字は拒否)。
+    // 空文字を拒否する validate は Config.withDefault の後ろでも実行されるが、
+    // 既定 "dev" が空でない以上通常はここには到達しない (env で空文字を強制した
+    // 場合のみ発火する防御ガード)。
+    runnerId: Config.string("RUNNER_ID").pipe(Config.withDefault("benchvm")),
+    runnerRevision: Config.string("RUNNER_REVISION").pipe(
+      Config.withDefault("dev"),
+      Config.validate({
+        message: "RUNNER_REVISION must be non-empty",
+        validation: (v) => v.trim() !== ""
+      })
+    ),
+    // BENCH_DIR は privateIsuAdapter が process.env から読む場所と同じにする
+    // (spec §4)。runner ローカル heartbeat が directory 実在 + read 可能性を
+    // 検査するのに使う。既定は現行 benchvm の canonical パスと同じ。
+    benchDir: Config.string("BENCH_DIR").pipe(
+      Config.withDefault("/home/kise/private-isu/benchmarker")
+    )
   })
 )
 
@@ -57,7 +79,11 @@ const PortalClientLive = Layer.effect(
         )
     })
     return {
-      poll: client.runner.pollJob().pipe(Effect.map((res) => Option.fromNullable(res.job))),
+      // Task 10: heartbeat payload を body に載せる新シグネチャ。ポータルは
+      // runner_agents を touch → benchReady=true なら dequeue、false なら
+      // Option.none() を返す。ここは payload をそのまま渡すだけ。
+      poll: (payload) =>
+        client.runner.pollJob({ payload }).pipe(Effect.map((res) => Option.fromNullable(res.job))),
       reportProgress: (jobId, payload) => client.runner.reportProgress({ path: { id: jobId }, payload }),
       reportFinish: (jobId, payload) => client.runner.reportFinish({ path: { id: jobId }, payload })
     }

@@ -15,10 +15,12 @@ import type { UserId } from "../../domain/ids.js"
 import { Team } from "../../domain/team.js"
 import { TeamInvite } from "../../domain/teamInvite.js"
 import { ContestNotFound } from "../errors.js"
+import type { Operation } from "../../domain/operation.js"
 import {
   ContestRepo,
   InstanceRepo,
   InviteRepo,
+  OperationInProgress,
   OperationRepo,
   RepoError,
   TeamRepo,
@@ -459,3 +461,65 @@ export const getAdminContest = (
       Option.match({ onNone: () => Effect.fail(new ContestNotFound()), onSome: Effect.succeed })
     )
   )
+
+// Task 10: preparing → running へ遷移する Operation を enqueue する。
+// spec §Step 6 「Do not trust the last UI readiness response.」に従い、この
+// enqueue 時点では readiness を再計算せず、単に kind='start' の 1-step Operation を
+// 積む。実際の readiness 再検査と saveIfRevision は worker が起動する
+// start Operation handler の中で行う (portal/src/application/usecases/startOperation.ts)。
+//
+// enqueue 側で見るのは:
+//   - Contest 存在 (ContestNotFound)
+//   - expectedRevision 一致 (ContestRevisionConflict; 悪意 UI が古い revision で
+//     start を蹴らないよう HTTP レイヤの前段で 409 に落とす)
+//   - Contest が preparing (InvalidContestTransition)。この時点で running/finalizing
+//     に既に居るなら別 admin が start 済み、finished/canceled なら誤操作。
+//   - グローバル未完了 Operation 無し (OperationInProgress は OperationRepo.enqueue
+//     の SQL ガードで検出)。
+export type RequestContestStartError =
+  | RepoError
+  | ContestNotFound
+  | ContestRevisionConflict
+  | InvalidContestTransition
+  | OperationInProgress
+
+export const requestContestStart = (
+  contestId: ContestId,
+  expectedRevision: number,
+  actorUserId: UserId
+): Effect.Effect<Operation, RequestContestStartError, ContestRepo | OperationRepo> =>
+  Effect.gen(function* () {
+    const contest = yield* loadForMutation(contestId)
+    if (contest.revision !== expectedRevision) {
+      return yield* Effect.fail(
+        new ContestRevisionConflict({ expected: expectedRevision, actual: contest.revision })
+      )
+    }
+    if (contest.status !== "preparing") {
+      return yield* Effect.fail(
+        new InvalidContestTransition({ from: contest.status, to: "running" })
+      )
+    }
+    const operations = yield* OperationRepo
+    return yield* operations.enqueue({
+      contestId: contest.id,
+      kind: "start",
+      actor: { kind: "admin", userId: actorUserId },
+      // start Operation は plan digest の source-of-truth を持たないため
+      // reconciliation のような hash ではなく監査用の固定文字列を使う。
+      planDigest: `start:c${contest.id}:r${contest.revision}`,
+      contestRevision: contest.revision,
+      steps: [
+        {
+          stepKey: START_CONTEST_STEP_KEY,
+          ordinal: 0,
+          inputSummary: JSON.stringify({ contestId: contest.id, expectedRevision }),
+          continueOnError: false
+        }
+      ]
+    })
+  })
+
+// spec §Step 6 「single step recomputes every required check immediately before
+// `saveIfRevision`」の 1-step 名。handler 側でこの key を lookup する。
+export const START_CONTEST_STEP_KEY = "start_contest" as const

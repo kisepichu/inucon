@@ -13,8 +13,13 @@ import {
 // 行う)。
 export const RunnerLive = HttpApiBuilder.group(api, "runner", (handlers) =>
   handlers
-    .handle("pollJob", () =>
-      pollNextRunnerJob.pipe(
+    .handle("pollJob", ({ payload }) =>
+      pollNextRunnerJob({
+        runnerId: payload.runnerId,
+        revision: payload.revision,
+        benchReady: payload.benchReady,
+        healthSummary: payload.healthSummary
+      }).pipe(
         Effect.map((job) => ({ job: Option.getOrNull(job) })),
         Effect.orDie
       )

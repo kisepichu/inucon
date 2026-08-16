@@ -33,6 +33,7 @@ import type { StubGithubUser } from "./githubOAuthStub.js"
 import { makeGithubOAuthStub } from "./githubOAuthStub.js"
 import type { CloudflareInventorySeed, ManagedVmSeed } from "./inMemory.js"
 import {
+  makeBackupPortTest,
   makeCloudflarePortTest,
   makeGithubKeysPortTest,
   makeProxmoxPortTest,
@@ -87,7 +88,13 @@ const baseTestConfigProvider = CP.fromMap(new Map([["RUNNER_TOKEN", RUNNER_TOKEN
   CP.orElse(() => CP.fromEnv())
 )
 
-const RunnerConfigTestLive = Layer.succeed(RunnerConfig, { jobTimeoutMillis: 600_000 })
+const RunnerConfigTestLive = Layer.succeed(RunnerConfig, {
+  jobTimeoutMillis: 600_000,
+  // Task 10: runner heartbeat の readiness / gate 判定用。テストは実時間で
+  // 走るので十分に長い既定 (60s) を渡し、個別テストは runner_agents を
+  // 直接 seed / touch して stale / fresh を切り替える。
+  maxAgeMillis: 60_000
+})
 
 // Proxmox/Cloudflare/GithubKeys の 3 port(Task 5): AdminLive の inviteMember/
 // listInvites ハンドラ(invites.ts 経由)がこれらを要求するため、テスト用
@@ -164,6 +171,10 @@ export const makeAppTestLayer = (options?: {
         // 要求するため、http テスト全般が壊れないよう既定値を配線する
         // (makeInstancePortsTestLive と同じ理由)。
         Layer.provide(ProvisioningConfigTest()),
+        // Task 10: readiness (operations handler) が BackupPort を要求する。
+        // http テストは実 FS canary を触らないので probe=success で埋める
+        // (dedicated backup probe テストは test/infrastructure/backupProbe.test.ts)。
+        Layer.provide(makeBackupPortTest()),
         Layer.provide(
           Layer.setConfigProvider(
             options?.configProvider !== undefined

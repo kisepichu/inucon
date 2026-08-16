@@ -3,8 +3,8 @@ import { it } from "@effect/vitest"
 import { Effect, Option } from "effect"
 import { describe, expect } from "vitest"
 import { DEFAULT_TEST_CONTEST_ID, makeContest, makeInstance, makeTeam } from "../support/factories.js"
-import { InstanceId, TeamId } from "../../src/domain/ids.js"
-import { ContestRepo, InstanceRepo, TeamRepo } from "../../src/application/ports.js"
+import { BenchJobId, InstanceId, TeamId } from "../../src/domain/ids.js"
+import { BenchJobRepo, ContestRepo, InstanceRepo, TeamRepo } from "../../src/application/ports.js"
 import { login } from "../support/login.js"
 import { asAdmin, TestLayer } from "../support/apiTestHelpers.js"
 import { RUNNER_TOKEN_TEST } from "../support/testApi.js"
@@ -48,11 +48,28 @@ const enqueue = (cookieHeader: string, payload: unknown) =>
     return yield* client.post("/api/bench-jobs", { headers: { cookie: cookieHeader }, body: HttpBody.unsafeJson(payload) })
   })
 
-const poll = () =>
+// Task 10: pollJob は payload を受ける形になった。テストは既定 heartbeat を
+// 送る (benchReady=true) が、payload をオーバライドすれば dequeue 抑制 /
+// stale 検証もできる。
+const poll = (
+  payload: {
+    runnerId?: string
+    revision?: string
+    benchReady?: boolean
+    healthSummary?: string
+  } = {}
+) =>
   Effect.gen(function* () {
     const client = yield* HttpClient.HttpClient
+    const body = yield* HttpBody.json({
+      runnerId: payload.runnerId ?? "runner-test",
+      revision: payload.revision ?? "test",
+      benchReady: payload.benchReady ?? true,
+      healthSummary: payload.healthSummary ?? "ok"
+    }).pipe(Effect.orDie)
     return yield* client.post("/api/runner/jobs/poll", {
-      headers: { authorization: `Bearer ${RUNNER_TOKEN_TEST}` }
+      headers: { authorization: `Bearer ${RUNNER_TOKEN_TEST}` },
+      body
     })
   })
 
@@ -387,6 +404,120 @@ describe("POST /api/bench-jobs/:id/cancel", () => {
       const { cookieHeader: noTeamCookie } = yield* login({ githubLogin: "bench-no-team", githubId: 9000 })
       const res = yield* cancel(noTeamCookie, enqueued.id)
       expect(res.status).toBe(403)
+    }).pipe(Effect.provide(TestLayer))
+  )
+})
+
+// Task 10: POST /api/admin/contests/:contestId/rehearsal は admin 専用。
+// preparing Contest の running Instance に対して rehearsal BenchJob を投入する。
+describe("POST /api/admin/contests/:contestId/rehearsal (Task 10)", () => {
+  const rehearsalSetup = () =>
+    Effect.gen(function* () {
+      teamSeq++
+      // 現行 preparing Contest を seed する (setup() は running を作るため使わない)。
+      const contests = yield* ContestRepo
+      const contest = makeContest({ id: DEFAULT_TEST_CONTEST_ID, status: "preparing" })
+      yield* contests.create(contest)
+
+      const teams = yield* TeamRepo
+      const teamNumber = 80 + teamSeq
+      const team = makeTeam({
+        id: TeamId.make(`team-rehearsal-${teamSeq}`),
+        name: `RehearsalTeam ${teamSeq}`,
+        teamNumber
+      })
+      yield* teams.create(team)
+
+      const { user: adminUser, cookieHeader: adminCookie } = yield* asAdmin()
+      yield* teams.setMembers(DEFAULT_TEST_CONTEST_ID, team.id, [adminUser.id])
+
+      // 対象 Instance は running で seed する。
+      const instances = yield* InstanceRepo
+      const instanceId = InstanceId.make(`inst-rehearsal-${teamSeq}`)
+      yield* instances.create(
+        makeInstance({
+          id: instanceId,
+          teamId: team.id,
+          contestId: DEFAULT_TEST_CONTEST_ID,
+          index: 1,
+          vmid: 5000 + teamSeq,
+          privateIp: `10.100.${teamNumber}.11`,
+          status: "running"
+        })
+      )
+      return { adminCookie, contest, instanceId, teamNumber }
+    })
+
+  const rehearsal = (cookieHeader: string, contestId: string, payload: { instanceId: string }) =>
+    Effect.gen(function* () {
+      const client = yield* HttpClient.HttpClient
+      return yield* client.post(`/api/admin/contests/${contestId}/rehearsal`, {
+        headers: { cookie: cookieHeader },
+        body: HttpBody.unsafeJson(payload)
+      })
+    })
+
+  it.effect("admin + preparing + running Instance → 200 で rehearsal BenchJob が返る", () =>
+    Effect.gen(function* () {
+      const { adminCookie, instanceId, contest } = yield* rehearsalSetup()
+      const res = yield* rehearsal(adminCookie, contest.id, { instanceId })
+      expect(res.status).toBe(200)
+      const body = (yield* res.json) as { purpose: string; status: string; targetPort: number }
+      expect(body.purpose).toBe("rehearsal")
+      expect(body.status).toBe("queued")
+      expect(body.targetPort).toBe(80)
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("非 admin は 403", () =>
+    Effect.gen(function* () {
+      const { instanceId, contest } = yield* rehearsalSetup()
+      const { cookieHeader } = yield* login({ githubLogin: "rehearsal-non-admin", githubId: 8100 })
+      const res = yield* rehearsal(cookieHeader, contest.id, { instanceId })
+      expect(res.status).toBe(403)
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("Contest が running のときは 409 ContestNotPreparing", () =>
+    Effect.gen(function* () {
+      const { adminCookie, contest, instanceId } = yield* rehearsalSetup()
+      // preparing → running に遷移させる (実際は start Operation 経由だが、
+      // ここは repository を直接叩いて状態だけ変える)。
+      const contests = yield* ContestRepo
+      yield* contests.saveIfRevision(
+        makeContest({ ...contest, status: "running", revision: contest.revision + 1 }),
+        contest.revision
+      )
+      const res = yield* rehearsal(adminCookie, contest.id, { instanceId })
+      expect(res.status).toBe(409)
+      const body = (yield* res.json) as { _tag: string; status: string }
+      expect(body._tag).toBe("ContestNotPreparing")
+      expect(body.status).toBe("running")
+    }).pipe(Effect.provide(TestLayer))
+  )
+
+  it.effect("rehearsal スコアは scoreboard に載らない (purpose='competition' のみ集計)", () =>
+    Effect.gen(function* () {
+      const { adminCookie, contest, instanceId } = yield* rehearsalSetup()
+      const enqueueRes = yield* rehearsal(adminCookie, contest.id, { instanceId })
+      expect(enqueueRes.status).toBe(200)
+      const job = (yield* enqueueRes.json) as { id: string }
+      // finished + passed に手動で遷移させる (runner 経由でも良いが、副作用が
+      // 大きい)。BenchJobRepo を直接使う。
+      const jobs = yield* BenchJobRepo
+      yield* jobs.dequeueNextQueued({ contestId: contest.id, purpose: "rehearsal" }, 1000)
+      yield* jobs.finishIfRunning(
+        BenchJobId.make(job.id),
+        { score: 999, passed: true },
+        2000
+      )
+      // scoreboard 経由で取得 (purpose='competition' しか集計しない)。
+      const client = yield* HttpClient.HttpClient
+      const sb = yield* client.get(`/api/contests/${contest.id}/scoreboard`)
+      expect(sb.status).toBe(200)
+      const rows = (yield* sb.json) as ReadonlyArray<{ bestScore: number | null }>
+      // rehearsal の 999 が漏れていないこと (bestScore は null のまま)。
+      expect(rows.every((r) => r.bestScore === null)).toBe(true)
     }).pipe(Effect.provide(TestLayer))
   )
 })
