@@ -307,6 +307,34 @@ export const BenchJobRepoLive: Layer.Layer<BenchJobRepo, never, SqlClient.SqlCli
           `
         ).pipe(Effect.asVoid),
 
+      // Task 11: finalize Operation の cancel_queued step 用。running/queued の
+      // うち queued のみを canceled に落とす(running は wait_running step で
+      // 自然完了を待ち、それでも動かないものは既存 timeoutSweeper が failed に
+      // する)。purpose は分けない(rehearsal も含めて drain する)。返り値は
+      // 実際に canceled にした件数(step summary に載せる)。finished_at は
+      // 「終了」の意味を持つカラムなので canceled でも刻む(cancel_at 別列を
+      // 増やさずに Task 5 の cancelIfQueued と揃える方針)。
+      cancelQueuedByContest: (contestId: ContestId, now: number) =>
+        wrapSqlError(
+          sql<{ id: string }>`
+            UPDATE bench_jobs
+            SET status = 'canceled', finished_at = ${now}
+            WHERE contest_id = ${contestId} AND status = 'queued'
+            RETURNING id
+          `
+        ).pipe(Effect.map((rows) => rows.length)),
+
+      // Task 11: wait_running step の判定。purpose を分けずに contest スコープの
+      // running 総数を返す(rehearsal は preparing 時点で終わっている想定だが、
+      // 防御的に両者を含める)。
+      countRunningByContest: (contestId: ContestId) =>
+        wrapSqlError(
+          sql<{ count: number }>`
+            SELECT COUNT(*) AS count FROM bench_jobs
+            WHERE contest_id = ${contestId} AND status = 'running'
+          `
+        ).pipe(Effect.map((rows) => rows[0]?.count ?? 0)),
+
       // Task 3: 集計対象は当該 contest かつ purpose='competition' の finished
       // のみ。rehearsal は表示しない。0 件チームも teams 列を LEFT で残す。
       scoreboard: (contestId: ContestId) =>

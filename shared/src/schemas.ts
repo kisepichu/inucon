@@ -511,3 +511,36 @@ export const Operation = Schema.Struct({
   finishedAt: Schema.NullOr(Schema.Int)
 })
 export type Operation = typeof Operation.Type
+
+// Task 11: contest_artifacts 行を UI/公開 API に返すための wire schema。
+// domain の Artifact (Option verifiedAt) は境界を跨がないため、null 許容 struct
+// を境界にする(BenchJob/Operation と同じ方針)。storagePath は返さない
+// (path traversal の攻撃面を狭くする; download 経路は artifactId → ArtifactRepo
+// で解決するのが唯一の path source。)
+export const ArtifactKind = Schema.Literal("scoreboard", "scoreboard_csv", "snapshot")
+export type ArtifactKind = typeof ArtifactKind.Type
+
+export const ArtifactOffHostStatus = Schema.Literal("not_applicable", "pending", "verified")
+export type ArtifactOffHostStatus = typeof ArtifactOffHostStatus.Type
+
+export const Artifact = Schema.Struct({
+  id: ArtifactId,
+  contestId: ContestId,
+  kind: ArtifactKind,
+  sha256: Schema.String,
+  sizeBytes: Schema.Int.pipe(Schema.nonNegative()),
+  offHostStatus: ArtifactOffHostStatus,
+  verifiedAt: Schema.NullOr(Schema.Int),
+  createdAt: Schema.Int
+})
+export type Artifact = typeof Artifact.Type
+
+// POST /api/admin/artifacts/:artifactId/verify: 表示 SHA-256 を再入力して
+// off_host copy を "verified" に上げる。64 桁 hex (`[0-9a-f]{64}`) を強制する
+// (review round 1 finding 3: 空文字 / 非 hex を application まで通すと
+// 常に mismatch (409) になり、operator が「なぜ 409 か」を推測する必要が
+// 出るため、契約層で 422 に落とす)。
+export const VerifyArtifactRequest = Schema.Struct({
+  sha256: Schema.String.pipe(Schema.pattern(/^[0-9a-f]{64}$/))
+})
+export type VerifyArtifactRequest = typeof VerifyArtifactRequest.Type

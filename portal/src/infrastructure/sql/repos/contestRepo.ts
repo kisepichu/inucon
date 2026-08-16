@@ -219,10 +219,16 @@ export const ContestRepoLive: Layer.Layer<ContestRepo, never, SqlClient.SqlClien
       saveIfRevisionAndPurgeInvites: (c: Contest, expectedRevision: number) =>
         sql.withTransaction(
           Effect.gen(function* () {
+            // Task 11: finish_contest step もこの atomic 版を経由するため、
+            // canceled_at だけでなく finishedAt / finalizingAt も更新する。
+            // cancel と finish のどちらも同じ更新カラム集合(status +
+            // 対応する timestamp + revision)で扱える。
             const updated = yield* sql<{ revision: number }>`
               UPDATE contests SET
                 status = ${c.status},
                 canceled_at = ${Option.getOrNull(c.canceledAt)},
+                finalizing_at = ${Option.getOrNull(c.finalizingAt)},
+                finished_at = ${Option.getOrNull(c.finishedAt)},
                 revision = ${c.revision}
               WHERE id = ${c.id} AND revision = ${expectedRevision}
               RETURNING revision

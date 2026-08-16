@@ -16,6 +16,7 @@ import { RunnerLive } from "../../src/infrastructure/http/handlers/runner.js"
 import { ScoreboardLive } from "../../src/infrastructure/http/handlers/scoreboard.js"
 import { TeamsLive } from "../../src/infrastructure/http/handlers/teams.js"
 import { AdminOnlyLive, AuthenticationLive, RunnerAuthLive } from "../../src/infrastructure/http/middleware.js"
+import { ArtifactsLive } from "../../src/infrastructure/http/handlers/artifacts.js"
 import { ArtifactRepoLive } from "../../src/infrastructure/sql/repos/artifactRepo.js"
 import { BenchJobRepoLive } from "../../src/infrastructure/sql/repos/benchJobRepo.js"
 import { ContestRepoLive } from "../../src/infrastructure/sql/repos/contestRepo.js"
@@ -155,7 +156,8 @@ export const makeAppTestLayer = (options?: {
             BenchLive,
             RunnerLive,
             ScoreboardLive,
-            OperationsLive
+            OperationsLive,
+            ArtifactsLive
           )
         ),
         Layer.provide(AuthenticationLive),

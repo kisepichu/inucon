@@ -67,6 +67,17 @@ export const ArtifactRepoLive: Layer.Layer<ArtifactRepo, never, SqlClient.SqlCli
           )
         ),
 
+      findById: (id: ArtifactId) =>
+        wrapSqlError(
+          sql<ArtifactRow>`SELECT ${columns} FROM contest_artifacts WHERE id = ${id}`
+        ).pipe(
+          Effect.flatMap((rows) =>
+            rows.length === 0
+              ? Effect.succeed(Option.none<Artifact>())
+              : decodeRow(Artifact, rows[0]).pipe(Effect.map(Option.some))
+          )
+        ),
+
       markVerified: (id: ArtifactId, now: number) =>
         wrapSqlError(
           sql`UPDATE contest_artifacts SET off_host_status = 'verified', verified_at = ${now} WHERE id = ${id}`

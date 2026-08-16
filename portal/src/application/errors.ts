@@ -1,4 +1,5 @@
 import { Data } from "effect"
+import type { ContestStatus } from "../domain/contest.js"
 import type { InstanceId, TeamId } from "../domain/ids.js"
 
 // ユースケース(オーケストレーション)固有のエラー。
@@ -100,3 +101,24 @@ export class AmbiguousReconciliation extends Data.TaggedError("AmbiguousReconcil
 // 用意して 409 (Conflict: 適用対象なし) に落とす。UI は「既に clean です」
 // と表示できる。
 export class NothingToReconcile extends Data.TaggedError("NothingToReconcile")<{}> {}
+
+// Task 11: markOffHostVerified が呼び出し元表示 SHA-256 と DB 側の sha256 の
+// 一致を要求する。不一致は operator に「再取得してください」の 409 を返す。
+// 生の cause / path は絶対に載せない。actual は artifact.sha256、expected は
+// 呼び出し元入力(いずれも 64 桁 hex)。
+export class ArtifactChecksumMismatch extends Data.TaggedError("ArtifactChecksumMismatch")<{
+  readonly expected: string
+  readonly actual: string
+}> {}
+
+// Task 11 review round 1 finding 1: verifyArtifactChecksum が
+// ArtifactRepo.findById(None) を「artifact 行不存在」と分類する専用型。
+// 従来は ContestNotFound を再利用して HTTP 層でも 404 に畳めるので実害は
+// なかったが、_tag で分岐する未来の caller が「contest 不在」と混同するのを
+// 防ぐため型を分ける。
+export class ArtifactNotFound extends Data.TaggedError("ArtifactNotFound")<{}> {}
+// Task 11: legacy archive-only regenerate の enqueue 時に Contest が
+// finished でないと 409 を返す。contest.status は enum なので情報漏えいなし。
+export class InvalidArchiveState extends Data.TaggedError("InvalidArchiveState")<{
+  readonly status: ContestStatus
+}> {}

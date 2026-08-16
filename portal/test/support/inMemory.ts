@@ -1,4 +1,8 @@
 import { Context, Effect, Either, Layer, Option, Ref } from "effect"
+import { createHash } from "node:crypto"
+import { promises as fsp } from "node:fs"
+import { join as pathJoin, resolve as pathResolve, sep as pathSep } from "node:path"
+import { BackupError as _BackupErrorTag } from "../../src/application/ports.js"
 import type { BenchJobPurpose } from "../../src/domain/benchJob.js"
 import { BenchJob, cancelJob, failJob, finishJob, recordProgress, startJob } from "../../src/domain/benchJob.js"
 import type { Contest } from "../../src/domain/contest.js"
@@ -807,6 +811,23 @@ export const makeBenchJobRepoTest = (
                 ? new BenchJob({ ...j, status: "canceled" })
                 : j
             )
+          ),
+        // Task 11: purpose を分けず contest スコープの queued を全て canceled に。
+        cancelQueuedByContest: (contestId: ContestId, now: number) =>
+          Ref.modify(jobsRef, (jobs): readonly [number, ReadonlyArray<BenchJob>] => {
+            let count = 0
+            const updated = jobs.map((j) => {
+              if (j.contestId === contestId && j.status === "queued") {
+                count++
+                return new BenchJob({ ...j, status: "canceled", finishedAt: Option.some(now) })
+              }
+              return j
+            })
+            return [count, updated]
+          }),
+        countRunningByContest: (contestId: ContestId) =>
+          Ref.get(jobsRef).pipe(
+            Effect.map((jobs) => jobs.filter((j) => j.contestId === contestId && j.status === "running").length)
           ),
         appendLog: (id: BenchJobId, chunk: string) =>
           Ref.update(logsRef, (logs) => ({ ...logs, [id]: (logs[id] ?? "") + chunk })),
@@ -1639,10 +1660,82 @@ export interface BackupPortTestOptions {
   readonly failWith?: BackupError
 }
 
+// Task 11 で BackupPort が createSnapshot/writeArtifact/readArtifact を要求
+// するようになったが、多くの http テスト(backup が絡まない場面)は「呼ばれ
+// たら意図しない」= die で十分。artifact テストは実 FS を触るので専用の
+// makeArtifactBackupPortTest を作る(下記)。
 export const makeBackupPortTest = (options: BackupPortTestOptions = {}): Layer.Layer<BackupPort> =>
   Layer.succeed(BackupPort, {
     probe:
       options.failWith === undefined
         ? Effect.void
-        : Effect.fail(options.failWith)
+        : Effect.fail(options.failWith),
+    createSnapshot: () => Effect.dieMessage("makeBackupPortTest: createSnapshot not implemented"),
+    writeArtifact: () => Effect.dieMessage("makeBackupPortTest: writeArtifact not implemented"),
+    readArtifact: () => Effect.dieMessage("makeBackupPortTest: readArtifact not implemented")
   })
+
+// Task 11: 実 FS 上に scoreboard/scoreboard_csv/snapshot を書ける in-memory
+// (実は on-disk)実装。呼び出しごとに一時ディレクトリを掘り、書き込む。
+// テスト側で作った root を渡す使い方(root 自体は mkdtempSync 等でテストが
+// 用意する)。snapshot は better-sqlite3 に依らないダミー bytes を書く
+// (実 online backup の検証は test/infrastructure/sqliteBackup.test.ts の
+// snapshotAt 経由で行う; ここでは finish/backup Operation の step 分岐や
+// upsert 経路が動くことが検証対象)。
+
+export interface ArtifactBackupPortTestOptions {
+  readonly root: string
+  readonly snapshotBytes?: (contestId: ContestId, edition: number) => Uint8Array
+}
+
+const encodeUtf8 = (s: string): Uint8Array => new TextEncoder().encode(s)
+
+export const makeArtifactBackupPortTest = (
+  options: ArtifactBackupPortTestOptions
+): Layer.Layer<BackupPort> => {
+  const rootAbs = pathResolve(options.root)
+  const write = async (subpath: string, bytes: Uint8Array): Promise<{ storagePath: string; sha256: string; sizeBytes: number }> => {
+    const dest = pathJoin(rootAbs, subpath)
+    await fsp.mkdir(pathResolve(dest, ".."), { recursive: true, mode: 0o700 })
+    await fsp.writeFile(dest, bytes, { mode: 0o600 })
+    const sha = createHash("sha256").update(bytes).digest("hex")
+    return { storagePath: dest, sha256: sha, sizeBytes: bytes.byteLength }
+  }
+  return Layer.succeed(BackupPort, {
+    probe: Effect.void,
+    createSnapshot: (args) =>
+      Effect.tryPromise({
+        try: async () => {
+          const bytes = options.snapshotBytes?.(args.contestId, args.edition) ?? encodeUtf8(`snapshot:c${args.contestId}:e${args.edition}`)
+          const subpath = `contests/${args.contestId}/e${args.edition}/snapshot.sqlite`
+          return await write(subpath, bytes)
+        },
+        catch: (cause) => new _BackupErrorTag({ reason: "io_error", detail: String(cause) })
+      }),
+    writeArtifact: (args) =>
+      Effect.tryPromise({
+        try: async () => {
+          const filename = args.kind === "scoreboard" ? "scoreboard.json" : "scoreboard.csv"
+          const subpath = `contests/${args.contestId}/e${args.edition}/${filename}`
+          return await write(subpath, args.bytes)
+        },
+        catch: (cause) => new _BackupErrorTag({ reason: "io_error", detail: String(cause) })
+      }),
+    readArtifact: (storagePath) =>
+      Effect.tryPromise({
+        try: async () => {
+          const canonical = pathResolve(storagePath)
+          const guard = rootAbs.endsWith(pathSep) ? rootAbs : rootAbs + pathSep
+          if (canonical !== rootAbs && !canonical.startsWith(guard)) {
+            throw new _BackupErrorTag({ reason: "destination_outside_root", detail: "outside root" })
+          }
+          const buf = await fsp.readFile(canonical)
+          return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+        },
+        catch: (cause) =>
+          cause instanceof _BackupErrorTag
+            ? cause
+            : new _BackupErrorTag({ reason: "io_error", detail: String(cause) })
+      })
+  })
+}

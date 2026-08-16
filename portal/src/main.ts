@@ -30,6 +30,11 @@ import {
   PrepareConfigDefault
 } from "./application/usecases/prepare.js"
 import {
+  BACKUP_STEP_KEYS,
+  FINISH_STEP_KEYS,
+  makeContestFinalizationHandler
+} from "./application/usecases/finalization.js"
+import {
   makeStartContestHandler,
   START_CONTEST_STEP_KEY
 } from "./application/usecases/startOperation.js"
@@ -40,6 +45,7 @@ import { GithubOAuthLive } from "./infrastructure/github/oauth.js"
 import { AdminLive } from "./infrastructure/http/handlers/admin.js"
 import { AuthLive } from "./infrastructure/http/handlers/auth.js"
 import { BenchLive } from "./infrastructure/http/handlers/bench.js"
+import { ArtifactsLive } from "./infrastructure/http/handlers/artifacts.js"
 import { ContestLive, ContestsLive } from "./infrastructure/http/handlers/contest.js"
 import { ContestAdminLive } from "./infrastructure/http/handlers/contestAdmin.js"
 import { HealthLive } from "./infrastructure/http/handlers/health.js"
@@ -68,6 +74,7 @@ import { ArtifactRepoLive } from "./infrastructure/sql/repos/artifactRepo.js"
 import { OperationRepoLive } from "./infrastructure/sql/repos/operationRepo.js"
 import { ResourceBindingRepoLive } from "./infrastructure/sql/repos/resourceBindingRepo.js"
 import { RunnerAgentRepoLive } from "./infrastructure/sql/repos/runnerAgentRepo.js"
+import { ContestSchedulerLive } from "./infrastructure/worker/contestScheduler.js"
 import { OperationWorkerLive } from "./infrastructure/worker/operationWorker.js"
 import { TimeoutSweeperLive } from "./infrastructure/worker/timeoutSweeper.js"
 
@@ -256,7 +263,8 @@ const ApiLive = HttpApiBuilder.api(api).pipe(
       BenchLive,
       RunnerLive,
       ScoreboardLive,
-      OperationsLive
+      OperationsLive,
+      ArtifactsLive
     )
   ),
   Layer.provide(AuthenticationLive),
@@ -330,13 +338,27 @@ const WorkerLive = TimeoutSweeperLive.pipe(
   Layer.provide(MigratorLive)
 )
 
+// finish (6-step) と backup (3-step) の Operation は同一 dispatcher に相乗り。
+// stepKey の共通集合は BACKUP_STEP_KEYS ⊂ FINISH_STEP_KEYS。
+const FINALIZATION_STEP_KEYS: ReadonlyArray<string> = [
+  FINISH_STEP_KEYS.cancelQueued,
+  FINISH_STEP_KEYS.waitRunning,
+  FINISH_STEP_KEYS.writeScoreboardJson,
+  FINISH_STEP_KEYS.writeScoreboardCsv,
+  FINISH_STEP_KEYS.writeDbSnapshot,
+  FINISH_STEP_KEYS.finishContest,
+  BACKUP_STEP_KEYS.writeScoreboardJson,
+  BACKUP_STEP_KEYS.writeScoreboardCsv,
+  BACKUP_STEP_KEYS.writeDbSnapshot
+]
 
-// Task 7/8/9/10: Operation kind 別の step handler を登録する。
+// Task 7/8/9/10/11: Operation kind 別の step handler を登録する。
 //  - reconcile: Cloudflare/Proxmox の inventory-driven cleanup
 //  - enter_contest_mode: devvm → benchvm の graceful power transition
 //  - prepare: preparing Contest の全 team を desiredInstanceCount まで
 //    「1 台ずつ + memory recheck + KSM settle」で収束させる (Task 9)
 //  - start: preparing → running の readiness 再検査 + saveIfRevision (Task 10)
+//  - finish / backup: scheduled finalization + archive artifact 生成 (Task 11)
 const OperationHandlerRegistryLive = Layer.effect(
   OperationHandlerRegistry,
   Effect.gen(function* () {
@@ -344,6 +366,7 @@ const OperationHandlerRegistryLive = Layer.effect(
     const modeHandler = yield* makeEnterContestModeHandler
     const prepareHandler = yield* makePrepareHandler
     const startHandler = yield* makeStartContestHandler
+    const finalizationHandler = yield* makeContestFinalizationHandler
     const enterModeStepKeys: ReadonlyArray<string> = ENTER_CONTEST_MODE_STEP_KEYS
     return {
       lookup: (kind, stepKey) => {
@@ -358,6 +381,9 @@ const OperationHandlerRegistryLive = Layer.effect(
         }
         if (kind === "start" && stepKey === START_CONTEST_STEP_KEY) {
           return Option.some(startHandler)
+        }
+        if ((kind === "finish" || kind === "backup") && FINALIZATION_STEP_KEYS.includes(stepKey)) {
+          return Option.some(finalizationHandler)
         }
         return Option.none()
       }
@@ -415,6 +441,17 @@ const ProvisionerConditionalLive = Layer.unwrapEffect(
 // migration/seed は HttpLive・WorkerLive の依存(Layer.provide)経由で実行される
 // (メモ化により 1 回だけ)。トップレベルにはそれらを消費するコンポーネント
 // だけを並べ、順序は依存グラフに任せる。
-const MainLive = Layer.mergeAll(HttpLive, WorkerLive, ProvisionerConditionalLive, OperationWorkerConditionalLive)
+const ContestSchedulerConditionalLive = ContestSchedulerLive.pipe(
+  Layer.provide(ReposLive),
+  Layer.provide(MigratorLive)
+)
+
+const MainLive = Layer.mergeAll(
+  HttpLive,
+  WorkerLive,
+  ProvisionerConditionalLive,
+  OperationWorkerConditionalLive,
+  ContestSchedulerConditionalLive
+)
 
 Layer.launch(MainLive).pipe(NodeRuntime.runMain)

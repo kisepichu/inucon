@@ -8,6 +8,8 @@ import {
 } from "@effect/platform"
 import { Context, Schema } from "effect"
 import {
+  Artifact,
+  ArtifactId,
   BenchJob,
   BenchJobDetail,
   BenchJobId,
@@ -47,7 +49,8 @@ import {
   TeamInvite,
   TeamWithMembers,
   UpdateContestDraftRequest,
-  User
+  User,
+  VerifyArtifactRequest
 } from "./schemas.js"
 
 // --- cookie 名(ポータルのハンドラ/ミドルウェアと契約側で共有する) ---
@@ -324,6 +327,24 @@ export class InstanceNotFound extends Schema.TaggedError<InstanceNotFound>()(
 export class InvalidJobTransition extends Schema.TaggedError<InvalidJobTransition>()(
   "InvalidJobTransition",
   { jobId: BenchJobId, from: BenchJobStatus, action: JobAction },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// Task 11: POST /api/admin/artifacts/:artifactId/verify: 表示 SHA-256 と
+// アーティファクトの sha256 が一致しない。off_host_status を "verified" に
+// 上げず、operator に再取得を促す。expected は要求から来た値、actual は
+// DB 側の値(operator が UI 上で再確認できる)。
+export class ArtifactChecksumMismatch extends Schema.TaggedError<ArtifactChecksumMismatch>()(
+  "ArtifactChecksumMismatch",
+  { expected: Schema.String, actual: Schema.String },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// Task 11: POST /api/admin/contests/:contestId/archive: 対象 Contest が
+// finished でない(legacy archive 生成は finished contest だけを対象にする)。
+export class InvalidArchiveState extends Schema.TaggedError<InvalidArchiveState>()(
+  "InvalidArchiveState",
+  { status: ContestStatus },
   HttpApiSchema.annotations({ status: 409 })
 ) {}
 
@@ -755,6 +776,70 @@ export const operationsGroup = HttpApiGroup.make("operations")
       .middleware(AdminOnly)
   )
 
+// Task 11: 開催回の archive artifact 一覧・ダウンロード・SHA-256 verify・
+// legacy contest の archive-only 再生成 API。scoreboard JSON/CSV は公開経路、
+// DB snapshot と verify は AdminOnly。生 storagePath は返さない(id のみ)。
+export const artifactsGroup = HttpApiGroup.make("artifacts")
+  .add(
+    HttpApiEndpoint.get(
+      "listContestArtifacts"
+    )`/api/contests/${HttpApiSchema.param("contestId", ContestId)}/artifacts`
+      .addSuccess(Schema.Array(Artifact))
+      .addError(NotFound)
+  )
+  .add(
+    HttpApiEndpoint.get(
+      "downloadArtifact"
+    )`/api/artifacts/${HttpApiSchema.param("artifactId", ArtifactId)}/download`
+      // Uint8Array の生バイトを返す。scoreboard/CSV は public、snapshot は 404 に
+      // 落とす(admin download 経路は adminArtifactsGroup)。
+      .addSuccess(HttpApiSchema.Empty(200))
+      .addError(NotFound)
+  )
+  .add(
+    HttpApiEndpoint.get(
+      "downloadAdminArtifact"
+    )`/api/admin/artifacts/${HttpApiSchema.param("artifactId", ArtifactId)}/download`
+      .addSuccess(HttpApiSchema.Empty(200))
+      .addError(NotFound)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "verifyArtifactChecksum"
+    )`/api/admin/artifacts/${HttpApiSchema.param("artifactId", ArtifactId)}/verify`
+      .setPayload(VerifyArtifactRequest)
+      .addSuccess(Artifact)
+      .addError(NotFound)
+      .addError(ArtifactChecksumMismatch)
+      .middleware(AdminOnly)
+  )
+  .add(
+    // 即時 finalize: 実行中 running Contest を手動で終了させる。scheduler と
+    // 同じ Operation 経路。expectedRevision で楽観ロック。
+    HttpApiEndpoint.post(
+      "requestContestFinalize"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/finalize`
+      .setPayload(ContestTransitionRequest)
+      .addSuccess(Operation)
+      .addError(NotFound)
+      .addError(ContestRevisionConflict)
+      .addError(InvalidContestTransition)
+      .addError(OperationalContestConflict)
+      .middleware(AdminOnly)
+  )
+  .add(
+    // legacy contest の archive-only 再生成。finished Contest 限定。
+    HttpApiEndpoint.post(
+      "requestContestArchive"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/archive`
+      .addSuccess(Operation)
+      .addError(NotFound)
+      .addError(InvalidArchiveState)
+      .addError(OperationalContestConflict)
+      .middleware(AdminOnly)
+  )
+
 export const api = HttpApi.make("inucon")
   .add(healthGroup)
   .add(authGroup)
@@ -768,3 +853,4 @@ export const api = HttpApi.make("inucon")
   .add(runnerGroup)
   .add(scoreboardGroup)
   .add(operationsGroup)
+  .add(artifactsGroup)

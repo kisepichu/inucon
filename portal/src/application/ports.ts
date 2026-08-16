@@ -339,6 +339,18 @@ export class BenchJobRepo extends Context.Tag("app/BenchJobRepo")<
     // ため、放置すると orphan として queued に残り dashboard / 履歴 UI を汚す。
     // Task 10 の guarded_start Operation が正式化されたらこの port は不要になる予定。
     readonly cancelQueuedRehearsalsForContest: (contestId: ContestId) => Effect.Effect<void, RepoError>
+    // Task 11 (finalize): finalizing 遷移直後の finish Operation が
+    // 「新規 competition ジョブが積まれない」状態を確保するために、queued な
+    // competition/rehearsal を一括で canceled に落とす。返り値は cancel した件数
+    // (可観測性のため; 0 は「既に drained」の意)。
+    readonly cancelQueuedByContest: (
+      contestId: ContestId,
+      now: number
+    ) => Effect.Effect<number, RepoError>
+    // Task 11 (finalize): drain step が「まだ running な bench_jobs があるか」を
+    // 判定するために使う。purpose を分けず contest スコープの running 総数
+    // (rehearsal は preparing 時点で存在しない想定だが、防御的に両者を含める)。
+    readonly countRunningByContest: (contestId: ContestId) => Effect.Effect<number, RepoError>
     // Task 3: scoreboard は contest スコープ。purpose='competition' の finished
     // のみを集計対象にする。0 件チームも desiredInstanceCount 分の枠として
     // 返す(呼び出し元の handler が scope 済み teams と JOIN 済みの結果を受け取る)。
@@ -646,6 +658,15 @@ export class ResourceBindingRepo extends Context.Tag("app/ResourceBindingRepo")<
   }
 >() {}
 
+// Task 11: ArtifactRepo は contest_artifacts 行の正のリポジトリ。
+// - upsert: (contest_id, kind) UNIQUE 上書き。finish/backup Operation の
+//   artifact step が使う(regenerate は in-place 差し替え)。
+// - listByContest: 監査/公開 API 用。生 storagePath は含む(handler が
+//   境界で剥がす契約)。
+// - findByKind / findById: 個別解決。download handler は必ず ArtifactRepo
+//   経由で storagePath を得る(request path traversal 対策)。
+// - markVerified: off_host_status='verified' + verified_at。checksum 判定は
+//   application 層(finalization.ts)で行う。
 export class ArtifactRepo extends Context.Tag("app/ArtifactRepo")<
   ArtifactRepo,
   {
@@ -655,6 +676,7 @@ export class ArtifactRepo extends Context.Tag("app/ArtifactRepo")<
       contestId: ContestId,
       kind: Artifact["kind"]
     ) => Effect.Effect<Option.Option<Artifact>, RepoError>
+    readonly findById: (id: ArtifactId) => Effect.Effect<Option.Option<Artifact>, RepoError>
     readonly markVerified: (id: ArtifactId, now: number) => Effect.Effect<void, RepoError>
   }
 >() {}
@@ -711,13 +733,49 @@ export class BackupError extends Data.TaggedError("BackupError")<{
     | "not_writable"
     | "canary_failed"
     | "not_configured"
+    // Task 11: snapshot / writeArtifact / readArtifact 系の追加理由。
+    // すべて BackupError で一様に扱い、上位は operation_step の
+    // sanitized error に storage_unavailable として集約する。
+    | "source_missing"
+    | "destination_exists"
+    | "destination_outside_root"
+    | "io_error"
   readonly detail: string
 }> {}
+
+// Task 11: BackupPort は artifact 書き込み/読み出しの唯一の I/O 境界。
+// - probe: readiness / 起動時 canary(既存)。
+// - createSnapshot: better-sqlite3 の online backup で portal DB を
+//   `/backups/contests/<contestId>/e<edition>/snapshot.sqlite` に書き出し、
+//   終了後に SHA-256 を計算して返す。
+// - writeArtifact: scoreboard.json / .csv の bytes を書き込む(kind 別に
+//   ファイル名を固定; server-generated path)。
+// - readArtifact: download handler が ArtifactRepo で解決した storagePath を
+//   受けて bytes を返す。関数内で resolve(root) startsWith 判定を行い、
+//   root 外への path traversal を絶対に許さない。
+export interface ArtifactWriteResult {
+  readonly storagePath: string
+  readonly sha256: string
+  readonly sizeBytes: number
+}
 
 export class BackupPort extends Context.Tag("app/BackupPort")<
   BackupPort,
   {
     readonly probe: Effect.Effect<void, BackupError>
+    readonly createSnapshot: (args: {
+      readonly contestId: ContestId
+      readonly edition: number
+      readonly now: number
+    }) => Effect.Effect<ArtifactWriteResult, BackupError>
+    readonly writeArtifact: (args: {
+      readonly contestId: ContestId
+      readonly edition: number
+      readonly now: number
+      readonly kind: "scoreboard" | "scoreboard_csv"
+      readonly bytes: Uint8Array
+    }) => Effect.Effect<ArtifactWriteResult, BackupError>
+    readonly readArtifact: (storagePath: string) => Effect.Effect<Uint8Array, BackupError>
   }
 >() {}
 
