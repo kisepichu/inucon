@@ -22,6 +22,21 @@ export class InvalidOperationTransition extends Data.TaggedError("InvalidOperati
   to: OperationStatus
 }> {}
 
+// Task 8: beginContestPreparation の pre-save ガードでチェック失敗があったときに
+// 返す。details として readiness key の識別子(previous_cleanup / unfinished_operation /
+// transitional_instance など)の配列を運ぶ。UI 側は「まだ準備できない」旨と
+// 個々の失敗 key を提示できる。
+export type PreparationBlockReason =
+  | "previous_cleanup"
+  | "unfinished_operation"
+  | "transitional_instance"
+
+export class ContestNotReadyForPreparation extends Data.TaggedError(
+  "ContestNotReadyForPreparation"
+)<{
+  readonly failingChecks: ReadonlyArray<PreparationBlockReason>
+}> {}
+
 // draft -> preparing の schedule 検証で unset/順序違反が見つかったときに返す。
 // beginPreparation で生成され、admin API は 422 にマップする(Task 5)。
 export type InvalidContestScheduleReason =

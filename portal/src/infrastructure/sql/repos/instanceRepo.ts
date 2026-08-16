@@ -51,6 +51,25 @@ export const InstanceRepoLive: Layer.Layer<InstanceRepo, never, SqlClient.SqlCli
           `
         ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeInstance))),
 
+      // Task 8: readiness の previous_cleanup と beginContestPreparation 前検査。
+      // 指定 Contest の全 Instance を返す(全 status)。ORDER は idx。
+      listByContest: (contestId: ContestId) =>
+        wrapSqlError(
+          sql<InstanceRow>`
+            SELECT ${columns} FROM instances
+            WHERE contest_id = ${contestId}
+            ORDER BY team_id, idx
+          `
+        ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeInstance))),
+
+      // Task 8: creating または deleting な Instance がグローバルに存在するかの
+      // 単発判定。beginContestPreparation の transitional_instance ガードが使う。
+      hasTransitional: wrapSqlError(
+        sql<{ hit: number }>`
+          SELECT 1 AS hit FROM instances WHERE status IN ('creating', 'deleting') LIMIT 1
+        `
+      ).pipe(Effect.map((rows) => rows.length > 0)),
+
       findById: (id: InstanceId) =>
         wrapSqlError(sql<InstanceRow>`SELECT ${columns} FROM instances WHERE id = ${id}`).pipe(
           Effect.flatMap((rows) =>

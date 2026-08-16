@@ -32,6 +32,7 @@ import {
   Me,
   Operation,
   PollJobResponse,
+  ReadinessCheck,
   ReconciliationApplyRequest,
   ReconciliationPlan,
   ReconciliationPlanRequest,
@@ -252,6 +253,17 @@ export class ProviderUnavailable extends Schema.TaggedError<ProviderUnavailable>
   "ProviderUnavailable",
   { provider: Schema.Literal("proxmox", "cloudflare") },
   HttpApiSchema.annotations({ status: 503 })
+) {}
+
+// Task 8: begin-preparation の pre-save ガード(previous_cleanup /
+// unfinished_operation / transitional_instance)が失敗した際に返す。UI は
+// failingChecks に基づいて再診断へ誘導する。ContestRevisionConflict と同じ
+// 409 相当だが、原因が「revision drift」ではなく「まだ準備できない状態」なので
+// 別 tag にする。
+export class ContestNotReadyForPreparation extends Schema.TaggedError<ContestNotReadyForPreparation>()(
+  "ContestNotReadyForPreparation",
+  { failingChecks: Schema.Array(Schema.String) },
+  HttpApiSchema.annotations({ status: 409 })
 ) {}
 
 // POST /api/bench-jobs: Contest が running でない(domain の
@@ -549,6 +561,7 @@ export const contestAdminGroup = HttpApiGroup.make("contestAdmin")
       .addError(NotFound)
       .addError(ContestRevisionConflict)
       .addError(OperationalContestConflict)
+      .addError(ContestNotReadyForPreparation)
       .addError(InvalidContestTransition)
       .addError(InvalidContestSchedule)
       .middleware(AdminOnly)
@@ -670,6 +683,14 @@ export const operationsGroup = HttpApiGroup.make("operations")
       .addError(AmbiguousReconciliation)
       .addError(NothingToReconcile)
       .addError(OperationalContestConflict)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.get(
+      "getContestReadiness"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/readiness`
+      .addSuccess(Schema.Array(ReadinessCheck))
+      .addError(NotFound)
       .middleware(AdminOnly)
   )
 

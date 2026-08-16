@@ -14,6 +14,7 @@ import {
   applyReconciliation,
   planReconciliation
 } from "../../../application/usecases/reconciliation.js"
+import { computeReadiness } from "../../../application/usecases/readiness.js"
 
 // Task 7: reconciliation plan/apply の HTTP handler。AdminOnly middleware は
 // shared/api の group 定義側で付与済みなので、handler は CurrentUser を
@@ -72,6 +73,16 @@ export const OperationsLive = HttpApiBuilder.group(api, "operations", (handlers)
           // ときの enqueue 失敗は 500 に落とさず 409 (OperationalContestConflict)
           // に落とす。他 admin と競合したことを client に明示する。
           OperationInProgress: () => Effect.fail(new OperationalContestConflict())
+        }),
+        Effect.orDie
+      )
+    )
+    .handle("getContestReadiness", ({ path }) =>
+      computeReadiness(path.contestId).pipe(
+        Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound())
+          // provider unavailability は readiness の各 check が個別に fail を
+          // 返すので readiness 全体としては 200 で返る(UI が summary を表示)。
         }),
         Effect.orDie
       )

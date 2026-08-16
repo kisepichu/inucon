@@ -3,7 +3,9 @@ import { NodeHttpClient } from "@effect/platform-node"
 import { Clock, Config, Effect, Either, Layer, Option, Redacted, Schema } from "effect"
 import type { ConfigError } from "effect/ConfigError"
 import type * as Https from "node:https"
-import { ProvisionTimeout, ProxmoxError, ProxmoxPort } from "../../application/ports.js"
+import type { ProxmoxInfrastructureInventory, VmInventoryItem } from "../../application/ports.js"
+import { ModeTransitionTimeout, ProvisionTimeout, ProxmoxError, ProxmoxPort } from "../../application/ports.js"
+import { BENCHVM_VMID, DEVVM_VMID, isModeVmid } from "../../domain/modeVmIds.js"
 import { MANAGED_HOSTNAME_PATTERN } from "../../domain/reconciliation.js"
 import { describeHttpFailure, requestPath } from "../httpClientErrors.js"
 
@@ -52,10 +54,36 @@ const ExecStatus = Schema.Struct({
   "out-data": Schema.optional(Schema.String)
 })
 const ExecStatusResponse = Schema.Struct({ data: ExecStatus })
-
 const NodeStatusResponse = Schema.Struct({
   data: Schema.Struct({ memory: Schema.Struct({ free: Schema.Int }) })
 })
+
+// Task 8: /nodes/:node/network の必要フィールドだけ。iface (bridge 名) と
+// type ('bridge' 等) を持つ。type=bridge にのみ興味がある。
+const NodeNetworkEntry = Schema.Struct({
+  iface: Schema.String,
+  type: Schema.optional(Schema.String)
+})
+const NodeNetworkResponse = Schema.Struct({ data: Schema.Array(NodeNetworkEntry) })
+
+// Task 8: /nodes/:node/qemu/:vmid/config は任意のフィールドを返すため
+// necessary な項目だけ抽出する。onboot は 0/1 の integer or string。
+// name は inventory の name と一致する保証がないため config 側は無視する
+// (list 側の name を使う)。net<N> は bridge=... を含む文字列。
+const VmConfig = Schema.Record({
+  key: Schema.String,
+  value: Schema.Union(Schema.String, Schema.Int, Schema.Number, Schema.Null, Schema.Undefined)
+}).annotations({ identifier: "VmConfig" })
+const VmConfigResponse = Schema.Struct({ data: VmConfig })
+
+// Task 8: /nodes/:node/services/:service/state。data.state が "running" のときだけ active 扱い。
+const ServiceStateResponse = Schema.Struct({
+  data: Schema.Struct({ state: Schema.String })
+})
+
+// Task 8: /nodes/:node/qemu/:vmid/status/current。status の string だけ使う。
+const VmStatusCurrent = Schema.Struct({ status: Schema.String })
+const VmStatusCurrentResponse = Schema.Struct({ data: VmStatusCurrent })
 
 // Task 7 §Reconciliation: qemu 一覧の必要フィールドだけ抜き出す。
 // PVE の GET /nodes/<node>/qemu は maxmem/mem/status/name/vmid/template を返す。
@@ -66,7 +94,11 @@ const VmListEntry = Schema.Struct({
   name: Schema.optional(Schema.String),
   status: Schema.String,
   maxmem: Schema.optional(Schema.Union(Schema.Int, Schema.String)),
-  template: Schema.optional(Schema.Union(Schema.Int, Schema.String))
+  template: Schema.optional(Schema.Union(Schema.Int, Schema.String)),
+  // Task 8: qemu 一覧に onboot=0/1(integer or string)が含まれることがある。
+  // getInfrastructureInventory は devvm/benchvm の onBoot をここから拾う
+  // (存在しないときは qemu/:vmid/config を fallback で叩く)。
+  onboot: Schema.optional(Schema.Union(Schema.Int, Schema.String))
 })
 const VmListResponse = Schema.Struct({ data: Schema.Array(VmListEntry) })
 
@@ -114,23 +146,118 @@ const GUEST_AGENT_POLL_INTERVAL_MILLIS = 2_000
 const GUEST_EXEC_POLL_INTERVAL_MILLIS = 500
 const GUEST_EXEC_POLL_TIMEOUT_MILLIS = 60_000
 
+
+// Task 8: enter_contest_mode / return_normal_mode の graceful shutdown / start
+// が扱う共通インフラ VM の vmid と、それによる credential dispatch。値の
+// single source of truth は domain/modeVmIds.ts(review round 3 finding 3:
+// app→infra の inverted re-export を避けるため domain 側に移した)。
+
+// Task 8: waitForVmStatus のポーリング間隔。テストは TestClock.adjust で
+// 進めるため wall time に依らない。
+const VM_STATUS_POLL_INTERVAL_MILLIS = 1_000
+// Task 8: split provision/mode credential.
+//
+// 「4 つすべて欠落 → legacy PROXMOX_TOKEN_ID/SECRET を両クライアントに配線」の
+// rolling migration を許容し、それ以外は split を必須にする(部分設定は
+// startup error)。final production は必ず split。以下の 3 ケースを扱う:
+//   1. すべての split が揃う           → split を採用(legacy 併存でも split 優先)。
+//   2. 4 つのうち一部だけ設定           → ConfigError で Layer 構築失敗(部分禁止)。
+//   3. 4 つとも欠落かつ legacy が揃う   → legacy を両クライアントに配線
+//                                        (secret-free deprecation warning を 1 度出す)。
+//   4. 4 つとも欠落かつ legacy 欠落     → ConfigError(従来通り)。
+//
+// Config.option を使い、全部 all Some / all None を判定する(Config.string で
+// 直に読むと欠落時に ConfigError で即 fail してしまい、legacy fallback に落ちない)。
+interface ResolvedCredentials {
+  readonly provisionTokenId: string
+  readonly provisionTokenSecret: Redacted.Redacted
+  readonly modeTokenId: string
+  readonly modeTokenSecret: Redacted.Redacted
+  readonly usedLegacyFallback: boolean
+}
+
+const readSplitCredentials: Effect.Effect<ResolvedCredentials, ConfigError> = Effect.gen(function* () {
+  const provisionId = yield* Config.option(Config.string("PROXMOX_PROVISION_TOKEN_ID"))
+  const provisionSecret = yield* Config.option(Config.redacted("PROXMOX_PROVISION_TOKEN_SECRET"))
+  const modeId = yield* Config.option(Config.string("PROXMOX_MODE_TOKEN_ID"))
+  const modeSecret = yield* Config.option(Config.redacted("PROXMOX_MODE_TOKEN_SECRET"))
+
+  const splitSlots: ReadonlyArray<Option.Option<unknown>> = [provisionId, provisionSecret, modeId, modeSecret]
+  const splitAllSet = splitSlots.every(Option.isSome)
+  const splitAllUnset = splitSlots.every(Option.isNone)
+
+  if (splitAllSet) {
+    return {
+      provisionTokenId: Option.getOrThrow(provisionId),
+      provisionTokenSecret: Option.getOrThrow(provisionSecret),
+      modeTokenId: Option.getOrThrow(modeId),
+      modeTokenSecret: Option.getOrThrow(modeSecret),
+      usedLegacyFallback: false
+    }
+  }
+
+  if (!splitAllUnset) {
+    // 部分設定は運用ミスの温床。Config.string で強制的に ConfigError にする。
+    // 未設定のフィールドを最初に踏むまで読み進める(欠落名が cause に載る)。
+    // string / redacted は Option の型が違うので 2 ループに分けて yield する。
+    for (const [name, slot] of [
+      ["PROXMOX_PROVISION_TOKEN_ID", provisionId],
+      ["PROXMOX_MODE_TOKEN_ID", modeId]
+    ] as const) {
+      if (Option.isNone(slot)) yield* Config.string(name)
+    }
+    for (const [name, slot] of [
+      ["PROXMOX_PROVISION_TOKEN_SECRET", provisionSecret],
+      ["PROXMOX_MODE_TOKEN_SECRET", modeSecret]
+    ] as const) {
+      if (Option.isNone(slot)) yield* Config.redacted(name)
+    }
+    return yield* Effect.dieMessage("unreachable: partial Proxmox split credentials")
+  }
+
+  // すべての split が欠落 → legacy を両クライアントに配線する。
+  const legacyId = yield* Config.string("PROXMOX_TOKEN_ID")
+  const legacySecret = yield* Config.redacted("PROXMOX_TOKEN_SECRET")
+  yield* Effect.logWarning(
+    "PROXMOX_TOKEN_ID/PROXMOX_TOKEN_SECRET (legacy shared credential) is used for both provision and mode " +
+      "operations. Configure PROXMOX_{PROVISION,MODE}_TOKEN_ID/SECRET to complete the split-credential migration."
+  )
+  return {
+    provisionTokenId: legacyId,
+    provisionTokenSecret: legacySecret,
+    modeTokenId: legacyId,
+    modeTokenSecret: legacySecret,
+    usedLegacyFallback: true
+  }
+})
+
 export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpClient> = Layer.effect(
   ProxmoxPort,
   Effect.gen(function* () {
     const apiUrl = yield* Config.string("PROXMOX_API_URL")
-    const tokenId = yield* Config.string("PROXMOX_TOKEN_ID")
-    const tokenSecret = yield* Config.redacted("PROXMOX_TOKEN_SECRET")
+    const creds = yield* readSplitCredentials
     const rawClient = yield* HttpClient.HttpClient
-    const client = rawClient.pipe(
-      HttpClient.mapRequest(
-        HttpClientRequest.setHeader("authorization", `PVEAPIToken=${tokenId}=${Redacted.value(tokenSecret)}`)
-      )
-    )
+
+    const authHeader = (tokenId: string, secret: Redacted.Redacted): string =>
+      `PVEAPIToken=${tokenId}=${Redacted.value(secret)}`
+
+    const withAuth = (tokenId: string, secret: Redacted.Redacted) =>
+      rawClient.pipe(HttpClient.mapRequest(HttpClientRequest.setHeader("authorization", authHeader(tokenId, secret))))
+
+    const provisionClient = withAuth(creds.provisionTokenId, creds.provisionTokenSecret)
+    const modeClient = withAuth(creds.modeTokenId, creds.modeTokenSecret)
+
+    // ルーティング: 明示的に mode 側に投げるのは
+    // (a) 共通インフラ VM(9200/9300)への操作、および
+    // (b) node audit(/nodes/:node/status など)。
+    // それ以外は provision client を使う(team VM / template)。
+    const clientFor = (vmid: number) => (isModeVmid(vmid) ? modeClient : provisionClient)
 
     const nodeUrl = `${apiUrl}/nodes/${NODE}`
 
     // 2xx なら schema でデコード、それ以外は ProxmoxError。
-    const request = <A>(
+    const requestWith = <A>(
+      client: HttpClient.HttpClient,
       req: HttpClientRequest.HttpClientRequest,
       schema: Schema.Schema<A, any>
     ): Effect.Effect<A, ProxmoxError> =>
@@ -148,26 +275,15 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         Effect.scoped
       )
 
+    // 既存の compat: 単数 client(provision)向けの short form。
+    const request = <A>(req: HttpClientRequest.HttpClientRequest, schema: Schema.Schema<A, any>) =>
+      requestWith(provisionClient, req, schema)
+
     // PVE 9 実機(Task 7 実機検証で確認)では、存在しない VM に対する
     // GET .../status/current(や、既に消えている VM への stop/delete)が
     // 404 ではなく HTTP 500 で返り、ボディは
     // {"data":null,"message":"Configuration file 'nodes/eevee/qemu-server/<vmid>.conf' does not exist\n"}
-    // となる。404 のみを「存在しない」とみなす実装ではこの 500 がそのまま
-    // 復旧不能な ProxmoxError として伝播し、自己サービス払い出しが
-    // creating → failed で即死する(Task 7 で実際に踏んだ本番障害)。
-    // そのため、404 に加えて「非 2xx かつボディがこの VM 設定ファイル欠落
-    // メッセージに一致する」場合も「VM が存在しない」として扱う。
-    // codex レビュー P1: 当初 /does not exist/i という広すぎるパターンで
-    // マッチさせていたが、これだと stop/delete 中に起きた無関係なエラー
-    // (例: "storage 'local' does not exist")まで VM 不在と誤認し、
-    // テアダウンがインスタンスを deleted にする一方で VM 実体は残る(orphan
-    // 化)・vmExists が誤って false を返し二重 clone を招く、という実害が
-    // あった。そのため、上記メッセージの中核である
-    // "Configuration file 'nodes/eevee/qemu-server/<vmid>.conf' does not exist"
-    // の qemu-server/<数字>.conf という形の VM 設定ファイルパスにのみ限定して
-    // マッチさせる。これに一致しない非 2xx(本当のサーバエラー等)は、
-    // 従来通り ProxmoxError で fail させる。
-    // 呼び出し側は 2xx をこの関数に渡さない前提(呼び出し前に 2xx 分岐済み)。
+    // となる。詳細は本 Layer 冒頭の記述参照(Task 4/7 実機検証)。
     const VM_MISSING_MESSAGE_PATTERN = /Configuration file '[^']*qemu-server\/\d+\.conf' does not exist/i
 
     const isVmMissingResponse = (
@@ -180,10 +296,8 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
             Effect.orElseSucceed(() => false)
           )
 
-    // 冪等操作用。404(対象 VM が既に無い)、204(No Content = 待つべき
-    // タスクが無い)、および上記の「500 + does not exist」はどれも None を返し、
-    // それ以外の成功はボディの UPID を Some で返す。
-    const requestUpidOrNotFound = (
+    const requestUpidOrNotFoundWith = (
+      client: HttpClient.HttpClient,
       req: HttpClientRequest.HttpClientRequest
     ): Effect.Effect<Option.Option<string>, ProxmoxError> =>
       client.execute(req).pipe(
@@ -209,14 +323,10 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         Effect.scoped
       )
 
-    // 存在確認専用(vmExists)。404、および「500 + does not exist」を
-    // 「存在しない」として吸収し、それ以外の非 2xx は復旧不能な ProxmoxError
-    // にする(requestUpidOrNotFound と同じ判定だが、こちらはボディをデコード
-    // せず有無だけを boolean で返す)。
     const requestExistsOrNotFound = (
       req: HttpClientRequest.HttpClientRequest
     ): Effect.Effect<boolean, ProxmoxError> =>
-      client.execute(req).pipe(
+      provisionClient.execute(req).pipe(
         Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) })),
         Effect.flatMap((response) => {
           if (response.status >= 200 && response.status < 300) return Effect.succeed(true)
@@ -233,7 +343,10 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         Effect.scoped
       )
 
-    const requestConfig = (req: HttpClientRequest.HttpClientRequest): Effect.Effect<void, ProxmoxError> =>
+    const requestConfigWith = (
+      client: HttpClient.HttpClient,
+      req: HttpClientRequest.HttpClientRequest
+    ): Effect.Effect<void, ProxmoxError> =>
       client.execute(req).pipe(
         Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) })),
         Effect.flatMap((response) =>
@@ -246,9 +359,13 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         Effect.scoped
       )
 
-    const pollTaskStatus = (upid: string) =>
+    // task 監視は provision credential でも mode credential でも成立する
+    // (どちらも同じ /nodes/:node/tasks/:upid/status を叩ける)。呼び出し元と
+    // 揃えるため、run 元と同じ client を使う。
+    const pollTaskStatusWith = (client: HttpClient.HttpClient, upid: string) =>
       pollUntil({
-        attempt: request(
+        attempt: requestWith(
+          client,
           HttpClientRequest.get(`${apiUrl}/nodes/${NODE}/tasks/${encodeURIComponent(upid)}/status`),
           TaskStatusResponse
         ).pipe(Effect.map((r) => r.data)),
@@ -258,8 +375,8 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         onTimeout: () => new ProxmoxError({ cause: `task ${upid} did not complete within timeout` })
       })
 
-    const waitForTask = (upid: string) =>
-      pollTaskStatus(upid).pipe(
+    const waitForTaskWith = (client: HttpClient.HttpClient, upid: string) =>
+      pollTaskStatusWith(client, upid).pipe(
         Effect.flatMap((data) =>
           data.exitstatus === "OK"
             ? Effect.void
@@ -267,21 +384,14 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         )
       )
 
-    const runTask = (req: HttpClientRequest.HttpClientRequest) =>
-      request(req, UpidResponse).pipe(Effect.flatMap((r) => waitForTask(r.data)))
+    const runTaskWith = (client: HttpClient.HttpClient, req: HttpClientRequest.HttpClientRequest) =>
+      requestWith(client, req, UpidResponse).pipe(Effect.flatMap((r) => waitForTaskWith(client, r.data)))
 
-    // PVE 9 実機(Task 7 再検証)では、既に消えている VM への stop/delete が
-    // 同期エラー(404 / 500 + does not exist)にならず、200 + UPID を返した上で
-    // タスク自体が exitstatus="unable to find configuration file for VM <vmid>"
-    // で失敗することがある(非同期版の「VM 不在」)。stopAndDestroyVm は冪等操作
-    // なので、この特定パターンの task 失敗だけは「既に無い」= 成功として許容する。
-    // vmid を組み込んだ正規表現でマッチさせ、無関係な task 失敗(本当の障害)を
-    // 誤って握りつぶさないようにする。
     const vmMissingTaskExitstatusPattern = (vmid: number) =>
       new RegExp(`unable to find configuration file for VM ${vmid}\\b`, "i")
 
     const waitForTaskTolerateMissing = (vmid: number, upid: string) =>
-      pollTaskStatus(upid).pipe(
+      pollTaskStatusWith(provisionClient, upid).pipe(
         Effect.flatMap((data) => {
           if (data.exitstatus === "OK") return Effect.void
           if (data.exitstatus !== undefined && vmMissingTaskExitstatusPattern(vmid).test(data.exitstatus)) {
@@ -291,28 +401,185 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         })
       )
 
+    // review round 2 finding 2: 「VM が既に停止している」ときの not-running を
+    // 冪等な success として扱うための判定。対象 vmid を含む '(VM|qemu) <id>
+    // (is )?not running' メッセージだけを許容し、無関係な 500 は素通しする。
+    // 実機で観測される message 例:
+    //   {"data":null,"message":"VM 9200 is not running\n"} (同期)
+    //   task exitstatus="VM 9200 not running"                (非同期)
+    const vmNotRunningMessagePattern = (vmid: number) =>
+      new RegExp(`(?:VM|qemu) ${vmid}\\b[^\\n]*not running`, "i")
+
+    const isVmNotRunningResponse = (
+      vmid: number,
+      response: HttpClientResponse.HttpClientResponse
+    ): Effect.Effect<boolean> =>
+      response.text.pipe(
+        Effect.map((text) => vmNotRunningMessagePattern(vmid).test(text)),
+        Effect.orElseSucceed(() => false)
+      )
+
+
     const vmExistsEffect = (vmid: number): Effect.Effect<boolean, ProxmoxError> =>
       requestExistsOrNotFound(HttpClientRequest.get(`${nodeUrl}/qemu/${vmid}/status/current`))
 
+    // Task 8: getInfrastructureInventory は次を単発で返す集約 endpoint。
+    // - qemu list: template / devvm / benchvm の存在確認 + inventory 化。
+    // - node network: type=bridge かつ iface=teamN の N の集合。
+    // - benchvm config: bridge=teamN が入っている net<N> の集合。
+    // - node service inucon-team-isolation の state。
+    // - node status の memory.free。
+    //
+    // (a) node status は mode credential でしか叩けない(least-privilege ACL:
+    //     provision は Sys.Audit を持たない)ため、readiness / mode 用の
+    //     inventory は modeClient で統一する。qemu list / network / config /
+    //     services も node 側の権限で読める(mode credential の InuconNodeAudit
+    //     + Access に VM.Audit を含む)。
+    const parseOnBoot = (v: unknown): boolean =>
+      v === 1 || v === "1" || v === true
+
+    const parseMaxmem = (v: unknown): number =>
+      typeof v === "string" ? Number(v) : typeof v === "number" ? v : 0
+
+    const parseTemplate = (v: unknown): boolean =>
+      v === 1 || v === "1" || v === true
+
+    const vmInventoryFromList = (
+      vms: ReadonlyArray<Schema.Schema.Type<typeof VmListEntry>>,
+      vmid: number
+    ): VmInventoryItem | null => {
+      const found = vms.find((v) => v.vmid === vmid)
+      if (found === undefined || found.name === undefined) return null
+      return {
+        vmid: found.vmid,
+        name: found.name,
+        status: (found.status === "running" ? "running" : "stopped") as "running" | "stopped",
+        memoryBytes: parseMaxmem(found.maxmem),
+        onBoot: parseOnBoot(found.onboot)
+      }
+    }
+
+    // benchvm の VM config を single request で読み、"net<N>" のうち
+    // bridge=teamK が含まれるものの K だけ集める(intersection の benchvm 側)。
+    const readBenchvmBridges: Effect.Effect<ReadonlyArray<number>, ProxmoxError> =
+      requestWith(
+        modeClient,
+        HttpClientRequest.get(`${nodeUrl}/qemu/${BENCHVM_VMID}/config`),
+        VmConfigResponse
+      ).pipe(
+        Effect.map((r) => {
+          const acc: Array<number> = []
+          for (const [k, v] of Object.entries(r.data)) {
+            if (!/^net\d+$/.test(k) || typeof v !== "string") continue
+            const m = v.match(/bridge=team(\d+)\b/)
+            if (m !== null) acc.push(Number(m[1]))
+          }
+          return acc
+        })
+      )
+
+    // node network の iface=teamN を集める(intersection のノード側)。
+    const readNodeTeamBridges: Effect.Effect<ReadonlyArray<number>, ProxmoxError> =
+      requestWith(
+        modeClient,
+        HttpClientRequest.get(`${nodeUrl}/network`),
+        NodeNetworkResponse
+      ).pipe(
+        Effect.map((r) => {
+          const acc: Array<number> = []
+          for (const n of r.data) {
+            const m = n.iface.match(/^team(\d+)$/)
+            if (m !== null) acc.push(Number(m[1]))
+          }
+          return acc
+        })
+      )
+
+    // review round 3 finding 2: service state 未定義(404)だけを "inactive"
+    // 相当として畳み、authorization / schema / ネットワーク失敗は
+    // ProxmoxError のまま伝播させる。以前は Effect.catchAll(() => false)
+    // で全てを飲み込んでいたが、401/403 やスキーマ mismatch のときに
+    // 「isolation: fail」と誤診する false-positive があった(readiness の
+    // 「isolation service を start しろ」誘導が正しくは「trocken トークン権限
+    // 修正が必要」だった、というケース)。ここでは requestWith を通さず
+    // 直接 modeClient.execute し、response.status を見て 404 だけ absorb する。
+    const readIsolationServiceActive: Effect.Effect<boolean, ProxmoxError> = Effect.gen(function* () {
+      const req = HttpClientRequest.get(`${nodeUrl}/services/inucon-team-isolation/state`)
+      return yield* modeClient.execute(req).pipe(
+        Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) })),
+        Effect.flatMap((response) => {
+          if (response.status === 404) return Effect.succeed(false)
+          if (response.status >= 200 && response.status < 300) {
+            return HttpClientResponse.schemaBodyJson(ServiceStateResponse)(response).pipe(
+              Effect.map((r) => r.data.state === "running"),
+              Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) }))
+            )
+          }
+          return Effect.fail(
+            new ProxmoxError({ cause: `Proxmox API ${req.method} ${requestPath(req)} → ${response.status}` })
+          )
+        }),
+        Effect.scoped
+      )
+    })
+    const readNodeFreeMemBytes: Effect.Effect<number, ProxmoxError> =
+      requestWith(modeClient, HttpClientRequest.get(`${nodeUrl}/status`), NodeStatusResponse).pipe(
+        Effect.map((r) => r.data.memory.free)
+      )
+
+    // 名前ベースで template / devvm / benchvm を探す。
+    // - template は spec §Contest の 9100 固定(Contest.templateVmid のデフォルト値)。
+    //   inventory 側の template=1 フラグと VMID の両方で識別できる。
+    const TEMPLATE_VMID = 9100
+
+    const getInfrastructureInventoryEffect: Effect.Effect<
+      ProxmoxInfrastructureInventory,
+      ProxmoxError
+    > = Effect.gen(function* () {
+      const [nodeFreeMemBytes, listResp, isolationActive, benchvmBridges, nodeBridges] = yield* Effect.all(
+        [
+          readNodeFreeMemBytes,
+          requestWith(modeClient, HttpClientRequest.get(`${nodeUrl}/qemu`), VmListResponse),
+          readIsolationServiceActive,
+          readBenchvmBridges,
+          readNodeTeamBridges
+        ],
+        { concurrency: "unbounded" }
+      )
+      const vms = listResp.data
+      const templateExists = vms.some((v) => v.vmid === TEMPLATE_VMID && parseTemplate(v.template))
+      const devvm = vmInventoryFromList(vms, DEVVM_VMID)
+      const benchvm = vmInventoryFromList(vms, BENCHVM_VMID)
+      if (devvm === null) {
+        return yield* Effect.fail(new ProxmoxError({ cause: `devvm (vmid ${DEVVM_VMID}) not present in inventory` }))
+      }
+      if (benchvm === null) {
+        return yield* Effect.fail(new ProxmoxError({ cause: `benchvm (vmid ${BENCHVM_VMID}) not present in inventory` }))
+      }
+      const benchvmBridgeSet = new Set(benchvmBridges)
+      const prepared = [...new Set(nodeBridges.filter((n) => benchvmBridgeSet.has(n)))].sort((a, b) => a - b)
+      return {
+        nodeFreeMemBytes,
+        templateExists,
+        devvm,
+        benchvm,
+        preparedTeamNumbers: prepared,
+        isolationServiceActive: isolationActive
+      }
+    })
+
     return {
       cloneVm: ({ name, newVmid, templateVmid }) =>
-        runTask(
+        runTaskWith(
+          provisionClient,
           HttpClientRequest.post(`${apiUrl}/nodes/${NODE}/qemu/${templateVmid}/clone`).pipe(
             HttpClientRequest.bodyUrlParams({ newid: newVmid, full: 0, name })
           )
         ),
 
-      // PVE ネイティブの ciuser/sshkeys で cloud-init を設定する(snippet
-      // アップロード無し、単一の config リクエスト)。
-      // sshkeys の値は PVE の既知の慣習として、config に保存される時点で
-      // percent-encode(RFC 3986)済みであることが要求される
-      // (bpg/proxmox Terraform provider も同じ方式でエンコードしている)。
-      // ここで encodeURIComponent したものを bodyUrlParams のパラメータ値として
-      // 渡すため、実際の HTTP ボディ上ではさらにもう一段 form/url エンコードが
-      // 掛かる(= 意図的な二重エンコード。PVE 側が受け取って一段 form-decode
-      // した結果、ちょうど percent-encode 済みの sshkeys 文字列になる)。
       configureCloudInit: ({ gateway, ip, sshKeys, vmid }) =>
-        requestConfig(
+        requestConfigWith(
+          provisionClient,
           HttpClientRequest.post(`${nodeUrl}/qemu/${vmid}/config`).pipe(
             HttpClientRequest.bodyUrlParams({
               ciuser: CLOUD_INIT_USER,
@@ -324,38 +591,30 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         ),
 
       setVnet: ({ bridge, vmid }) =>
-        requestConfig(
+        requestConfigWith(
+          provisionClient,
           HttpClientRequest.post(`${nodeUrl}/qemu/${vmid}/config`).pipe(
             HttpClientRequest.bodyUrlParams({ net0: `virtio,bridge=${bridge},firewall=0` })
           )
         ),
 
-      startVm: (vmid) => runTask(HttpClientRequest.post(`${nodeUrl}/qemu/${vmid}/status/start`)),
+      // startVm は mode/provision の両方から呼ばれる。vmid で client を選ぶ。
+      startVm: (vmid) =>
+        runTaskWith(clientFor(vmid), HttpClientRequest.post(`${nodeUrl}/qemu/${vmid}/status/start`)),
 
-      // 冪等: 対象 VM が既に存在しない場合は成功扱い。PVE 9 実機(Task 7)で
-      // 2 通りの「VM 不在」が確認されている。
-      // (1) 同期パス: stop/delete 自体が 404、または 500 +
-      //     "Configuration file '...qemu-server/<vmid>.conf' does not exist"
-      //     で返る(isVmMissingResponse / requestUpidOrNotFound が吸収)。
-      // (2) 非同期パス(Task 7 再検証): 存在しない VM への stop が同期エラーに
-      //     ならず 200 + UPID を返し、そのタスクを poll すると
-      //     exitstatus="unable to find configuration file for VM <vmid>" で
-      //     stopped する(waitForTaskTolerateMissing が吸収)。
-      // さらに、そもそも VM が最初から存在しない(vmExists=false)場合は
-      // stop/destroy のリクエスト自体を送らずに即成功させる(冪等操作の
-      // 事前短絡。無用な API 呼び出しを避け、(1)(2)いずれの応答パターンにも
-      // 依存しない最も確実な経路)。
       stopAndDestroyVm: (vmid) =>
         Effect.gen(function* () {
           const exists = yield* vmExistsEffect(vmid)
           if (!exists) return
 
-          const stopUpid = yield* requestUpidOrNotFound(
+          const stopUpid = yield* requestUpidOrNotFoundWith(
+            provisionClient,
             HttpClientRequest.post(`${nodeUrl}/qemu/${vmid}/status/stop`)
           )
           if (Option.isSome(stopUpid)) yield* waitForTaskTolerateMissing(vmid, stopUpid.value)
 
-          const deleteUpid = yield* requestUpidOrNotFound(
+          const deleteUpid = yield* requestUpidOrNotFoundWith(
+            provisionClient,
             HttpClientRequest.del(`${nodeUrl}/qemu/${vmid}`).pipe(
               HttpClientRequest.setUrlParam("purge", "1")
             )
@@ -363,23 +622,13 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
           if (Option.isSome(deleteUpid)) yield* waitForTaskTolerateMissing(vmid, deleteUpid.value)
         }),
 
-      // clone 再入可能性チェック用(Task 4 レビュー C1)。status/current は
-      // 対象 VM が存在しない場合 404 を返すことが多いが、PVE 9 実機(Task 7)では
-      // 500 + "Configuration file '...' does not exist" で返ることを確認済み
-      // (requestExistsOrNotFound / isVmMissingResponse が両方を吸収する)。
       vmExists: (vmid) => vmExistsEffect(vmid),
 
-      // guest agent 未起動時、Proxmox は agent/ping に 500(QEMU guest agent is not
-      // running)を返す。これは「まだ ready でない」= リトライすべきケース。
-      // 一方 401/403(トークン不正)・404(VM 不在)などそれ以外の非 2xx、および
-      // client.execute 自体の失敗(ネットワーク層)は復旧不能なので pollUntil の
-      // deadline を待たず ProxmoxError で即 fail させる(pollUntil はこの E を
-      // 素通しし、false のときだけリトライする)。
       waitForGuestAgent: (vmid, timeoutMillis) =>
         pollUntil<boolean, ProxmoxError | ProvisionTimeout>({
           attempt: Effect.suspend(() => {
             const req = HttpClientRequest.post(`${nodeUrl}/qemu/${vmid}/agent/ping`)
-            return client.execute(req).pipe(
+            return provisionClient.execute(req).pipe(
               Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) })),
               Effect.flatMap((response) => {
                 if (response.status >= 200 && response.status < 300) return Effect.succeed(true)
@@ -421,17 +670,9 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
           return { exitcode: status.exitcode ?? -1, out: status["out-data"] ?? "" }
         }),
 
-      getNodeFreeMemBytes: request(HttpClientRequest.get(`${nodeUrl}/status`), NodeStatusResponse).pipe(
-        Effect.map((r) => r.data.memory.free)
-      ),
+      getNodeFreeMemBytes: readNodeFreeMemBytes,
 
-      // Task 7 §Reconciliation: qemu 一覧のうち name が
-      // `^inucon-team\d+-\d+$` に一致する VM のみを返す。template と
-      // devvm/benchvm 等の共有インフラ VM は絶対に混ぜない(cleanup が誤って
-      // 触らないよう source of truth 段階で除外する)。status は "running" /
-      // "stopped" 以外を PVE が返す可能性(paused 等)を安全側に "stopped" に
-      // 畳む(reconciliation は状態機械のガードには使わないため実害は無い)。
-      listManagedVms: request(HttpClientRequest.get(`${nodeUrl}/qemu`), VmListResponse).pipe(
+      listManagedVms: requestWith(provisionClient, HttpClientRequest.get(`${nodeUrl}/qemu`), VmListResponse).pipe(
         Effect.map((r) =>
           r.data
             .filter((v) => v.name !== undefined && MANAGED_HOSTNAME_PATTERN.test(v.name))
@@ -439,10 +680,88 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
               vmid: v.vmid,
               name: v.name as string,
               status: (v.status === "running" ? "running" : "stopped") as "running" | "stopped",
-              memoryBytes: typeof v.maxmem === "string" ? Number(v.maxmem) : (v.maxmem ?? 0)
+              memoryBytes: parseMaxmem(v.maxmem)
             }))
         )
-      )
+      ),
+
+      getInfrastructureInventory: getInfrastructureInventoryEffect,
+
+      // Task 8: mode / setVmOnBoot は mode credential で叩く(共通インフラ VM の
+      // config を書き換えるため InuconMode ACL が要る)。
+      setVmOnBoot: (vmid, enabled) =>
+        requestConfigWith(
+          clientFor(vmid),
+          HttpClientRequest.post(`${nodeUrl}/qemu/${vmid}/config`).pipe(
+            HttpClientRequest.bodyUrlParams({ onboot: enabled ? 1 : 0 })
+          )
+        ),
+
+      // Task 8: guest shutdown 発行。force stop 系(/status/stop)は絶対に呼ばない。
+      //
+      // review round 3 finding 1: 以前は shutdown task の完了まで待っていたが、
+      // Proxmox の /status/shutdown task は内部の deadline (default 180s、
+      // かつ `timeout` パラメータで上書き可能) を過ぎると exitstatus="VM
+      // <id> is still running" で失敗する。この文字列は "not running" とは
+      // 一致しないため waitForTaskTolerateNotRunning は素通しで ProxmoxError
+      // を投げ、modeOperation の catchTag("ProxmoxError") が
+      // OperationExecutionError に畳んで operation を **failed** に落として
+      // しまう(spec §mode の "60s graceful → blocked (no force stop)" 経路が
+      // 到達不能)。
+      //
+      // 修正: fire-and-forget にする。POST /status/shutdown?timeout=3600 で
+      // ACPI signal を発行し、task 完了(= VM が実際に停止した)を待たない。
+      // 実際の "60 秒 graceful deadline → blocked" 判定は wait_devvm_stopped
+      // step の waitForVmStatus(status/current polling)が owner。task 側の
+      // timeout は wait step の deadline より十分大きい値(3600s)にして、
+      // wait step が blocked と判断するより先に task 側で強制失敗しないように
+      // する。
+      //
+      // 冪等性: shutdown_devvm step は事前に inv.devvm.status を見て
+      // 「stopped なら short-circuit」しているが、inventory 取得と
+      // shutdownVm 発火の間で devvm が自然停止する race がある。Proxmox は
+      // このとき同期エラーとして 500 + "VM <id> is not running" を返し得るので、
+      // isVmNotRunningResponse で success 扱いに畳む(round 2 findings 対応の
+      // 継続)。task 側の応答は待たないので、round 2 で追加した
+      // waitForTaskTolerateNotRunning は shutdown からは呼ばない(dead)。
+      shutdownVm: (vmid) =>
+        Effect.gen(function* () {
+          const client = clientFor(vmid)
+          const req = HttpClientRequest.post(`${nodeUrl}/qemu/${vmid}/status/shutdown`).pipe(
+            HttpClientRequest.bodyUrlParams({ timeout: 3600, forceStop: 0 })
+          )
+          yield* client.execute(req).pipe(
+            Effect.mapError((cause) => new ProxmoxError({ cause: describeHttpFailure(req, cause) })),
+            Effect.flatMap((response) => {
+              if (response.status >= 200 && response.status < 300) return Effect.void
+              return isVmNotRunningResponse(vmid, response).pipe(
+                Effect.flatMap((notRunning) =>
+                  notRunning
+                    ? Effect.void
+                    : Effect.fail(
+                        new ProxmoxError({ cause: `Proxmox API ${req.method} ${requestPath(req)} → ${response.status}` })
+                      )
+                )
+              )
+            }),
+            Effect.scoped
+          )
+        }),
+
+      // Task 8: status/current を poll し、期待 status に達したら成功、
+      // timeout に達したら ModeTransitionTimeout。ProxmoxError は素通し。
+      waitForVmStatus: (vmid, expected, timeoutMillis) =>
+        pollUntil<{ readonly status: string }, ProxmoxError | ModeTransitionTimeout>({
+          attempt: requestWith(
+            clientFor(vmid),
+            HttpClientRequest.get(`${nodeUrl}/qemu/${vmid}/status/current`),
+            VmStatusCurrentResponse
+          ).pipe(Effect.map((r) => r.data)),
+          isDone: (data) => data.status === expected,
+          intervalMillis: VM_STATUS_POLL_INTERVAL_MILLIS,
+          timeoutMillis,
+          onTimeout: () => new ModeTransitionTimeout({ vmid, expected, timeoutMillis })
+        }).pipe(Effect.asVoid)
     }
   })
 )

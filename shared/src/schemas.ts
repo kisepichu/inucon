@@ -31,6 +31,18 @@ export type ResourceBindingId = typeof ResourceBindingId.Type
 export const ArtifactId = Schema.String.pipe(Schema.brand("ArtifactId"))
 export type ArtifactId = typeof ArtifactId.Type
 
+// Task 8: readiness aggregation の wire schema。key/status/summary の 3 タプル。
+// summary は非機密文字列(生 email / bearer / cause 等を絶対に含まない)。
+export const ReadinessCheckStatus = Schema.Literal("pass", "warn", "fail")
+export type ReadinessCheckStatus = typeof ReadinessCheckStatus.Type
+
+export const ReadinessCheck = Schema.Struct({
+  key: Schema.String,
+  status: ReadinessCheckStatus,
+  summary: Schema.String
+})
+export type ReadinessCheck = typeof ReadinessCheck.Type
+
 export const User = Schema.Struct({
   id: UserId,
   githubId: Schema.Int,

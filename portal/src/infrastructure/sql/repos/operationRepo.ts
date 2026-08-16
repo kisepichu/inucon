@@ -261,6 +261,15 @@ export const OperationRepoLive: Layer.Layer<
       })
 
     return {
+      // Task 8: readiness / beginContestPreparation 前検査で「今 unfinished
+      // Operation が 1 件でも居るか」を単発判定する。返り値は boolean のみ
+      // (件数や list は返さない — 攻撃面を狭く保つ)。
+      hasUnfinished: wrapSqlError(
+        sql<{ hit: number }>`
+          SELECT 1 AS hit FROM operations WHERE status NOT IN ('succeeded','canceled') LIMIT 1
+        `
+      ).pipe(Effect.map((rows) => rows.length > 0)),
+
       enqueue: (input: NewOperation) =>
         wrapSqlError(
           sql.withTransaction(

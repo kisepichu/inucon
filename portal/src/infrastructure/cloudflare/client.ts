@@ -487,6 +487,23 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
           routes: Array.from(routesByStem.values()),
           apps: appsByStem
         }
+      }),
+
+      // Task 8: readiness の cloudflare_token key が呼ぶ probe。
+      // GET /user/tokens/verify のみを叩き、status=="active" を成功条件にする。
+      // review round 1 finding 3: inventoryReadable フラグは常に true を返す
+      // dead flag だったため型ごと廃止した。readiness の `cloudflare_inventory`
+      // key は getInstanceInventory を独立に呼ぶ責務分離。
+      probe: Effect.gen(function* () {
+        const verifyReq = HttpClientRequest.get(`${CF_API_BASE}/user/tokens/verify`)
+        yield* request(verifyReq, Schema.Struct({ status: Schema.String })).pipe(
+          Effect.flatMap((result) =>
+            result.status === "active"
+              ? Effect.void
+              : Effect.fail(new CloudflareError({ cause: `token status ${result.status}` }))
+          )
+        )
+        return { tokenStatus: "active" as const }
       })
     }
   })

@@ -20,6 +20,10 @@ import {
   DEFAULT_OPERATION_RETRY_MAX_MILLIS
 } from "./application/usecases/operations.js"
 import { makeReconciliationHandler } from "./application/usecases/reconciliation.js"
+import {
+  ENTER_CONTEST_MODE_STEP_KEYS,
+  makeEnterContestModeHandler
+} from "./application/usecases/modeOperation.js"
 import { CloudflareLive } from "./infrastructure/cloudflare/client.js"
 import { GithubKeysLive } from "./infrastructure/github/keys.js"
 import { GithubOAuthLive } from "./infrastructure/github/oauth.js"
@@ -308,11 +312,18 @@ const OperationHandlerRegistryLive = Layer.effect(
   OperationHandlerRegistry,
   Effect.gen(function* () {
     const reconcileHandler = yield* makeReconciliationHandler
+    const modeHandler = yield* makeEnterContestModeHandler
+    const enterModeStepKeys: ReadonlyArray<string> = ENTER_CONTEST_MODE_STEP_KEYS
     return {
-      lookup: (kind, stepKey) =>
-        kind === "reconcile" && stepKey.startsWith("reconcile:")
-          ? Option.some(reconcileHandler)
-          : Option.none()
+      lookup: (kind, stepKey) => {
+        if (kind === "reconcile" && stepKey.startsWith("reconcile:")) {
+          return Option.some(reconcileHandler)
+        }
+        if (kind === "enter_contest_mode" && enterModeStepKeys.includes(stepKey)) {
+          return Option.some(modeHandler)
+        }
+        return Option.none()
+      }
     }
   })
 )

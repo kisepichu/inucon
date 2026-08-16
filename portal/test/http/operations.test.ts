@@ -315,3 +315,55 @@ describe("POST /api/admin/contests/:contestId/reconciliation/apply", () => {
     )
   )
 })
+
+// Task 8: GET /api/admin/contests/:contestId/readiness (AdminOnly)。
+// readiness は mutation を一切行わず、非機密の check 一覧を返す。
+describe("GET /api/admin/contests/:contestId/readiness", () => {
+  it.effect("非 admin は 403", () =>
+    Effect.gen(function* () {
+      yield* seedLegacy
+      const { cookieHeader: cookie } = yield* login({
+        githubLogin: "user1",
+        githubId: 1,
+        isAdmin: false
+      })
+      const client = yield* HttpClient.HttpClient
+      const res = yield* client.get(`/api/admin/contests/${CONTEST_ID}/readiness`, {
+        headers: { cookie }
+      })
+      expect(res.status).toBe(403)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("admin は 200 で checks 配列を返す(生 email / bearer / cause を絶対に含まない)", () =>
+    Effect.gen(function* () {
+      yield* seedLegacy
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const client = yield* HttpClient.HttpClient
+      const res = yield* client.get(`/api/admin/contests/${CONTEST_ID}/readiness`, {
+        headers: { cookie }
+      })
+      expect(res.status).toBe(200)
+      const text = yield* res.text
+      expect(text).not.toMatch(/@/) // no raw emails
+      expect(text).not.toMatch(/Bearer/i) // no bearer tokens
+      const body = JSON.parse(text) as ReadonlyArray<{ key: string; status: string; summary: string }>
+      expect(Array.isArray(body)).toBe(true)
+      // 少なくとも previous_cleanup と cloudflare_token key は必ず含まれる。
+      const keys = body.map((c) => c.key)
+      expect(keys.includes("previous_cleanup")).toBe(true)
+      expect(keys.includes("cloudflare_token")).toBe(true)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("存在しない contest は 404", () =>
+    Effect.gen(function* () {
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const client = yield* HttpClient.HttpClient
+      const res = yield* client.get(`/api/admin/contests/${ContestId.make("nope")}/readiness`, {
+        headers: { cookie }
+      })
+      expect(res.status).toBe(404)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+})

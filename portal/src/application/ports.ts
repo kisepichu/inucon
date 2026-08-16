@@ -59,6 +59,16 @@ export class ProvisionTimeout extends Data.TaggedError("ProvisionTimeout")<{
   timeoutMillis: number
 }> {}
 
+// Task 8: enter_contest_mode / return_normal_mode の guest shutdown / start
+// が graceful timeout に達したときの型付きエラー。ProvisionTimeout と同じ
+// 構造だが、mode transition は force stop を絶対に呼ばない前提のため専用型に
+// して呼び出し元(operation worker + readiness / handler)から取り違えない。
+export class ModeTransitionTimeout extends Data.TaggedError("ModeTransitionTimeout")<{
+  readonly vmid: number
+  readonly expected: "running" | "stopped"
+  readonly timeoutMillis: number
+}> {}
+
 // Task 6: Operation enqueue が「他に unfinished Operation あり」または
 // 「creating/deleting な Instance あり」で失敗したときの型付きエラー。
 // cross-lock は SQL 側の atomic ガードで検出する(TeamJobAlreadyQueued と同型)。
@@ -241,6 +251,14 @@ export class InstanceRepo extends Context.Tag("app/InstanceRepo")<
     ) => Effect.Effect<ReadonlyArray<Instance>, RepoError>
     readonly findById: (id: InstanceId) => Effect.Effect<Option.Option<Instance>, RepoError>
     readonly create: (i: Instance) => Effect.Effect<Instance, RepoError | DuplicateInstanceIndex>
+    // Task 8: readiness の previous_cleanup / beginContestPreparation 前検査で
+    // 参照する。指定 Contest の全 Instance(全 status)を返す。
+    readonly listByContest: (
+      contestId: ContestId
+    ) => Effect.Effect<ReadonlyArray<Instance>, RepoError>
+    // Task 8: 「creating または deleting な Instance がグローバルに存在するか」の
+    // 単発判定。beginContestPreparation の transitional_instance ガードが使う。
+    readonly hasTransitional: Effect.Effect<boolean, RepoError>
     readonly remove: (id: InstanceId) => Effect.Effect<void, RepoError>
     readonly createIfAllowed: (
       i: Instance,
@@ -342,6 +360,27 @@ export class AuthConfig extends Context.Tag("app/AuthConfig")<
   { readonly adminGithubLogins: ReadonlyArray<string> }
 >() {}
 
+// Task 8: readiness aggregation および enter_contest_mode / return_normal_mode
+// の Operation が使う「インフラ側の状態」まとめ。単発の inventory call で
+// devvm/benchvm の VM inventory item + template 存在 + team slot 集合 +
+// isolation service 状態 + ノード空き RAM を返す。
+export interface VmInventoryItem {
+  readonly vmid: number
+  readonly name: string
+  readonly status: "running" | "stopped"
+  readonly memoryBytes: number
+  readonly onBoot: boolean
+}
+
+export interface ProxmoxInfrastructureInventory {
+  readonly nodeFreeMemBytes: number
+  readonly templateExists: boolean
+  readonly devvm: VmInventoryItem
+  readonly benchvm: VmInventoryItem
+  readonly preparedTeamNumbers: ReadonlyArray<number>
+  readonly isolationServiceActive: boolean
+}
+
 // Proxmox VE API(https://192.0.2.10:8006/api2/json)。トークン認証。
 // Phase 3 のインスタンス払い出し/撤収オーケストレーション(Task 4)が使う。
 export class ProxmoxPort extends Context.Tag("app/ProxmoxPort")<
@@ -382,6 +421,35 @@ export class ProxmoxPort extends Context.Tag("app/ProxmoxPort")<
       readonly status: "running" | "stopped"
       readonly memoryBytes: number
     }>, ProxmoxError>
+
+    // Task 8: readiness / enter_contest_mode 用の集約 inventory。単一呼び出しで
+    // 「readiness / mode transition が判断に必要とする現状」をすべて返す。
+    // - nodeFreeMemBytes: Proxmox /nodes/:node/status memory.free(reclaimable
+    //   page cache を含まないため /proc/meminfo MemAvailable より保守的)。
+    // - templateExists: `templateVmid` (spec §Contest では 9100) が qemu 一覧に
+    //   template=1 で存在するか。
+    // - devvm/benchvm: 名前で解決した VM inventory item。onBoot は Proxmox の
+    //   qemu/:vmid/config の onboot(0/1)を boolean に畳んだもの。
+    // - preparedTeamNumbers: 「node network で iface=teamN として up している」
+    //   かつ「benchvm の VM config の bridge にも teamN が入っている」bridge の
+    //   N の集合(intersection)。片方だけでは実運用できないため必ず積集合を取る。
+    // - isolationServiceActive: `inucon-team-isolation` service の state が
+    //   running のときのみ true。inactive/failed/未定義はすべて false。
+    readonly getInfrastructureInventory: Effect.Effect<ProxmoxInfrastructureInventory, ProxmoxError>
+
+    // Task 8: enter_contest_mode / return_normal_mode 用の power / config primitive。
+    // enter_contest_mode は「devvm (9200) を graceful shutdown → benchvm (9300)
+    // を起動」する。force stop は絶対に呼ばない(guest shutdown が timeout に
+    // 達したら ModeTransitionTimeout として blocked へ落とし、operator 判断待ち)。
+    readonly setVmOnBoot: (vmid: number, enabled: boolean) => Effect.Effect<void, ProxmoxError>
+    readonly shutdownVm: (vmid: number) => Effect.Effect<void, ProxmoxError>
+    readonly waitForVmStatus: (
+      vmid: number,
+      status: "running" | "stopped",
+      timeoutMillis: number
+    ) => Effect.Effect<void, ProxmoxError | ModeTransitionTimeout>
+    // Task 8 note: startVm は既存の signature を再利用する(実装は mode 側
+    // credential で叩く)。互換のため port method の追加は行わない。
   }
 >() {}
 
@@ -421,6 +489,21 @@ export class CloudflarePort extends Context.Tag("app/CloudflarePort")<
         readonly emailSetHash: string
       }>
     }, CloudflareError>
+
+    // Task 8: Cloudflare API token の verify を単発で行う readiness 用 probe。
+    // GET /user/tokens/verify が active を返せば success、それ以外(status
+    // が active でない / HTTP エラー / ネットワーク失敗)は CloudflareError で
+    // 失敗する。readiness の `cloudflare_token` key が使う。
+    //
+    // review round 1 finding 3: 以前は返却型に inventoryReadable: true を
+    // 含めていたが、実装は inventory を読んでおらず「常に true」の misleading な
+    // フラグだった。readiness の `cloudflare_inventory` key は
+    // getInstanceInventory を独立に呼ぶので、probe の責務は「token だけ」に
+    // 揃える。API-Tokens-Read 権限は発行しない — 既発行トークンの verify のみ。
+    readonly probe: Effect.Effect<
+      { readonly tokenStatus: "active" },
+      CloudflareError
+    >
   }
 >() {}
 
@@ -450,6 +533,10 @@ export class ProvisioningConfig extends Context.Tag("app/ProvisioningConfig")<
 export class OperationRepo extends Context.Tag("app/OperationRepo")<
   OperationRepo,
   {
+    // Task 8: readiness / beginContestPreparation ガード用の「未完了 Operation が
+    // 全体に 1 件でも存在するか」の単発判定。単一 operation 不変条件を守るために
+    // 楽観ロック的に確認するので、返り値は boolean のみ(件数や list は返さない)。
+    readonly hasUnfinished: Effect.Effect<boolean, RepoError>
     readonly enqueue: (
       input: NewOperation
     ) => Effect.Effect<Operation, RepoError | OperationInProgress>

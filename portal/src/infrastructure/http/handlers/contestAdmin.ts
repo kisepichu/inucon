@@ -3,6 +3,7 @@ import { Effect } from "effect"
 import {
   api,
   ContestEditionConflict,
+  ContestNotReadyForPreparation,
   ContestRevisionConflict,
   CurrentUser,
   InvalidContestSchedule,
@@ -71,6 +72,8 @@ export const ContestAdminLive = HttpApiBuilder.group(api, "contestAdmin", (handl
           ContestRevisionConflict: (e) =>
             Effect.fail(new ContestRevisionConflict({ expected: e.expected, actual: e.actual })),
           OperationalContestConflict: () => Effect.fail(new OperationalContestConflict()),
+          ContestNotReadyForPreparation: (e) =>
+            Effect.fail(new ContestNotReadyForPreparation({ failingChecks: e.failingChecks })),
           InvalidContestTransition: (e) =>
             Effect.fail(new InvalidContestTransition({ from: e.from, to: e.to })),
           InvalidContestSchedule: (e) => Effect.fail(new InvalidContestSchedule({ reason: e.reason }))

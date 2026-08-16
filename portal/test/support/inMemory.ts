@@ -31,6 +31,7 @@ import {
   GithubKeysPort,
   InstanceRepo,
   InviteRepo,
+  ModeTransitionTimeout,
   OperationInProgress,
   OperationRepo,
   ProvisioningConfig,
@@ -45,6 +46,7 @@ import {
   UserRepo,
   UuidGen
 } from "../../src/application/ports.js"
+import type { ProxmoxInfrastructureInventory } from "../../src/application/ports.js"
 
 // テスト専用のインメモリ port 実装。すべて Ref ベースで、ports.ts のコメントに
 // 書かれた意味論(TOCTOU 回避 / 全体 running 1 本制約)を素直に再現する。
@@ -574,6 +576,16 @@ export const makeInstanceRepoTest = (initial: ReadonlyArray<Instance> = []): Lay
                 .sort((a, b) => a.index - b.index)
             )
           ),
+        // Task 8: readiness の previous_cleanup / beginContestPreparation 前検査。
+        listByContest: (contestId: ContestId) =>
+          Ref.get(instancesRef).pipe(
+            Effect.map((instances) =>
+              instances.filter((i) => i.contestId === contestId).sort((a, b) => a.index - b.index)
+            )
+          ),
+        hasTransitional: Ref.get(instancesRef).pipe(
+          Effect.map((instances) => instances.some((i) => i.status === "creating" || i.status === "deleting"))
+        ),
         findById: (id: InstanceId) =>
           Ref.get(instancesRef).pipe(
             Effect.map((instances) => Option.fromNullable(instances.find((i) => i.id === id)))
@@ -957,6 +969,10 @@ export type ProxmoxOperation =
   | "getNodeFreeMemBytes"
   | "vmExists"
   | "listManagedVms"
+  | "getInfrastructureInventory"
+  | "setVmOnBoot"
+  | "shutdownVm"
+  | "waitForVmStatus"
 
 export interface ProxmoxTestState {
   readonly clonedVmids: ReadonlyArray<number>
@@ -971,6 +987,12 @@ export interface ProxmoxTestState {
   // 初期値は options.existingVmids で「クラッシュ前に clone だけ成功し
   // progress 未保存のまま再開する」ケースを直接シードできる。
   readonly existingVmids: ReadonlyArray<number>
+  // Task 8: enter_contest_mode の観測。テストは shutdown/onboot 設定 /
+  // inventory 再観測が期待順序で発生することを検証する。
+  readonly shutdownRequests: ReadonlyArray<number>
+  readonly forceStopRequests: ReadonlyArray<number>
+  readonly onBootByVmid: Readonly<Record<number, boolean>>
+  readonly inventoryReads: number
 }
 
 const emptyProxmoxState: ProxmoxTestState = {
@@ -981,7 +1003,11 @@ const emptyProxmoxState: ProxmoxTestState = {
   destroyedVmids: [],
   authorizedKeysByVmid: {},
   guestExecCalls: [],
-  existingVmids: []
+  existingVmids: [],
+  shutdownRequests: [],
+  forceStopRequests: [],
+  onBootByVmid: {},
+  inventoryReads: 0
 }
 
 // authorized_keys への追記を模す固定コマンド(実装は
@@ -1001,8 +1027,11 @@ const extractAppendedKey = (command: ReadonlyArray<string>): string | undefined 
 // options.failWith: 特定の操作を常に指定エラーで失敗させる(saga の補償処理・
 // エラーハンドリングをテストするためのフック)。waitForGuestAgent だけ
 // ProvisionTimeout も許容する(ports.ts のシグネチャに合わせる)。
-type ProxmoxFailWith = Partial<Record<Exclude<ProxmoxOperation, "waitForGuestAgent">, ProxmoxError>> & {
+// Task 8: waitForVmStatus / shutdownVm も型付きエラーを許容する。前者は
+// ModeTransitionTimeout を、後者は ProxmoxError のみを受ける。
+type ProxmoxFailWith = Partial<Record<Exclude<ProxmoxOperation, "waitForGuestAgent" | "waitForVmStatus">, ProxmoxError>> & {
   waitForGuestAgent?: ProxmoxError | ProvisionTimeout
+  waitForVmStatus?: ProxmoxError | ModeTransitionTimeout
 }
 
 // Task 7: reconciliation の inventory 用に managedVms を直接シードできる。
@@ -1014,23 +1043,56 @@ export interface ManagedVmSeed {
   readonly memoryBytes?: number
 }
 
+// Task 8: makeProxmoxPortTest の options を named type として export し、
+// テスト側から重複定義せず再利用できるようにする(ts-no-return-type ルール)。
+export interface ProxmoxTestOptions {
+  freeMemBytes?: number
+  guestAgentReady?: boolean
+  failWith?: ProxmoxFailWith
+  existingVmids?: ReadonlyArray<number>
+  managedVms?: ReadonlyArray<ManagedVmSeed>
+  // Task 8: getInfrastructureInventory の返却値を直接シードする。未指定なら
+  // 呼び出しは defect にせず、テスト用に「最低限あり得る値(template/devvm/
+  // benchvm 全部あり、preparedTeamNumbers=[1,2]、isolation active、free 6 GiB)」
+  // を返す(既存テストで新メソッドを触るところは無いはずだが安全側)。
+  infrastructureInventory?: ProxmoxInfrastructureInventory
+}
+
+export interface ProxmoxPortTestFixture {
+  readonly layer: Layer.Layer<ProxmoxPort>
+  readonly getState: Effect.Effect<ProxmoxTestState>
+}
+
 export const makeProxmoxPortTest = (
-  options: {
-    freeMemBytes?: number
-    guestAgentReady?: boolean
-    failWith?: ProxmoxFailWith
-    // 「クラッシュ前に clone だけ成功したが progress は保存されなかった」を
-    // 直接シードするための初期 vmExists 状態(Task 4 レビュー C1)。
-    existingVmids?: ReadonlyArray<number>
-    managedVms?: ReadonlyArray<ManagedVmSeed>
-  } = {}
-): { layer: Layer.Layer<ProxmoxPort>; getState: Effect.Effect<ProxmoxTestState> } => {
+  options: ProxmoxTestOptions = {}
+): ProxmoxPortTestFixture => {
+  const DEFAULT_INVENTORY: ProxmoxInfrastructureInventory = {
+    nodeFreeMemBytes: 20_000_000_000,
+    templateExists: true,
+    devvm: {
+      vmid: 9200,
+      name: "devvm",
+      status: "running",
+      memoryBytes: 8 * 1024 * 1024 * 1024,
+      onBoot: true
+    },
+    benchvm: {
+      vmid: 9300,
+      name: "benchvm",
+      status: "stopped",
+      memoryBytes: 4 * 1024 * 1024 * 1024,
+      onBoot: false
+    },
+    preparedTeamNumbers: [1, 2],
+    isolationServiceActive: true
+  }
+  const inventory = options.infrastructureInventory ?? DEFAULT_INVENTORY
   const stateRef = Ref.unsafeMake({ ...emptyProxmoxState, existingVmids: options.existingVmids ?? [] })
   const freeMemBytes = options.freeMemBytes ?? 6_000_000_000
   const guestAgentReady = options.guestAgentReady ?? true
 
   const guarded = <A>(
-    op: Exclude<ProxmoxOperation, "waitForGuestAgent">,
+    op: Exclude<ProxmoxOperation, "waitForGuestAgent" | "waitForVmStatus">,
     succeed: Effect.Effect<A, never>
   ): Effect.Effect<A, ProxmoxError> => {
     const failure = options.failWith?.[op]
@@ -1111,7 +1173,35 @@ export const makeProxmoxPortTest = (
           memoryBytes: v.memoryBytes ?? 4 * 1024 * 1024 * 1024
         }))
       )
-    )
+    ),
+    getInfrastructureInventory: guarded(
+      "getInfrastructureInventory",
+      Ref.update(stateRef, (s) => ({ ...s, inventoryReads: s.inventoryReads + 1 })).pipe(
+        Effect.andThen(Effect.succeed(inventory))
+      )
+    ),
+    setVmOnBoot: (vmid, enabled) =>
+      guarded(
+        "setVmOnBoot",
+        Ref.update(stateRef, (s) => ({ ...s, onBootByVmid: { ...s.onBootByVmid, [vmid]: enabled } }))
+      ),
+    shutdownVm: (vmid) =>
+      guarded(
+        "shutdownVm",
+        Ref.update(stateRef, (s) => ({ ...s, shutdownRequests: [...s.shutdownRequests, vmid] }))
+      ),
+    waitForVmStatus: (vmid, expected, timeoutMillis) => {
+      const failure = options.failWith?.waitForVmStatus
+      if (failure !== undefined) return Effect.fail(failure)
+      // 既定は inventory の状態と一致するかで判定する。inventory と一致しない
+      // (= shutdown/start がまだ)なら ModeTransitionTimeout(テスト側で
+      // shutdown/start の記録を進めれば inventory を上書きして pass にできる)。
+      const inv = inventory
+      const actual = vmid === inv.devvm.vmid ? inv.devvm.status : vmid === inv.benchvm.vmid ? inv.benchvm.status : "stopped"
+      return actual === expected
+        ? Effect.void
+        : Effect.fail(new ModeTransitionTimeout({ vmid, expected, timeoutMillis }))
+    }
   })
 
   return { layer, getState: Ref.get(stateRef) }
@@ -1130,6 +1220,7 @@ export type CloudflareOperation =
   | "ensureAccessApp"
   | "removeAccessApp"
   | "getInstanceInventory"
+  | "probe"
 
 // Task 7: reconciliation inventory を直接シードするためのオプション。
 // 既定 { routes: [], apps: [] }(既存テストは inventory を読まない)。
@@ -1147,12 +1238,21 @@ export interface CloudflareInventorySeed {
   }>
 }
 
+// Task 8: named options / fixture types(ts-no-return-type ルール準拠、
+// テスト側から重複定義せず再利用できるようにする)。
+export interface CloudflareTestOptions {
+  failWith?: Partial<Record<CloudflareOperation, CloudflareError>>
+  inventory?: CloudflareInventorySeed
+}
+
+export interface CloudflarePortTestFixture {
+  readonly layer: Layer.Layer<CloudflarePort>
+  readonly getState: Effect.Effect<CloudflareTestState>
+}
+
 export const makeCloudflarePortTest = (
-  options: {
-    failWith?: Partial<Record<CloudflareOperation, CloudflareError>>
-    inventory?: CloudflareInventorySeed
-  } = {}
-): { layer: Layer.Layer<CloudflarePort>; getState: Effect.Effect<CloudflareTestState> } => {
+  options: CloudflareTestOptions = {}
+): CloudflarePortTestFixture => {
   const stateRef = Ref.unsafeMake(emptyCloudflareState)
 
   const guarded = <A>(op: CloudflareOperation, succeed: Effect.Effect<A, never>): Effect.Effect<A, CloudflareError> => {
@@ -1195,6 +1295,12 @@ export const makeCloudflarePortTest = (
     getInstanceInventory: guarded(
       "getInstanceInventory",
       Effect.succeed(options.inventory ?? { routes: [], apps: [] })
+    ),
+    // Task 8: readiness の cloudflare_token key が呼ぶ probe。既定は成功。
+    // round 1 finding 3: inventoryReadable フラグは廃止し、tokenStatus のみ。
+    probe: guarded(
+      "probe",
+      Effect.succeed({ tokenStatus: "active" as const })
     )
   })
 
@@ -1263,6 +1369,7 @@ export const makeOperationRepoTest = (): { layer: Layer.Layer<OperationRepo>; ge
   const stepsRef = Ref.unsafeMake<ReadonlyArray<OperationStep>>([])
 
   const layer = Layer.succeed(OperationRepo, {
+    hasUnfinished: Ref.get(opsRef).pipe(Effect.map((rows) => rows.some(isOperationUnfinished))),
     enqueue: (input: NewOperation) =>
       Effect.gen(function* () {
         if (input.steps.length === 0) {
@@ -1353,3 +1460,23 @@ export const makeOperationRepoTest = (): { layer: Layer.Layer<OperationRepo>; ge
       Ref.get(opsRef).pipe(Effect.map((rows) => Option.fromNullable(rows.find((o) => o.id === id))))
   }
 }
+
+// Task 8: contestAdmin テスト用の軽量 OperationRepo。beginContestPreparation の
+// unfinished_operation ガードは hasUnfinished のみを触るため、他のメソッドは
+// defect にして「今そのメソッドを呼んだテストは想定外」を明示する。
+export const makeOperationRepoStubTest = (
+  args: { readonly hasUnfinished: boolean } = { hasUnfinished: false }
+): Layer.Layer<OperationRepo> =>
+  Layer.succeed(OperationRepo, {
+    hasUnfinished: Effect.succeed(args.hasUnfinished),
+    enqueue: () => Effect.dieMessage("makeOperationRepoStubTest: enqueue not implemented"),
+    findById: () => Effect.succeed(Option.none()),
+    listSteps: () => Effect.succeed([]),
+    claimNext: () => Effect.succeed(Option.none()),
+    completeStep: () => Effect.dieMessage("makeOperationRepoStubTest: completeStep not implemented"),
+    failStep: () => Effect.dieMessage("makeOperationRepoStubTest: failStep not implemented"),
+    blockStep: () => Effect.dieMessage("makeOperationRepoStubTest: blockStep not implemented"),
+    resumeExpired: () => Effect.succeed(0),
+    retry: () => Effect.dieMessage("makeOperationRepoStubTest: retry not implemented"),
+    cancel: () => Effect.dieMessage("makeOperationRepoStubTest: cancel not implemented")
+  })

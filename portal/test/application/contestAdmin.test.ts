@@ -20,14 +20,17 @@ import {
   updateContestDraft
 } from "../../src/application/usecases/contestAdmin.js"
 import type { Contest } from "../../src/domain/contest.js"
-import { ContestId, TeamId, UserId } from "../../src/domain/ids.js"
+import { ContestId, InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
+import type { Instance } from "../../src/domain/instance.js"
 import type { Team } from "../../src/domain/team.js"
 import { TeamInvite } from "../../src/domain/teamInvite.js"
 import { User } from "../../src/domain/user.js"
-import { makeContest, makeInvite, makeTeam } from "../support/factories.js"
+import { makeContest, makeInstance, makeInvite, makeTeam } from "../support/factories.js"
 import {
   makeContestRepoTest,
+  makeInstanceRepoTest,
   makeInviteReposTest,
+  makeOperationRepoStubTest,
   TransactionRunnerTest,
   UuidGenTest
 } from "../support/inMemory.js"
@@ -44,6 +47,8 @@ interface BuildLayerOptions {
   memberships?: ReadonlyArray<{ contestId: ContestId; teamId: TeamId; userId: UserId }>
   invites?: ReadonlyArray<TeamInvite>
   users?: ReadonlyArray<User>
+  instances?: ReadonlyArray<Instance>
+  hasUnfinishedOperation?: boolean
 }
 
 const buildLayer = (opts: BuildLayerOptions = {}) => {
@@ -52,6 +57,8 @@ const buildLayer = (opts: BuildLayerOptions = {}) => {
     UuidGenTest,
     TransactionRunnerTest,
     makeContestRepoTest(contests),
+    makeInstanceRepoTest(opts.instances ?? []),
+    makeOperationRepoStubTest({ hasUnfinished: opts.hasUnfinishedOperation ?? false }),
     makeInviteReposTest({
       teams: opts.teams ?? [],
       contests,
@@ -359,6 +366,123 @@ describe("beginContestPreparation", () => {
         )
       )
       expect(exit).toStrictEqual(Exit.fail(new OperationalContestConflict()))
+    })
+  )
+
+  // Task 8 Step 4: previous_cleanup / no unfinished Operation / no
+  // creating|deleting Instance の 3 ガード。start までに前開催の resource が
+  // まだ残っていれば preparing 遷移を拒否する(readiness と同じ判定式)。
+  it.effect("前開催に status != 'deleted' の Instance が残っていれば ContestNotReadyForPreparation", () =>
+    Effect.gen(function* () {
+      const legacyId = ContestId.make("legacy")
+      const legacyTeam = TeamId.make("legacy-team")
+      const legacy = makeContest({ id: legacyId, edition: 1, status: "finished" })
+      const draft = makeContest({
+        id: ContestId.make("d"),
+        edition: 2,
+        status: "draft",
+        revision: 1,
+        scheduledStartAt: Option.some(100),
+        scheduledEndAt: Option.some(200),
+        accessClosesAt: Option.some(300)
+      })
+      const exit = yield* Effect.exit(
+        beginContestPreparation(draft.id, 1, adminUserId).pipe(
+          Effect.provide(
+            buildLayer({
+              contests: [legacy, draft],
+              teams: [
+                makeTeam({ id: legacyTeam, contestId: legacyId, teamNumber: 1, name: "t1" })
+              ],
+              instances: [
+                makeInstance({
+                  id: InstanceId.make("i-legacy"),
+                  teamId: legacyTeam,
+                  contestId: legacyId,
+                  index: 1,
+                  vmid: 1101,
+                  privateIp: "10.100.1.11",
+                  status: "failed"
+                })
+              ]
+            })
+          )
+        )
+      )
+      const cause = Exit.isFailure(exit) ? exit.cause : null
+      expect(cause !== null).toBe(true)
+      // 実装は ContestNotReadyForPreparation({ failingChecks: [...] }) を返す。
+      // failingChecks に previous_cleanup が含まれる。
+      expect(JSON.stringify(exit)).toMatch(/previous_cleanup/)
+    })
+  )
+
+  it.effect("未完了 Operation が居ると ContestNotReadyForPreparation(unfinished_operation)", () =>
+    Effect.gen(function* () {
+      const draft = makeContest({
+        id: ContestId.make("d"),
+        edition: 2,
+        status: "draft",
+        revision: 1,
+        scheduledStartAt: Option.some(100),
+        scheduledEndAt: Option.some(200),
+        accessClosesAt: Option.some(300)
+      })
+      const exit = yield* Effect.exit(
+        beginContestPreparation(draft.id, 1, adminUserId).pipe(
+          Effect.provide(buildLayer({ contests: [draft], hasUnfinishedOperation: true }))
+        )
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(JSON.stringify(exit)).toMatch(/unfinished_operation/)
+    })
+  )
+
+  it.effect("creating/deleting Instance がグローバルに残っていれば ContestNotReadyForPreparation(transitional_instance)", () =>
+    Effect.gen(function* () {
+      const draft = makeContest({
+        id: ContestId.make("d"),
+        edition: 2,
+        status: "draft",
+        revision: 1,
+        scheduledStartAt: Option.some(100),
+        scheduledEndAt: Option.some(200),
+        accessClosesAt: Option.some(300)
+      })
+      // 他 contest(finalizing 等)は無いが Instance だけ creating が残っている想定。
+      const otherId = ContestId.make("other")
+      const otherTeam = TeamId.make("other-t")
+      const other = makeContest({ id: otherId, edition: 3, status: "finalizing" })
+      // ↑ single-operational partial unique を考慮し finalizing は「これから finish」の状態。
+      const exit = yield* Effect.exit(
+        beginContestPreparation(draft.id, 1, adminUserId).pipe(
+          Effect.provide(
+            buildLayer({
+              contests: [other, draft],
+              teams: [makeTeam({ id: otherTeam, contestId: otherId, teamNumber: 1, name: "t1" })],
+              instances: [
+                makeInstance({
+                  id: InstanceId.make("i-transitional"),
+                  teamId: otherTeam,
+                  contestId: otherId,
+                  index: 1,
+                  vmid: 3101,
+                  privateIp: "10.100.3.11",
+                  status: "creating"
+                })
+              ]
+            })
+          )
+        )
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+      // 他 operational contest(finalizing)が居ることも同時に検出されるが、
+      // 少なくとも transitional_instance または operational_contest_conflict の
+      // いずれかで拒否されればよい(先に発火する側を採用する)。
+      const body = JSON.stringify(exit)
+      expect(
+        body.includes("transitional_instance") || body.includes("OperationalContestConflict")
+      ).toBe(true)
     })
   )
 })

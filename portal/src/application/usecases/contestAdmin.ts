@@ -3,11 +3,13 @@ import { Contest, beginPreparation, cancelContest as cancelContestDomain } from 
 import type { ContestStatus } from "../../domain/contest.js"
 import {
   ContestEditionConflict,
+  ContestNotReadyForPreparation,
   ContestRevisionConflict,
   InvalidContestSchedule,
   InvalidContestTransition,
   OperationalContestConflict
 } from "../../domain/errors.js"
+import type { PreparationBlockReason } from "../../domain/errors.js"
 import { ContestId, TeamId } from "../../domain/ids.js"
 import type { UserId } from "../../domain/ids.js"
 import { Team } from "../../domain/team.js"
@@ -15,14 +17,15 @@ import { TeamInvite } from "../../domain/teamInvite.js"
 import { ContestNotFound } from "../errors.js"
 import {
   ContestRepo,
+  InstanceRepo,
   InviteRepo,
+  OperationRepo,
   RepoError,
   TeamRepo,
   TransactionRunner,
   UuidGen
 } from "../ports.js"
-
-// Task 5: admin draft wizard 用の usecase 群。
+import { evaluatePreviousCleanup } from "./readiness.js"
 //
 // - createContestDraft: 新規 draft Contest を作る。edition partial unique に反すれば
 //   ContestEditionConflict。schedule が入っていれば draft ステージでも整合性検査
@@ -44,6 +47,7 @@ export type ContestAdminError =
   | OperationalContestConflict
   | InvalidContestTransition
   | InvalidContestSchedule
+  | ContestNotReadyForPreparation
 
 export interface CreateContestDraftInput {
   readonly edition: number
@@ -225,41 +229,76 @@ export const beginContestPreparation = (
   contestId: ContestId,
   expectedRevision: number,
   _actorUserId: UserId
-): Effect.Effect<Contest, ContestAdminError, ContestRepo> =>
+): Effect.Effect<
+  Contest,
+  ContestAdminError,
+  ContestRepo | InstanceRepo | OperationRepo | TransactionRunner
+> =>
   Effect.gen(function* () {
-    const contest = yield* loadForMutation(contestId)
-    if (contest.revision !== expectedRevision) {
-      return yield* Effect.fail(
-        new ContestRevisionConflict({ expected: expectedRevision, actual: contest.revision })
-      )
-    }
-    const prepared = yield* Either.match(beginPreparation(contest), {
-      onLeft: Effect.fail,
-      onRight: Effect.succeed
-    })
-    // single-operational partial unique index の TOCTOU 対策(Task 5 review
-    // finding 1)。事前 getOperational で 0 を確認していても、SqlClient 越しの
-    // 別トランザクションが先に「preparing に遷移」を commit する race がある。
-    // その場合 saveIfRevision の UPDATE が
-    // idx_contests_single_operational で UNIQUE 違反となり RepoError(500)
-    // に畳まれるので、失敗時にもう一度 getOperational を読んで「別 contest が
-    // 既に operational になっている」と判定できたら 409 OperationalContestConflict
-    // に載せ替える。実際の SQLite エラー文字列に依存しない安全側の診断。
-    const repo = yield* ContestRepo
-    const preCheck = yield* repo.getOperational
-    if (Option.isSome(preCheck) && preCheck.value.id !== contest.id) {
-      return yield* Effect.fail(new OperationalContestConflict())
-    }
-    return yield* repo.saveIfRevision(prepared, expectedRevision).pipe(
-      Effect.catchTag("RepoError", (cause) =>
-        Effect.gen(function* () {
-          const others = yield* repo.getOperational
-          if (Option.isSome(others) && others.value.id !== contest.id) {
-            return yield* Effect.fail(new OperationalContestConflict())
-          }
-          return yield* Effect.fail(cause)
+    const runner = yield* TransactionRunner
+    // round 1 finding 2 (TOCTOU): 3 つのガード読取(previous_cleanup /
+    // unfinished_operation / transitional_instance)と最終 saveIfRevision を
+    // 単一トランザクションに閉じ込める。SQLite ドライバは serialized なので
+    // トランザクション内での SELECT → UPDATE の間に別セッションが
+    // 「新規 Instance を creating で INSERT する」「新規 Operation を enqueue
+    // する」ことは blocked、これで readiness ガードは SQL 側で TOCTOU-safe に
+    // なる。in-memory TransactionRunner は passthrough なので単体テストの
+    // 挙動は変わらない。
+    return yield* runner.run(
+      Effect.gen(function* () {
+        const contest = yield* loadForMutation(contestId)
+        if (contest.revision !== expectedRevision) {
+          return yield* Effect.fail(
+            new ContestRevisionConflict({ expected: expectedRevision, actual: contest.revision })
+          )
+        }
+        const prepared = yield* Either.match(beginPreparation(contest), {
+          onLeft: Effect.fail,
+          onRight: Effect.succeed
         })
-      )
+        const repo = yield* ContestRepo
+        // Task 8 review gate: previous_cleanup / unfinished_operation /
+        // transitional_instance を単一 tx で並行取得し、失敗した key
+        // 全部を ContestNotReadyForPreparation に載せる(UI が個別に対応できる)。
+        const previousCleanup = yield* evaluatePreviousCleanup
+        const operationRepo = yield* OperationRepo
+        const instanceRepo = yield* InstanceRepo
+        const [hasUnfinishedOp, hasTransitionalInstance] = yield* Effect.all(
+          [operationRepo.hasUnfinished, instanceRepo.hasTransitional],
+          { concurrency: "unbounded" }
+        )
+        const failingChecks: Array<PreparationBlockReason> = []
+        if (previousCleanup.status !== "pass") failingChecks.push("previous_cleanup")
+        if (hasUnfinishedOp) failingChecks.push("unfinished_operation")
+        if (hasTransitionalInstance) failingChecks.push("transitional_instance")
+        if (failingChecks.length > 0) {
+          return yield* Effect.fail(new ContestNotReadyForPreparation({ failingChecks }))
+        }
+
+        // single-operational partial unique index の TOCTOU 対策(Task 5 review
+        // finding 1)。事前 getOperational で 0 を確認していても、SqlClient 越しの
+        // 別トランザクションが先に「preparing に遷移」を commit する race がある。
+        // その場合 saveIfRevision の UPDATE が
+        // idx_contests_single_operational で UNIQUE 違反となり RepoError(500)
+        // に畳まれるので、失敗時にもう一度 getOperational を読んで「別 contest が
+        // 既に operational になっている」と判定できたら 409 OperationalContestConflict
+        // に載せ替える。実際の SQLite エラー文字列に依存しない安全側の診断。
+        const preCheck = yield* repo.getOperational
+        if (Option.isSome(preCheck) && preCheck.value.id !== contest.id) {
+          return yield* Effect.fail(new OperationalContestConflict())
+        }
+        return yield* repo.saveIfRevision(prepared, expectedRevision).pipe(
+          Effect.catchTag("RepoError", (cause) =>
+            Effect.gen(function* () {
+              const others = yield* repo.getOperational
+              if (Option.isSome(others) && others.value.id !== contest.id) {
+                return yield* Effect.fail(new OperationalContestConflict())
+              }
+              return yield* Effect.fail(cause)
+            })
+          )
+        )
+      })
     )
   })
 
