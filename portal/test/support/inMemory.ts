@@ -23,6 +23,7 @@ import type { NewOperation, SanitizedOperationError } from "../../src/domain/ope
 import { InvalidOperationTransition } from "../../src/domain/errors.js"
 import { MemberConflict, ProvisionInProgress, QuotaExceeded } from "../../src/application/errors.js"
 import {
+  AmbiguousAccessPolicy,
   BenchJobRepo,
   CloudflareError,
   CloudflarePort,
@@ -38,6 +39,7 @@ import {
   ProvisionTimeout,
   ProxmoxError,
   ProxmoxPort,
+  RepoError,
   ResourceBindingRepo,
   RunnerConfig,
   SessionRepo,
@@ -1210,14 +1212,29 @@ export const makeProxmoxPortTest = (
 export interface CloudflareTestState {
   readonly routesByHostname: Readonly<Record<string, string>>
   readonly accessEmailsByHostname: Readonly<Record<string, ReadonlyArray<string>>>
+  // Task 9: 「exact set で書き込まれた回数」= 呼び出し履歴を軽量に検証するため。
+  // (batch prepare のテストが「1 台ずつ」書き換わることをアサートする。)
+  readonly ensureAccessAppExactCallsByHostname: Readonly<Record<string, number>>
+  // Task 9: portal 側で持つ「app_id / policy_id / dns_record_id」を確定させる
+  // ため、テスト port も deterministic な ID を返せるようにする。
+  readonly dnsRecordIdByHostname: Readonly<Record<string, string>>
+  readonly accessAppIdByHostname: Readonly<Record<string, string>>
+  readonly accessPolicyIdByHostname: Readonly<Record<string, string | null>>
 }
 
-const emptyCloudflareState: CloudflareTestState = { routesByHostname: {}, accessEmailsByHostname: {} }
+const emptyCloudflareState: CloudflareTestState = {
+  routesByHostname: {},
+  accessEmailsByHostname: {},
+  ensureAccessAppExactCallsByHostname: {},
+  dnsRecordIdByHostname: {},
+  accessAppIdByHostname: {},
+  accessPolicyIdByHostname: {}
+}
 
 export type CloudflareOperation =
   | "ensureInstanceRoute"
   | "removeInstanceRoute"
-  | "ensureAccessApp"
+  | "ensureAccessAppExact"
   | "removeAccessApp"
   | "getInstanceInventory"
   | "probe"
@@ -1243,6 +1260,13 @@ export interface CloudflareInventorySeed {
 export interface CloudflareTestOptions {
   failWith?: Partial<Record<CloudflareOperation, CloudflareError>>
   inventory?: CloudflareInventorySeed
+  // Task 9: `ensureAccessAppExact` を AmbiguousAccessPolicy で失敗させる注入。
+  // failWith と別にする理由は AmbiguousAccessPolicy が CloudflareError の
+  // union の外側にあるため(呼び出し元 err channel が分けて扱う)。
+  ambiguousAccessPolicyFor?: ReadonlyArray<{
+    readonly hostname: string
+    readonly reason: "multiple_allow_policies" | "non_email_include_present" | "policy_shape_unknown"
+  }>
 }
 
 export interface CloudflarePortTestFixture {
@@ -1254,6 +1278,20 @@ export const makeCloudflarePortTest = (
   options: CloudflareTestOptions = {}
 ): CloudflarePortTestFixture => {
   const stateRef = Ref.unsafeMake(emptyCloudflareState)
+  const ambiguousByHostname: Record<
+    string,
+    "multiple_allow_policies" | "non_email_include_present" | "policy_shape_unknown"
+  > = {}
+  for (const entry of options.ambiguousAccessPolicyFor ?? []) {
+    ambiguousByHostname[entry.hostname] = entry.reason
+  }
+  // Task 9: exact set semantics 準拠のスタブでも、Live と同じ「trim +
+  // lowercase + dedupe + sort」の正規化を通す — テストが「port レベルで
+  // 正規化されている」ことを observe できるようにする。
+  const normalize = (emails: ReadonlyArray<string>): ReadonlyArray<string> =>
+    Array.from(
+      new Set(emails.map((e) => e.trim().toLowerCase()).filter((e) => e.length > 0))
+    ).sort()
 
   const guarded = <A>(op: CloudflareOperation, succeed: Effect.Effect<A, never>): Effect.Effect<A, CloudflareError> => {
     const failure = options.failWith?.[op]
@@ -1264,32 +1302,66 @@ export const makeCloudflarePortTest = (
     ensureInstanceRoute: ({ hostname, ip }) =>
       guarded(
         "ensureInstanceRoute",
-        Ref.update(stateRef, (s) => ({ ...s, routesByHostname: { ...s.routesByHostname, [hostname]: ip } }))
+        Effect.gen(function* () {
+          const dnsRecordId = `test-dns-${hostname}`
+          yield* Ref.update(stateRef, (s) => ({
+            ...s,
+            routesByHostname: { ...s.routesByHostname, [hostname]: ip },
+            dnsRecordIdByHostname: { ...s.dnsRecordIdByHostname, [hostname]: dnsRecordId }
+          }))
+          return { dnsRecordId }
+        })
       ),
     removeInstanceRoute: (hostname) =>
       guarded(
         "removeInstanceRoute",
         Ref.update(stateRef, (s) => {
           const { [hostname]: _removed, ...rest } = s.routesByHostname
-          return { ...s, routesByHostname: rest }
+          const { [hostname]: _dropped, ...restDns } = s.dnsRecordIdByHostname
+          return { ...s, routesByHostname: rest, dnsRecordIdByHostname: restDns }
         })
       ),
-    // 現行 include との和集合(締め出し防止。ports.ts の意味論をそのまま再現)。
-    ensureAccessApp: ({ emails, hostname }) =>
-      guarded(
-        "ensureAccessApp",
-        Ref.update(stateRef, (s) => {
-          const current = s.accessEmailsByHostname[hostname] ?? []
-          const union = Array.from(new Set([...current, ...emails]))
-          return { ...s, accessEmailsByHostname: { ...s.accessEmailsByHostname, [hostname]: union } }
+    // Task 9: exact set semantics(Phase 3 の「和集合」を置き換え)。ambiguous
+    // 注入があればここで AmbiguousAccessPolicy を返し、それ以外は「渡された
+    // 集合そのまま」で state を上書きする。call 数を hostname 単位に加算する。
+    ensureAccessAppExact: ({ emails, hostname }) => {
+      const failure = options.failWith?.ensureAccessAppExact
+      if (failure !== undefined) return Effect.fail(failure)
+      const ambiguousReason = ambiguousByHostname[hostname]
+      if (ambiguousReason !== undefined) {
+        return Effect.fail(new AmbiguousAccessPolicy({ hostname, reason: ambiguousReason }))
+      }
+      const normalized = normalize(emails)
+      return Effect.gen(function* () {
+        const appId = `test-app-${hostname}`
+        const policyId = normalized.length === 0 ? null : `test-policy-${hostname}`
+        yield* Ref.update(stateRef, (s) => {
+          const nextCalls = { ...s.ensureAccessAppExactCallsByHostname }
+          nextCalls[hostname] = (nextCalls[hostname] ?? 0) + 1
+          return {
+            ...s,
+            accessEmailsByHostname: { ...s.accessEmailsByHostname, [hostname]: normalized },
+            ensureAccessAppExactCallsByHostname: nextCalls,
+            accessAppIdByHostname: { ...s.accessAppIdByHostname, [hostname]: appId },
+            accessPolicyIdByHostname: { ...s.accessPolicyIdByHostname, [hostname]: policyId }
+          }
         })
-      ),
+        return { appId, policyId }
+      })
+    },
     removeAccessApp: (hostname) =>
       guarded(
         "removeAccessApp",
         Ref.update(stateRef, (s) => {
           const { [hostname]: _removed, ...rest } = s.accessEmailsByHostname
-          return { ...s, accessEmailsByHostname: rest }
+          const { [hostname]: _appDropped, ...restApp } = s.accessAppIdByHostname
+          const { [hostname]: _polDropped, ...restPol } = s.accessPolicyIdByHostname
+          return {
+            ...s,
+            accessEmailsByHostname: rest,
+            accessAppIdByHostname: restApp,
+            accessPolicyIdByHostname: restPol
+          }
         })
       ),
     getInstanceInventory: guarded(
@@ -1326,16 +1398,21 @@ export const makeGithubKeysPortTest = (
 // Task 6/7: ResourceBinding のインメモリ実装。upsert は
 // (provider, resource_type, canonical_key) の 3-tuple を key に既存を差し替える。
 // listByContest は contestId でフィルタする。
+// Task 9: review round 1 finding 1 用に upsert 失敗を注入する option。
 export const makeResourceBindingRepoTest = (
-  initial: ReadonlyArray<ResourceBinding> = []
+  initial: ReadonlyArray<ResourceBinding> = [],
+  options: { readonly failWithUpsert?: RepoError } = {}
 ): Layer.Layer<ResourceBindingRepo> =>
   Layer.effect(
     ResourceBindingRepo,
     Effect.gen(function* () {
       const rowsRef = yield* Ref.make<ReadonlyArray<ResourceBinding>>(initial)
       return {
-        upsert: (binding) =>
-          Ref.update(rowsRef, (rows) => {
+        upsert: (binding) => {
+          if (options.failWithUpsert !== undefined) {
+            return Effect.fail(options.failWithUpsert)
+          }
+          return Ref.update(rowsRef, (rows) => {
             const idx = rows.findIndex(
               (r) =>
                 r.provider === binding.provider &&
@@ -1346,7 +1423,8 @@ export const makeResourceBindingRepoTest = (
             const next = rows.slice()
             next[idx] = binding
             return next
-          }),
+          })
+        },
         listByContest: (contestId) =>
           Ref.get(rowsRef).pipe(Effect.map((rows) => rows.filter((r) => r.contestId === contestId))),
         deleteById: (id) => Ref.update(rowsRef, (rows) => rows.filter((r) => r.id !== id))
@@ -1430,6 +1508,14 @@ export const makeOperationRepoTest = (): { layer: Layer.Layer<OperationRepo>; ge
     completeStep: () => Effect.dieMessage("makeOperationRepoTest: completeStep not implemented"),
     failStep: () => Effect.dieMessage("makeOperationRepoTest: failStep not implemented"),
     blockStep: () => Effect.dieMessage("makeOperationRepoTest: blockStep not implemented"),
+    updateStepProgress: (stepId, progressJson) =>
+      Ref.update(stepsRef, (rows) =>
+        rows.map((s) =>
+          s.id === stepId && s.status === "running"
+            ? new OperationStep({ ...s, progressJson })
+            : s
+        )
+      ),
     resumeExpired: () => Effect.succeed(0),
     // review #5: 実 SQL 実装(operationRepo.ts の retry/cancel)は current
     // status を SELECT してから InvalidOperationTransition の from に載せる。
@@ -1476,6 +1562,7 @@ export const makeOperationRepoStubTest = (
     completeStep: () => Effect.dieMessage("makeOperationRepoStubTest: completeStep not implemented"),
     failStep: () => Effect.dieMessage("makeOperationRepoStubTest: failStep not implemented"),
     blockStep: () => Effect.dieMessage("makeOperationRepoStubTest: blockStep not implemented"),
+    updateStepProgress: () => Effect.void,
     resumeExpired: () => Effect.succeed(0),
     retry: () => Effect.dieMessage("makeOperationRepoStubTest: retry not implemented"),
     cancel: () => Effect.dieMessage("makeOperationRepoStubTest: cancel not implemented")

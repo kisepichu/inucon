@@ -13,8 +13,10 @@ import {
   makeInstanceRepoTest,
   makeInviteRepoTest,
   makeProxmoxPortTest,
+  makeResourceBindingRepoTest,
   makeTeamRepoTest,
-  ProvisioningConfigTest
+  ProvisioningConfigTest,
+  UuidGenTest
 } from "../support/inMemory.js"
 import { DEFAULT_TEST_CONTEST_ID, makeInstance, makeTeam } from "../support/factories.js"
 
@@ -83,7 +85,10 @@ const workerWith = (instances: ReadonlyArray<Instance>) => {
     makeInviteRepoTest([]),
     makeProxmoxPortTest().layer,
     makeCloudflarePortTest().layer,
-    ProvisioningConfigTest()
+    ProvisioningConfigTest(),
+    // Task 9: saga が resource_bindings に upsert するため provisioner にも配線する。
+    makeResourceBindingRepoTest([]),
+    UuidGenTest
   )
   const worker = ProvisionerLive.pipe(Layer.provide(deps))
   // deps を worker とテスト本体の両方へ同一参照で渡す(timeoutSweeper.test.ts

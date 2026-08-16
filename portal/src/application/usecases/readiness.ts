@@ -8,7 +8,8 @@ import {
   ContestRepo,
   InstanceRepo,
   ProxmoxPort,
-  RepoError
+  RepoError,
+  ResourceBindingRepo
 } from "../ports.js"
 import type { ProxmoxInfrastructureInventory } from "../ports.js"
 
@@ -273,14 +274,44 @@ const portalDbCheck: Effect.Effect<ReadinessCheck, never, ContestRepo> = Effect.
     : { key: "portal_db", status: "fail" as const, summary: "portal DB unreachable" }
 })
 
+// Task 9: cloudflare_write_proven = Contest スコープに 1 件でも portal 所有の
+// cloudflare binding が観測されているか。prepare Operation の外部書き込み
+// (ensureInstanceRoute / ensureAccessAppExact)が成功したときにだけ Task 9 の
+// runProvisioning saga が resource_bindings に upsert するため、これが 1 件で
+// もあれば「今エディションで実際に CF に書けた証拠」になる。
+const cloudflareWriteProvenCheck = (
+  contestId: ContestId
+): Effect.Effect<ReadinessCheck, never, ResourceBindingRepo> =>
+  Effect.gen(function* () {
+    const bindings = yield* ResourceBindingRepo
+    const rows = yield* Effect.either(bindings.listByContest(contestId))
+    if (rows._tag === "Left") {
+      return {
+        key: "cloudflare_write_proven",
+        status: "warn",
+        summary: "portal DB unreachable while reading resource bindings"
+      } satisfies ReadinessCheck
+    }
+    const cloudflareOwned = rows.right.filter(
+      (b) => b.provider === "cloudflare" && b.desiredState === "present"
+    )
+    if (cloudflareOwned.length === 0) {
+      return {
+        key: "cloudflare_write_proven",
+        status: "warn",
+        summary: "Cloudflare write path has not been exercised for this Contest yet"
+      } satisfies ReadinessCheck
+    }
+    return {
+      key: "cloudflare_write_proven",
+      status: "pass",
+      summary: `Cloudflare write path exercised (${cloudflareOwned.length} owned bindings)`
+    } satisfies ReadinessCheck
+  })
+
 // Task 10/11 が実装するまで warn を返す key set。start required からは
 // 外れているため start は通るが、UI 側に警告を出す口として維持する。
 const deferredWarnChecks: ReadonlyArray<ReadinessCheck> = [
-  {
-    key: "cloudflare_write_proven",
-    status: "warn",
-    summary: "Cloudflare write path is not yet exercised; Task 9 records this after successful convergence"
-  },
   {
     key: "runner",
     status: "warn",
@@ -327,7 +358,7 @@ export const computeReadiness = (
 ): Effect.Effect<
   ReadonlyArray<ReadinessCheck>,
   ContestNotFound,
-  ContestRepo | InstanceRepo | ProxmoxPort | CloudflarePort
+  ContestRepo | InstanceRepo | ProxmoxPort | CloudflarePort | ResourceBindingRepo
 > =>
   Effect.gen(function* () {
     const contests = yield* ContestRepo
@@ -351,21 +382,20 @@ export const computeReadiness = (
     }
     const contest = preamble.right.contest
     const all = preamble.right.all
-    const [portalDb, inventory, cfToken, cfInventory, previousCleanup] = yield* Effect.all(
+    const [portalDb, inventory, cfToken, cfInventory, previousCleanup, cfWriteProven] = yield* Effect.all(
       [
         portalDbCheck,
         optionalInventory,
         cloudflareTokenCheck,
         cloudflareInventoryCheck,
-        // previousCleanupCheck は InstanceRepo.listByContest を舐めるので DB
-        // 失敗しうる。ここでも Effect.either で個別に fence して warn に畳む。
         Effect.either(previousCleanupCheck(all)).pipe(
           Effect.map((r) =>
             r._tag === "Right"
               ? r.right
               : ({ key: "previous_cleanup", status: "fail" as const, summary: "portal DB unreachable while listing instances" } as ReadinessCheck)
           )
-        )
+        ),
+        cloudflareWriteProvenCheck(contestId)
       ],
       { concurrency: "unbounded" }
     )
@@ -380,6 +410,7 @@ export const computeReadiness = (
       benchvmCheck(inventory),
       cfToken,
       cfInventory,
+      cfWriteProven,
       ...deferredWarnChecks
     ]
   })

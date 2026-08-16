@@ -510,6 +510,19 @@ export const OperationRepoLive: Layer.Layer<
           )
         ).pipe(Effect.asVoid),
 
+      // Task 9: batch prepare Operation の KSM settle 待ち用。running step の
+      // progress_json を書き換えるだけで、status/lease/retry_at には触らない。
+      // running でない step への update は何もしない(TOCTOU 中に別 tick が
+      // 終了させたケースを安全側にする)。
+      updateStepProgress: (stepId: OperationStepId, progressJson: string) =>
+        wrapSqlError(
+          sql`
+            UPDATE operation_steps
+            SET progress_json = ${progressJson}
+            WHERE id = ${stepId} AND status = 'running'
+          `
+        ).pipe(Effect.asVoid),
+
       resumeExpired: (cutoff: number) =>
         wrapSqlError(
           sql<{ id: string }>`

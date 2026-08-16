@@ -1,7 +1,9 @@
 import { Clock, Effect, Either, Option } from "effect"
 import { addStep, markDeleted, markFailed, markProvisioned } from "../../domain/instance.js"
 import type { Instance, ProvisionStep } from "../../domain/instance.js"
-import type { ContestId, TeamId } from "../../domain/ids.js"
+import type { ContestId, ResourceBindingId, TeamId } from "../../domain/ids.js"
+import { ResourceBinding } from "../../domain/resourceBinding.js"
+import type { ResourceType } from "../../domain/resourceBinding.js"
 import { InsufficientMemory } from "../errors.js"
 import {
   CloudflareError,
@@ -14,8 +16,15 @@ import {
   ProxmoxError,
   ProxmoxPort,
   RepoError,
-  TeamRepo
+  ResourceBindingRepo,
+  TeamRepo,
+  UuidGen
 } from "../ports.js"
+
+// hostname stem(canonical key)= FQDN の先頭ラベル `inucon-teamN-M`。
+// ResourceBinding.canonicalKey は reconciliation の stem と揃える契約。
+const hostnameStemFor = (teamNumber: number, index: number): string =>
+  `inucon-team${teamNumber}-${index}`
 
 // tpl-private-isu(スペック §前提: Phase 1 で構築済みのテンプレート VM)。
 // VM スペックは固定(2vCPU/4GB/20GB、ユーザー入力を受けない)なので単一の
@@ -119,7 +128,15 @@ export const runProvisioning = (
 ): Effect.Effect<
   Instance,
   never,
-  InstanceRepo | ProxmoxPort | CloudflarePort | GithubKeysPort | TeamRepo | InviteRepo | ProvisioningConfig
+  | InstanceRepo
+  | ProxmoxPort
+  | CloudflarePort
+  | GithubKeysPort
+  | TeamRepo
+  | InviteRepo
+  | ProvisioningConfig
+  | ResourceBindingRepo
+  | UuidGen
 > =>
   Effect.gen(function* () {
     const repo = yield* InstanceRepo
@@ -127,6 +144,8 @@ export const runProvisioning = (
     const proxmox = yield* ProxmoxPort
     const cloudflare = yield* CloudflarePort
     const config = yield* ProvisioningConfig
+    const bindings = yield* ResourceBindingRepo
+    const uuid = yield* UuidGen
 
     // team 読み出しの失敗は saga の補償対象ではなく infra 障害(DB)なので
     // defect(die)にする。ワーカーの catchAllCause が握って fiber を殺さず、
@@ -152,6 +171,54 @@ export const runProvisioning = (
         return updated
       })
 
+    // Task 9: 各外部 provider 呼び出し成功直後に「portal 所有」の binding を
+    // 永続化する(spec: VM/DNS/ingress/app 別のタイミング)。canonicalKey は
+    // hostname stem = `inucon-teamN-M`(reconciliation の stem と一致)。
+    // upsert は (provider, resource_type, canonical_key) の 3-tuple key で
+    // 既存を差し替えるため、saga の再入で二重登録にはならない。
+    //
+    // review round 1 finding 1: binding upsert 失敗を saga 経路に伝播させると
+    // onFailure → compensate → stopAndDestroyVm が clone 済みの VM を破壊する。
+    // 一方 binding 行は「reconciliation 用の観測メタデータ」なので、次 tick で
+    // inventory + canonicalKey から復元できる (spec §Step 4: crash recovery
+    // via inventory + canonical key)。DB 一時故障で VM を捨てる非対称リスクを
+    // 避けるため、他の観測系 DB 書き込み (persistStep 後の repo.update)と
+    // 同じく logError に畳んで先へ進む。
+    const stem = hostnameStemFor(team.teamNumber, initial.index)
+    const persistBinding = (spec: {
+      readonly resourceType: ResourceType
+      readonly provider: "cloudflare" | "proxmox"
+      readonly externalId: Option.Option<string>
+      readonly desiredState: "present" | "absent"
+    }) =>
+      Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis
+        const id = (yield* uuid.next) as unknown as ResourceBindingId
+        yield* bindings
+          .upsert(
+            new ResourceBinding({
+              id,
+              contestId: initial.contestId,
+              teamId: Option.some(initial.teamId),
+              instanceId: Option.some(initial.id),
+              provider: spec.provider,
+              resourceType: spec.resourceType,
+              canonicalKey: stem,
+              externalId: spec.externalId,
+              desiredState: spec.desiredState,
+              lastObservedState: Option.some("present"),
+              lastObservedAt: Option.some(now)
+            })
+          )
+          .pipe(
+            Effect.catchAll((e) =>
+              Effect.logError(
+                `persist ResourceBinding failed (${spec.provider}/${spec.resourceType}/${stem}): ${describeError(e)}`
+              )
+            )
+          )
+      })
+
     // 逆順の補償(Task 4 レビュー C1 修正): access_done → route_done → VM 破棄を
     // progress の内容に関わらず毎回すべて試みる。理由は「clone 成功直後・
     // progress 保存前にプロセスが落ちた」場合、instance.progress には
@@ -162,11 +229,20 @@ export const runProvisioning = (
     // (呼んでも実害が無い一方、呼び漏らすと孤児資源が残る非対称なリスクの
     // ほうが大きい)。各補償ステップの失敗はログに残して次へ進む(1 つの
     // 補償失敗で残りの補償を諦めない、TimeoutSweeper と同じ生存性優先)。
-    const compensate = (instance: Instance) =>
+    //
+    // review round 1 finding 2: AmbiguousAccessPolicy は「そのアプリは
+    // portal 所有ではないので触らない」という guard 失敗であり、portal は
+    // このアプリを今回作成していない。ここで removeAccessApp を呼ぶと
+    // operator が事前に張った Access アプリを消してしまう (spec §Global
+    // Constraints:「INUCON 以外の DNS/ingress/Access resource は変更しない」
+    // と同じ非破壊原則)。skipAccess=true でアクセス撤収だけスキップする。
+    const compensate = (instance: Instance, opts: { readonly skipAccess: boolean } = { skipAccess: false }) =>
       Effect.gen(function* () {
-        yield* cloudflare
-          .removeAccessApp(hostname)
-          .pipe(Effect.catchAll((e) => Effect.logError(`compensate removeAccessApp failed: ${describeError(e)}`)))
+        if (!opts.skipAccess) {
+          yield* cloudflare
+            .removeAccessApp(hostname)
+            .pipe(Effect.catchAll((e) => Effect.logError(`compensate removeAccessApp failed: ${describeError(e)}`)))
+        }
         yield* cloudflare
           .removeInstanceRoute(hostname)
           .pipe(Effect.catchAll((e) => Effect.logError(`compensate removeInstanceRoute failed: ${describeError(e)}`)))
@@ -207,6 +283,20 @@ export const runProvisioning = (
             name: `inucon-team${team.teamNumber}-${instance.index}`
           })
         }
+        // review round 3 finding 1: persistStep(clone_done) より "前" に VM
+        // binding を永続化する (spec §Step 4:「VM binding after clone
+        // observation」)。順序を逆にすると、persistStep 直後の crash → 再入時
+        // に instance.progress が clone_done を含んで clone ブロックが丸ごと
+        // スキップされ、VM binding が永久に書かれないまま VM だけ存在する
+        // 状態になる (reconciliation が unmanaged_orphan として拾い operator
+        // adopt が必要になる)。他ステップ (dns_record / access_*) と同じく
+        // 「provider mutation 成功 → binding upsert → progress persist」の順に。
+        yield* persistBinding({
+          resourceType: "vm",
+          provider: "proxmox",
+          externalId: Option.some(String(instance.vmid)),
+          desiredState: "present"
+        })
         instance = yield* persistStep(instance, "clone_done")
       }
 
@@ -229,13 +319,49 @@ export const runProvisioning = (
       }
 
       if (!instance.progress.includes("route_done")) {
-        yield* cloudflare.ensureInstanceRoute({ hostname, ip: instance.privateIp })
+        const { dnsRecordId } = yield* cloudflare.ensureInstanceRoute({
+          hostname,
+          ip: instance.privateIp
+        })
+        // route 成功直後に DNS + ingress binding を永続化する(Task 9 §Step 4:
+        // ResourceBinding 永続化タイミングは VM/DNS/ingress/app 別)。DNS は
+        // externalId=dnsRecordId、ingress は externalId=undefined(CF ingress
+        // は id を持たず、ingress config の hostname エントリを直接更新する)。
+        yield* persistBinding({
+          resourceType: "dns_record",
+          provider: "cloudflare",
+          externalId: Option.some(dnsRecordId),
+          desiredState: "present"
+        })
+        yield* persistBinding({
+          resourceType: "tunnel_ingress",
+          provider: "cloudflare",
+          externalId: Option.none(),
+          desiredState: "present"
+        })
         instance = yield* persistStep(instance, "route_done")
       }
 
       if (!instance.progress.includes("access_done")) {
+        // Task 9: 「現メンバー ∪ 現 Contest 内 pending invites」= exact set。
+        // 過去エディションとは union しない(port 側で include を上書きする)。
         const access = yield* collectTeamAccess(instance.contestId, instance.teamId)
-        yield* cloudflare.ensureAccessApp({ hostname, emails: access.emails })
+        const { appId, policyId } = yield* cloudflare.ensureAccessAppExact({
+          hostname,
+          emails: access.emails
+        })
+        yield* persistBinding({
+          resourceType: "access_application",
+          provider: "cloudflare",
+          externalId: Option.some(appId),
+          desiredState: "present"
+        })
+        yield* persistBinding({
+          resourceType: "access_policy",
+          provider: "cloudflare",
+          externalId: policyId === null ? Option.none() : Option.some(policyId),
+          desiredState: "present"
+        })
         instance = yield* persistStep(instance, "access_done")
       }
 
@@ -263,7 +389,18 @@ export const runProvisioning = (
               Effect.map(Option.getOrElse(() => initial)),
               Effect.catchAll(() => Effect.succeed(initial))
             )
-            yield* compensate(current)
+            // review round 1 finding 2: AmbiguousAccessPolicy は portal が
+            // 「そのアプリを触らない」と判断した guard 失敗であり、portal は
+            // このホスト名の Access app を「今回」作成していない。従って
+            // 補償では removeAccessApp をスキップし、operator が張った
+            // Access アプリを消さない (非破壊原則)。他の error 型では従来通り
+            // 全 3 リソースを冪等に撤収する。
+            const isAmbiguousAccessPolicy =
+              typeof error === "object" &&
+              error !== null &&
+              "_tag" in error &&
+              error._tag === "AmbiguousAccessPolicy"
+            yield* compensate(current, { skipAccess: isAmbiguousAccessPolicy })
             const now = yield* Clock.currentTimeMillis
             const failed = markFailed(current, describeError(error), now)
             yield* repo
@@ -341,7 +478,15 @@ export const runTeardown = (
 export const runNextOrchestrationStep: Effect.Effect<
   Option.Option<Instance>,
   never,
-  InstanceRepo | ProxmoxPort | CloudflarePort | GithubKeysPort | TeamRepo | InviteRepo | ProvisioningConfig
+  | InstanceRepo
+  | ProxmoxPort
+  | CloudflarePort
+  | GithubKeysPort
+  | TeamRepo
+  | InviteRepo
+  | ProvisioningConfig
+  | ResourceBindingRepo
+  | UuidGen
 > = Effect.gen(function* () {
   const repo = yield* InstanceRepo
   const next = yield* repo.findNextForOrchestration.pipe(

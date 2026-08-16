@@ -53,6 +53,23 @@ export class CloudflareError extends Data.TaggedError("CloudflareError")<{ cause
 // GitHub 公開鍵取得の失敗(鍵未登録 = 空を含む)。
 export class GithubKeysError extends Data.TaggedError("GithubKeysError")<{ cause: unknown }> {}
 
+// Task 9: `ensureAccessAppExact` が既存 Access アプリのポリシー形状を「portal
+// 所有(単一 allow policy かつ include が email のみ)」と識別できないときに
+// 失敗する。generic な CloudflareError と別にしたのは:
+// - 呼び出し元 (prepareContest / apply) は AmbiguousAccessPolicy を 422 に
+//   落とし、operator に「手動整理が必要な hostname」を明示できる。
+// - error 本体には hostname と reason(kind)しか載せない。既存 include
+//   の生 email や外部 ID は絶対に運ばない (spec §credential)。
+export type AmbiguousAccessPolicyReason =
+  | "multiple_allow_policies"
+  | "non_email_include_present"
+  | "policy_shape_unknown"
+
+export class AmbiguousAccessPolicy extends Data.TaggedError("AmbiguousAccessPolicy")<{
+  readonly hostname: string
+  readonly reason: AmbiguousAccessPolicyReason
+}> {}
+
 // waitForGuestAgent が timeoutMillis 以内に guest agent の応答を確認できなかった。
 export class ProvisionTimeout extends Data.TaggedError("ProvisionTimeout")<{
   vmid: number
@@ -458,17 +475,38 @@ export class ProxmoxPort extends Context.Tag("app/ProxmoxPort")<
 export class CloudflarePort extends Context.Tag("app/CloudflarePort")<
   CloudflarePort,
   {
-    // DNS CNAME(→ benchvm tunnel)+ tunnel ingress(ssh://ip:22)の追加/更新。
+    // Task 9: DNS CNAME(→ benchvm tunnel)+ tunnel ingress(ssh://ip:22)の追加/更新。
+    // 成功時に upsert された CNAME の dnsRecordId を返す — 呼び出し元はこれを
+    // ResourceBinding.externalId に載せ、reconciliation/cleanup が「portal が
+    // 作ったこの 1 件」を狙って落とせるようにする(重複を勝手に消さない)。
     readonly ensureInstanceRoute: (args: {
       hostname: string
       ip: string
-    }) => Effect.Effect<void, CloudflareError>
+    }) => Effect.Effect<{ readonly dnsRecordId: string }, CloudflareError>
     readonly removeInstanceRoute: (hostname: string) => Effect.Effect<void, CloudflareError>
-    // Access アプリ作成 or ポリシー更新(現行 include との和集合で PUT — 締め出し防止)。
-    readonly ensureAccessApp: (args: {
+    // Task 9: 「Contest スコープの現メンバー ∪ 招待中」の email 集合と Access
+    // policy include(email) を完全一致させる(exact set)。Phase 3 の「和集合
+    // PUT」を置き換える:
+    // - 過去エディションの email は残さない(spec §Global Constraints:
+    //   「Access allow policy は当該 Contest Team の正確な email 集合へ
+    //   収束させ、過去開催の email と和集合にしない」)。
+    // - 呼び出し元が集める desired = members(email present) ∪ pending
+    //   team_invites(email) の union は現 Contest 内でのみ許容する。
+    // - emails は正規化(trim + lowercase + dedupe + sort)して include に載せる。
+    // - 既存 app のポリシー形状が portal 所有シェイプ(単一 allow policy かつ
+    //   include が email のみ)でないとき、上書きせず AmbiguousAccessPolicy を
+    //   返し、operator 判断(手動整理)を要求する。
+    // - 新規 app 作成時 emails=[] のときはポリシーを作らない(空 include は CF
+    //   400、Task 7 実機検出)。既存 app + portal 所有 allow policy + emails=[]
+    //   のときは policy を削除する(deny-by-default)。どちらの経路でも
+    //   policyId は null を返す。
+    readonly ensureAccessAppExact: (args: {
       hostname: string
       emails: ReadonlyArray<string>
-    }) => Effect.Effect<void, CloudflareError>
+    }) => Effect.Effect<
+      { readonly appId: string; readonly policyId: string | null },
+      CloudflareError | AmbiguousAccessPolicy
+    >
     readonly removeAccessApp: (hostname: string) => Effect.Effect<void, CloudflareError>
     // Task 7: reconciliation 向け inventory。DNS / tunnel ingress / Access app /
     // policies を横断して読み、hostname prefix が `inucon-team\d+-\d+` の
@@ -562,6 +600,15 @@ export class OperationRepo extends Context.Tag("app/OperationRepo")<
       stepId: OperationStepId,
       error: SanitizedOperationError,
       now: number
+    ) => Effect.Effect<void, RepoError>
+    // Task 9: batch prepare Operation の「KSM settle 待ち」用に、running step の
+    // progress_json を上書きする。retry ループで進捗(first low-memory
+    // observation の時刻など)を DB に残し、worker 再起動後の同 step も同じ
+    // 判断が続けられるようにする。書き込むのは step が running のときだけで、
+    // 他状態への遷移は起こさない(status を触らない)。
+    readonly updateStepProgress: (
+      stepId: OperationStepId,
+      progressJson: string
     ) => Effect.Effect<void, RepoError>
     // resumeExpired: cutoff 以前に lease_expires_at を持つ running Step を queued に戻す。
     // ワーカー起動時 (restart 補償) と定期スイープの両方から呼ばれる。返り値は

@@ -6,6 +6,7 @@ import {
   ProxmoxError
 } from "../../src/application/ports.js"
 import type { ProxmoxInfrastructureInventory } from "../../src/application/ports.js"
+import type { ResourceBinding } from "../../src/domain/resourceBinding.js"
 import type { Contest } from "../../src/domain/contest.js"
 import type { Instance } from "../../src/domain/instance.js"
 import type { Team } from "../../src/domain/team.js"
@@ -26,6 +27,7 @@ import {
   makeContestRepoTest,
   makeInstanceRepoTest,
   makeProxmoxPortTest,
+  makeResourceBindingRepoTest,
   makeTeamRepoTest
 } from "../support/inMemory.js"
 
@@ -82,6 +84,7 @@ interface ReadinessLayerOptions {
   readonly contests?: ReadonlyArray<Contest>
   readonly instances?: ReadonlyArray<Instance>
   readonly teams?: ReadonlyArray<Team>
+  readonly bindings?: ReadonlyArray<ResourceBinding>
   readonly proxmoxInventory?: ProxmoxInfrastructureInventory
   readonly proxmoxFail?: ProxmoxTestOptions
   readonly cloudflareInventory?: CloudflareInventorySeed
@@ -103,6 +106,8 @@ const buildLayer = (opts: ReadinessLayerOptions = {}) => {
     makeContestRepoTest(contests),
     makeInstanceRepoTest(instances),
     makeTeamRepoTest({ teams, memberships: [] }),
+    // Task 9: readiness の cloudflare_write_proven key は ResourceBindingRepo を舐める。
+    makeResourceBindingRepoTest(opts.bindings ?? []),
     proxmox,
     cloudflare
   )
@@ -388,6 +393,7 @@ describe("readiness は provider 状態を一切 mutate しない", () => {
             makeContestRepoTest([preparingContest]),
             makeInstanceRepoTest([]),
             makeTeamRepoTest({ teams: [team1], memberships: [] }),
+            makeResourceBindingRepoTest([]),
             proxmox.layer,
             cloudflare.layer
           )

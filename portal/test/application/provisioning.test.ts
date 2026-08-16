@@ -14,7 +14,7 @@ import {
   ProvisionInProgress,
   QuotaExceeded
 } from "../../src/application/errors.js"
-import { CloudflareError, CloudflarePort, InstanceRepo, ProxmoxError } from "../../src/application/ports.js"
+import { CloudflareError, CloudflarePort, InstanceRepo, ProxmoxError, RepoError } from "../../src/application/ports.js"
 import { listTeamInstances, requestCreateInstance, requestDeleteInstance } from "../../src/application/usecases/instances.js"
 import { collectTeamAccess, runProvisioning, runTeardown } from "../../src/application/usecases/provisioning.js"
 import {
@@ -25,6 +25,7 @@ import {
   makeInstanceRepoTest,
   makeInviteRepoTest,
   makeProxmoxPortTest,
+  makeResourceBindingRepoTest,
   makeTeamRepoTest,
   ProvisioningConfigTest,
   UuidGenTest
@@ -559,7 +560,10 @@ describe("runProvisioning(払い出し saga)", () => {
         inviteRepoLayer,
         proxmox.layer,
         cloudflare.layer,
-        ProvisioningConfigTest()
+        ProvisioningConfigTest(),
+        // Task 9: saga は ResourceBinding を各ステップ成功直後に upsert する。
+        makeResourceBindingRepoTest([]),
+        UuidGenTest
       )
     }
   }
@@ -583,7 +587,9 @@ describe("runProvisioning(払い出し saga)", () => {
         inviteRepoLayer,
         proxmox.layer,
         cloudflare.layer,
-        ProvisioningConfigTest()
+        ProvisioningConfigTest(),
+        makeResourceBindingRepoTest([]),
+        UuidGenTest
       )
     }
   }
@@ -614,7 +620,7 @@ describe("runProvisioning(払い出し saga)", () => {
     Effect.gen(function* () {
       const initial = creatingInstance({ id: "prov-fail-access", teamId: team1Id, index: 1, teamNumber: 1 })
       const { cloudflare, layer, proxmox } = sagaLayerWith(initial, {
-        cloudflare: { failWith: { ensureAccessApp: new CloudflareError({ cause: "boom" }) } }
+        cloudflare: { failWith: { ensureAccessAppExact: new CloudflareError({ cause: "boom" }) } }
       })
       const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
 
@@ -629,6 +635,80 @@ describe("runProvisioning(払い出し saga)", () => {
       const px = yield* proxmox.getState
       expect(px.destroyedVmids).toStrictEqual([vmid1])
     })
+  )
+
+  it.effect(
+    "review round 1 finding 2: AmbiguousAccessPolicy のときは removeAccessApp を呼ばない (operator の Access アプリを破壊しない)",
+    () =>
+      Effect.gen(function* () {
+        const initial = creatingInstance({ id: "prov-ambig", teamId: team1Id, index: 1, teamNumber: 1 })
+        const proxmox = makeProxmoxPortTest()
+        const cloudflare = makeCloudflarePortTest({
+          ambiguousAccessPolicyFor: [
+            { hostname: hostname1, reason: "non_email_include_present" }
+          ]
+        })
+        const layer = Layer.mergeAll(
+          makeInstanceRepoTest([initial]),
+          teamRepoLayer,
+          githubKeysLayer,
+          inviteRepoLayer,
+          proxmox.layer,
+          cloudflare.layer,
+          ProvisioningConfigTest(),
+          makeResourceBindingRepoTest([]),
+          UuidGenTest
+        )
+
+        const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
+
+        expect(result.status).toBe("failed")
+        // route / VM は portal が今回作った resource なので compensate で撤収される。
+        // Access は non-portal-owned で触れないため撤収スキップ (state に元々
+        // 何も入っていないので touched を数える術がない → 「touch されなかった」
+        // 相当は「他 hostname の access も無傷」で確認する)。
+        const cf = yield* cloudflare.getState
+        expect(cf.routesByHostname).toStrictEqual({})
+        // ensureAccessAppExact は 1 回だけ呼ばれ、そのとき AmbiguousAccessPolicy
+        // で失敗した (== state に何も書かれていない)。removeAccessApp は呼ばれて
+        // いないため state.accessEmailsByHostname / accessAppIdByHostname は
+        // 空のままで、この空状態から「消しに行っていない」ことを検証する。
+        expect(cf.accessEmailsByHostname).toStrictEqual({})
+        expect(cf.accessAppIdByHostname).toStrictEqual({})
+        // VM は破壊されている (route/VM は portal 所有)。
+        const px = yield* proxmox.getState
+        expect(px.destroyedVmids).toStrictEqual([vmid1])
+      })
+  )
+
+  it.effect(
+    "review round 1 finding 1: ResourceBinding upsert が RepoError でも saga は running に到達し VM を破壊しない",
+    () =>
+      Effect.gen(function* () {
+        const initial = creatingInstance({ id: "prov-binding-fail", teamId: team1Id, index: 1, teamNumber: 1 })
+        const proxmox = makeProxmoxPortTest()
+        const cloudflare = makeCloudflarePortTest()
+        const layer = Layer.mergeAll(
+          makeInstanceRepoTest([initial]),
+          teamRepoLayer,
+          githubKeysLayer,
+          inviteRepoLayer,
+          proxmox.layer,
+          cloudflare.layer,
+          ProvisioningConfigTest(),
+          makeResourceBindingRepoTest([], { failWithUpsert: new RepoError({ cause: "binding-db-outage" }) }),
+          UuidGenTest
+        )
+
+        const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
+
+        expect(result.status).toBe("running")
+        // VM は保持される: onFailure に落ちれば stopAndDestroyVm が呼ばれるが、
+        // binding 失敗は catchAll で吸収されるため saga は成功する。
+        const px = yield* proxmox.getState
+        expect(px.destroyedVmids).toStrictEqual([])
+        expect(px.clonedVmids).toStrictEqual([vmid1])
+      })
   )
 
   it.effect("startVm 失敗時: route は作らず、clone 済み VM だけ破棄して failed", () =>
@@ -682,7 +762,9 @@ describe("runProvisioning(払い出し saga)", () => {
         inviteRepoLayer,
         proxmox.layer,
         cloudflare.layer,
-        ProvisioningConfigTest()
+        ProvisioningConfigTest(),
+        makeResourceBindingRepoTest([]),
+        UuidGenTest
       )
 
       const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
@@ -716,7 +798,9 @@ describe("runProvisioning(払い出し saga)", () => {
           inviteRepoLayer,
           proxmox.layer,
           cloudflare.layer,
-          ProvisioningConfigTest()
+          ProvisioningConfigTest(),
+          makeResourceBindingRepoTest([]),
+          UuidGenTest
         )
 
         const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
@@ -740,7 +824,9 @@ describe("runProvisioning(払い出し saga)", () => {
         inviteRepoLayer,
         proxmox.layer,
         cloudflare.layer,
-        ProvisioningConfigTest({ minFreeMemBytes: 5_000_000_000 })
+        ProvisioningConfigTest({ minFreeMemBytes: 5_000_000_000 }),
+        makeResourceBindingRepoTest([]),
+        UuidGenTest
       )
 
       const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
@@ -767,7 +853,9 @@ describe("runProvisioning(払い出し saga)", () => {
         inviteRepoLayer,
         proxmox.layer,
         cloudflare.layer,
-        ProvisioningConfigTest({ minFreeMemBytes: 5_000_000_000 })
+        ProvisioningConfigTest({ minFreeMemBytes: 5_000_000_000 }),
+        makeResourceBindingRepoTest([]),
+        UuidGenTest
       )
 
       const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
@@ -832,7 +920,7 @@ describe("runTeardown(撤収 saga)", () => {
         // 事前に route/Access を張っておき、撤収で消えることを確認する。
         const cf = yield* CloudflarePort
         yield* cf.ensureInstanceRoute({ hostname: hostname1, ip: ip1 })
-        yield* cf.ensureAccessApp({ hostname: hostname1, emails: ["alice@example.com"] })
+        yield* cf.ensureAccessAppExact({ hostname: hostname1, emails: ["alice@example.com"] })
         return yield* runTeardown(deletingInstance)
       }).pipe(Effect.provide(layer))
 

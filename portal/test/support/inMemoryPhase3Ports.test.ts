@@ -150,31 +150,39 @@ describe("makeProxmoxPortTest", () => {
 })
 
 describe("makeCloudflarePortTest", () => {
-  it.effect("ensureAccessApp は和集合になり、remove は該当ホストのみ消す", () =>
+  it.effect("ensureAccessAppExact は渡された email 集合をそのまま保持し、remove は該当ホストのみ消す", () =>
     Effect.gen(function* () {
       const { getState, layer } = makeCloudflarePortTest()
-      yield* CloudflarePort.pipe(
+      const returned = yield* CloudflarePort.pipe(
         Effect.flatMap((cf) =>
           Effect.gen(function* () {
-            yield* cf.ensureInstanceRoute({ hostname: "a.kisen.one", ip: "10.100.1.11" })
-            yield* cf.ensureAccessApp({ hostname: "a.kisen.one", emails: ["x@example.com"] })
-            yield* cf.ensureAccessApp({ hostname: "a.kisen.one", emails: ["x@example.com", "y@example.com"] })
+            const route = yield* cf.ensureInstanceRoute({ hostname: "a.kisen.one", ip: "10.100.1.11" })
+            const app1 = yield* cf.ensureAccessAppExact({ hostname: "a.kisen.one", emails: ["x@example.com"] })
+            // 2 回目の call は「exact set」で上書き — union ではない。
+            const app2 = yield* cf.ensureAccessAppExact({ hostname: "a.kisen.one", emails: ["Y@Example.com"] })
+            return { route, app1, app2 }
           })
         ),
         Effect.provide(layer)
       )
       const state = yield* getState
       expect(state.routesByHostname).toStrictEqual({ "a.kisen.one": "10.100.1.11" })
-      expect([...state.accessEmailsByHostname["a.kisen.one"]].sort()).toStrictEqual(["x@example.com", "y@example.com"])
+      expect(returned.route.dnsRecordId).toBe("test-dns-a.kisen.one")
+      expect(returned.app1.appId).toBe("test-app-a.kisen.one")
+      expect(typeof returned.app1.policyId).toBe("string")
+      // 上書きされて "Y@Example.com" → normalized "y@example.com" だけが残る。
+      expect(state.accessEmailsByHostname["a.kisen.one"]).toStrictEqual(["y@example.com"])
+      // 呼び出しは 2 回。
+      expect(state.ensureAccessAppExactCallsByHostname["a.kisen.one"]).toBe(2)
     })
   )
 
-  it.effect("failWith で指定した操作は常に失敗する", () =>
+  it.effect("failWith.ensureAccessAppExact は常に失敗する", () =>
     Effect.gen(function* () {
       const injected = new CloudflareError({ cause: "boom" })
-      const { layer } = makeCloudflarePortTest({ failWith: { ensureAccessApp: injected } })
+      const { layer } = makeCloudflarePortTest({ failWith: { ensureAccessAppExact: injected } })
       const error = yield* CloudflarePort.pipe(
-        Effect.flatMap((cf) => cf.ensureAccessApp({ hostname: "a.kisen.one", emails: [] })),
+        Effect.flatMap((cf) => cf.ensureAccessAppExact({ hostname: "a.kisen.one", emails: [] })),
         Effect.provide(layer),
         Effect.flip
       )

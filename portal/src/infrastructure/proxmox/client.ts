@@ -235,6 +235,13 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
   ProxmoxPort,
   Effect.gen(function* () {
     const apiUrl = yield* Config.string("PROXMOX_API_URL")
+    // Task 9 review round 2 finding 2: pool は「Proxmox に存在するプールに
+    // だけ渡す」optional 環境変数にする。Task 14 が inucon-team-vms プールを
+    // 作るまで、旧環境や dev の Proxmox で clone が確実に 500 で落ちるのを
+    // 避けるため。設定していれば毎 clone request の URL params に pool を
+    // 積み、未設定なら pool パラメータ自体を送らない (Proxmox 側の
+    // 「pool は任意」契約に依存)。
+    const clonePool = yield* Config.option(Config.string("PROXMOX_CLONE_POOL"))
     const creds = yield* readSplitCredentials
     const rawClient = yield* HttpClient.HttpClient
 
@@ -569,13 +576,19 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
     })
 
     return {
-      cloneVm: ({ name, newVmid, templateVmid }) =>
-        runTaskWith(
+      // Task 9: PROXMOX_CLONE_POOL が設定されていれば、その pool を毎 clone に
+      // 付ける (least-privilege ACL の Task 14 と整合)。未設定なら pool 抜きで
+      // 送る(既存 Proxmox に prohibitively を要求しない)。
+      cloneVm: ({ name, newVmid, templateVmid }) => {
+        const params: Record<string, string | number> = { newid: newVmid, full: 0, name }
+        if (Option.isSome(clonePool)) params.pool = clonePool.value
+        return runTaskWith(
           provisionClient,
           HttpClientRequest.post(`${apiUrl}/nodes/${NODE}/qemu/${templateVmid}/clone`).pipe(
-            HttpClientRequest.bodyUrlParams({ newid: newVmid, full: 0, name })
+            HttpClientRequest.bodyUrlParams(params)
           )
-        ),
+        )
+      },
 
       configureCloudInit: ({ gateway, ip, sshKeys, vmid }) =>
         requestConfigWith(

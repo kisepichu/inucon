@@ -45,7 +45,10 @@ export const ProxmoxPortStubLive: Layer.Layer<ProxmoxPort> = Layer.succeed(Proxm
 export const CloudflarePortStubLive: Layer.Layer<CloudflarePort> = Layer.succeed(CloudflarePort, {
   ensureInstanceRoute: () => Effect.fail(new CloudflareError({ cause: DISABLED_MESSAGE })),
   removeInstanceRoute: () => Effect.fail(new CloudflareError({ cause: DISABLED_MESSAGE })),
-  ensureAccessApp: () => Effect.fail(new CloudflareError({ cause: DISABLED_MESSAGE })),
+  // Task 9: 未設定時は generic CloudflareError で返す(AmbiguousAccessPolicy は
+  // 実 provider を叩いた結果でしか出さない — スタブが operator 判断要求を
+  // 偽造しないため)。
+  ensureAccessAppExact: () => Effect.fail(new CloudflareError({ cause: DISABLED_MESSAGE })),
   removeAccessApp: () => Effect.fail(new CloudflareError({ cause: DISABLED_MESSAGE })),
   // 上記 listManagedVms と同じ理由で inventory は空で返す(fail ではなく)。
   getInstanceInventory: Effect.succeed({ routes: [], apps: [] }),

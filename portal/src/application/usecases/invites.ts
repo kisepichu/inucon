@@ -78,7 +78,12 @@ const syncRunningInstances = (
     let accessError: string | undefined
     for (const instance of running) {
       const hostname = hostnameFor(team.teamNumber, instance.index)
-      const result = yield* Effect.either(cloudflare.ensureAccessApp({ hostname, emails: access.emails }))
+      // Task 9: exact set semantics(過去エディションとは union しない)。
+      // AmbiguousAccessPolicy は portal 側の error 表示に流し込む(describeError
+      // が JSON 化するので hostname/reason だけの安全な文字列になる)。
+      const result = yield* Effect.either(
+        cloudflare.ensureAccessAppExact({ hostname, emails: access.emails })
+      )
       if (Either.isLeft(result)) {
         accessOk = false
         accessError = describeError(result.left)

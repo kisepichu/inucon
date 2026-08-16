@@ -2,7 +2,7 @@ import { createHash } from "node:crypto"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "@effect/platform"
 import { Config, Effect, Layer, Redacted, Schema } from "effect"
 import type { ConfigError } from "effect/ConfigError"
-import { CloudflareError, CloudflarePort } from "../../application/ports.js"
+import { AmbiguousAccessPolicy, CloudflareError, CloudflarePort } from "../../application/ports.js"
 import { MANAGED_HOSTNAME_PATTERN } from "../../domain/reconciliation.js"
 import { describeHttpFailure, requestPath } from "../httpClientErrors.js"
 
@@ -177,6 +177,9 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
         )
       )
 
+    // Task 9: upsert 後の DNS record ID を返す。既存があれば PUT、無ければ
+    // POST。CF は body の name/content/proxied で更新するので、こちらは
+    // record ID を portal 側の ResourceBinding に載せるだけで良い。
     const upsertDnsRecord = (hostname: string, content: string) =>
       Effect.gen(function* () {
         const existing = yield* findDnsRecord(hostname)
@@ -187,13 +190,15 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
               HttpClientRequest.bodyUnsafeJson(body)
             )
           )
-        } else {
-          yield* requestJson(
-            HttpClientRequest.post(`${CF_API_BASE}/zones/${zoneId}/dns_records`).pipe(
-              HttpClientRequest.bodyUnsafeJson(body)
-            )
-          )
+          return existing.id
         }
+        const created = yield* request(
+          HttpClientRequest.post(`${CF_API_BASE}/zones/${zoneId}/dns_records`).pipe(
+            HttpClientRequest.bodyUnsafeJson(body)
+          ),
+          DnsRecord
+        )
+        return created.id
       })
 
     const deleteDnsRecordIfExists = (hostname: string) =>
@@ -257,8 +262,9 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
     return {
       ensureInstanceRoute: ({ hostname, ip }) =>
         Effect.gen(function* () {
-          yield* upsertDnsRecord(hostname, `${tunnelId}.cfargotunnel.com`)
+          const dnsRecordId = yield* upsertDnsRecord(hostname, `${tunnelId}.cfargotunnel.com`)
           yield* upsertIngress(hostname, `ssh://${ip}:22`)
+          return { dnsRecordId }
         }),
 
       removeInstanceRoute: (hostname) =>
@@ -267,15 +273,27 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
           yield* removeIngress(hostname)
         }),
 
-      // GET → 和集合 → PUT(締め出し防止。既存ポリシーの include を消さない)。
+      // Task 9: exact set semantics で Access アプリ + ポリシーを収束させる。
       //
-      // emails が空のときはポリシーを書き込まない(Task 7 実機検出): CF は空の
-      // include を 400 で拒否する。ポリシー無しのアプリは deny-by-default なので
-      // 安全側であり、email は後から招待フロー(inviteMember →
-      // syncRunningInstances → ensureAccessApp 再実行)が登録した時点でポリシー
-      // が作られる。
-      ensureAccessApp: ({ hostname, emails }) =>
+      // - 呼び出し元が渡す `emails` を「trim + lowercase + dedupe + sort」して
+      //   include の唯一の source of truth にする。過去エディションの email が
+      //   include に残っていても消す(= no union with prior editions)。
+      // - 既存 app のポリシー形状が「単一 allow + include が email のみ」で
+      //   ない場合(手動追加された 2 つ目の allow policy、非 email include の
+      //   混入など)は、上書きすると operator が入れた設定を破壊するため
+      //   AmbiguousAccessPolicy を返して blocked にする。修復は operator の
+      //   手動整理を要求する(readiness/reconciliation の runbook 通り)。
+      // - emails=[] のとき: 新規 app なら policy を作らない(空 include は CF
+      //   400、Task 7 実機検出)。既存 app の portal 所有 allow policy は
+      //   DELETE する(deny-by-default に落ちる)。どちらも policyId=null 返却。
+      ensureAccessAppExact: ({ hostname, emails }) =>
         Effect.gen(function* () {
+          const normalized = Array.from(
+            new Set(
+              emails.map((e) => e.trim().toLowerCase()).filter((e) => e.length > 0)
+            )
+          ).sort()
+
           const existingApp = yield* findAccessApp(hostname)
           if (existingApp === undefined) {
             const app = yield* request(
@@ -289,59 +307,75 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
               ),
               AccessApp
             )
-            if (emails.length === 0) return
-            yield* requestJson(
+            if (normalized.length === 0) {
+              return { appId: app.id, policyId: null } as { appId: string; policyId: string | null }
+            }
+            const created = yield* request(
               HttpClientRequest.post(
                 `${CF_API_BASE}/accounts/${accountId}/access/apps/${app.id}/policies`
               ).pipe(
                 HttpClientRequest.bodyUnsafeJson({
                   name: "inucon-team-members",
                   decision: "allow",
-                  include: emails.map((email) => ({ email: { email } }))
+                  include: normalized.map((email) => ({ email: { email } }))
                 })
-              )
+              ),
+              AccessPolicy
             )
-            return
+            return { appId: app.id, policyId: created.id } as { appId: string; policyId: string | null }
           }
 
           const policies = yield* getPolicies(existingApp.id)
+          const allowPolicies = policies.filter((p) => p.decision === "allow")
 
-          // 前提(単一ポリシー想定の脆さへの対処): 実 API では複数ポリシー・複数種別の
-          // include(everyone/ip/email_domain 等)が存在しうる。ここでは「先頭の allow
-          // ポリシー」だけを inucon の対象ポリシーとみなし、email はその先頭 allow
-          // ポリシーの email include とのみ和集合を取る。allow ポリシーが 1 つも無い
-          // (0 個、または全て allow 以外)場合は新規に allow ポリシーを作成する。
-          // 対象ポリシーの email 以外の include(everyone/ip 等)は unknown のまま
-          // そのまま保持し、和集合の対象にも変更対象にもしない(消さない)。
-          const targetPolicy = policies.find((p) => p.decision === "allow")
+          // 「portal 所有シェイプ」の判定: allow policy が 0 か 1 かつ include が
+          // 空でなく email のみ、または 0(= 未作成)を許容する。それ以外は
+          // AmbiguousAccessPolicy として上書きせず operator に任せる。
+          if (allowPolicies.length > 1) {
+            return yield* Effect.fail(
+              new AmbiguousAccessPolicy({ hostname, reason: "multiple_allow_policies" })
+            )
+          }
+          const targetPolicy = allowPolicies.length === 1 ? allowPolicies[0] : undefined
+          if (
+            targetPolicy !== undefined &&
+            targetPolicy.include.length > 0 &&
+            !targetPolicy.include.every(isEmailInclude)
+          ) {
+            return yield* Effect.fail(
+              new AmbiguousAccessPolicy({ hostname, reason: "non_email_include_present" })
+            )
+          }
 
           if (targetPolicy === undefined) {
-            // 空 include は CF 400(上記コメント)。email が来るまで作らない。
-            if (emails.length === 0) return
-            yield* requestJson(
+            if (normalized.length === 0) {
+              return { appId: existingApp.id, policyId: null } as { appId: string; policyId: string | null }
+            }
+            const created = yield* request(
               HttpClientRequest.post(
                 `${CF_API_BASE}/accounts/${accountId}/access/apps/${existingApp.id}/policies`
               ).pipe(
                 HttpClientRequest.bodyUnsafeJson({
                   name: "inucon-team-members",
                   decision: "allow",
-                  include: emails.map((email) => ({ email: { email } }))
+                  include: normalized.map((email) => ({ email: { email } }))
                 })
-              )
+              ),
+              AccessPolicy
             )
-            return
+            return { appId: existingApp.id, policyId: created.id } as { appId: string; policyId: string | null }
           }
 
-          const currentEmails = targetPolicy.include.filter(isEmailInclude).map((i) => i.email.email)
-          const otherIncludes = targetPolicy.include.filter((i) => !isEmailInclude(i))
-          const union = Array.from(new Set([...currentEmails, ...emails]))
-          const includeBody = [...otherIncludes, ...union.map((email) => ({ email: { email } }))]
-
-          // 防御的ガード: includeBody が空になる場合(既存 allow ポリシーの include
-          // も追加 emails も空)は PUT しない(空 include は CF 400)。実運用では
-          // 既存 allow ポリシーの include が空になることは無いが、安全側に倒す。
-          if (includeBody.length === 0) return
-
+          // 既存 portal 所有 allow policy が存在。normalized=[] のときは削除、
+          // それ以外は include を「exact に normalized」で PUT する(和集合しない)。
+          if (normalized.length === 0) {
+            yield* requestJson(
+              HttpClientRequest.del(
+                `${CF_API_BASE}/accounts/${accountId}/access/apps/${existingApp.id}/policies/${targetPolicy.id}`
+              )
+            )
+            return { appId: existingApp.id, policyId: null } as { appId: string; policyId: string | null }
+          }
           yield* requestJson(
             HttpClientRequest.put(
               `${CF_API_BASE}/accounts/${accountId}/access/apps/${existingApp.id}/policies/${targetPolicy.id}`
@@ -349,10 +383,11 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
               HttpClientRequest.bodyUnsafeJson({
                 name: "inucon-team-members",
                 decision: "allow",
-                include: includeBody
+                include: normalized.map((email) => ({ email: { email } }))
               })
             )
           )
+          return { appId: existingApp.id, policyId: targetPolicy.id } as { appId: string; policyId: string | null }
         }),
 
       removeAccessApp: (hostname) =>

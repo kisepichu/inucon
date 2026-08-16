@@ -24,6 +24,11 @@ import {
   ENTER_CONTEST_MODE_STEP_KEYS,
   makeEnterContestModeHandler
 } from "./application/usecases/modeOperation.js"
+import {
+  makePrepareHandler,
+  PREPARE_STEP_KEY,
+  PrepareConfigDefault
+} from "./application/usecases/prepare.js"
 import { CloudflareLive } from "./infrastructure/cloudflare/client.js"
 import { GithubKeysLive } from "./infrastructure/github/keys.js"
 import { GithubOAuthLive } from "./infrastructure/github/oauth.js"
@@ -305,14 +310,17 @@ const WorkerLive = TimeoutSweeperLive.pipe(
 )
 
 
-// Task 7: reconcile Operation の step 実行 handler を登録。CloudflarePort
-// (InstancePortsLive) 経由で DNS/tunnel/Access を冪等に撤収する。他 kind
-// (start/finish/backup 等) の handler は Task 11/12 で追加する。
+// Task 7/8/9: Operation kind 別の step handler を登録する。
+//  - reconcile: Cloudflare/Proxmox の inventory-driven cleanup
+//  - enter_contest_mode: devvm → benchvm の graceful power transition
+//  - prepare: preparing Contest の全 team を desiredInstanceCount まで
+//    「1 台ずつ + memory recheck + KSM settle」で収束させる (Task 9)
 const OperationHandlerRegistryLive = Layer.effect(
   OperationHandlerRegistry,
   Effect.gen(function* () {
     const reconcileHandler = yield* makeReconciliationHandler
     const modeHandler = yield* makeEnterContestModeHandler
+    const prepareHandler = yield* makePrepareHandler
     const enterModeStepKeys: ReadonlyArray<string> = ENTER_CONTEST_MODE_STEP_KEYS
     return {
       lookup: (kind, stepKey) => {
@@ -321,6 +329,9 @@ const OperationHandlerRegistryLive = Layer.effect(
         }
         if (kind === "enter_contest_mode" && enterModeStepKeys.includes(stepKey)) {
           return Option.some(modeHandler)
+        }
+        if (kind === "prepare" && stepKey === PREPARE_STEP_KEY) {
+          return Option.some(prepareHandler)
         }
         return Option.none()
       }
@@ -337,7 +348,12 @@ const OperationWorkerConditionalLive = OperationWorkerLive.pipe(
     OperationHandlerRegistryLive.pipe(
       Layer.provide(InstancePortsLive),
       Layer.provide(ReposLive),
-      Layer.provide(HostnameConfigLive)
+      Layer.provide(HostnameConfigLive),
+      Layer.provide(ProvisioningConfigLive),
+      // Task 9: prepare Operation の handler が使う KSM/PVE 待機設定。
+      // env で上書き可能な wiring は本 task の実装スコープ外 (spec の DEFAULT_
+      // 既定値を使う)。
+      Layer.provide(PrepareConfigDefault)
     )
   ),
   Layer.provide(ReposLive),
