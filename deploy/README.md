@@ -2,7 +2,16 @@
 
 初期セットアップ(Phase 2 Task 11 当時の手順)と、通常運用の再デプロイ手順をまとめる。
 実行にはそれぞれの資格情報(apphost SSH 鍵、Cloudflare API トークン、nixos-config-private への書き込み権限)が要る。
-コンテスト当日の運営作業は `docs/runbooks/contest-operations.md` を参照。
+コンテスト当日の運営作業は `docs/runbooks/contest-operations.md` を、block
+condition (mode transition timeout / stale plan / ambiguous CF policy /
+cleanup 失敗 / migration rollback / credential rotation / finalizing で
+stuck 等) からの復旧は `docs/runbooks/contest-recovery.md` を参照。
+資格情報 (`GITHUB_CLIENT_ID/SECRET`, `RUNNER_TOKEN`, Proxmox provision /
+mode token, Cloudflare tunnel token) は Task 14 以降 **`../nixos-config-private`
+の agenix (`secrets/*.age`) が唯一の source of truth**。手順 3 の
+`kubectl create secret` は初期化 (Phase 2) 以来の履歴として残しているが、
+新規に平文値を作らない: apphost の systemd oneshot が age → k3s Secret
+`inucon-portal-env` に sync する経路を使う。
 
 ## 運用ポリシー: 本番 = main(Phase 3 以降)
 

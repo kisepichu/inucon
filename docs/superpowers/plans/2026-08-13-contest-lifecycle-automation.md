@@ -1360,14 +1360,14 @@ Do not use `set -x`, command substitution containing decoded values, terminal pr
 
 - [ ] **Step 5: Implement a plan-first Proxmox credential bootstrap and stop before apply**
 
-Create `scripts/provision-inucon-proxmox-credentials.sh` with read-only default/`--plan` and explicit `--apply --token-suffix <new-unique-suffix>`. The plan validates eevee `192.0.2.10`, VMIDs9100/9200/9300 and their names, storage `local-lvm`, the absence of target token IDs, and prints only role/user/pool/ACL names. Run plan during implementation, then stop for explicit user approval immediately before apply. It idempotently creates pool `inucon-team-vms` containing template9100, dedicated no-password users `inucon-provision@pve` and `inucon-mode@pve`, and these least-privilege roles/ACLs:
+Create `scripts/provision-inucon-proxmox-credentials.sh` with read-only default/`--plan` and explicit `--apply --token-suffix <new-unique-suffix>`. The plan validates eevee `192.0.2.10`, VMIDs9100/9200/9300 and their names, storage `local-zfs`, the absence of target token IDs, and prints only role/user/pool/ACL names. Run plan during implementation, then stop for explicit user approval immediately before apply. It idempotently creates pool `inucon-team-vms` containing template9100, dedicated no-password users `inucon-provision@pve` and `inucon-mode@pve`, and these least-privilege roles/ACLs:
 
 ```text
 InuconProvisionVm on /pool/inucon-team-vms:
   VM.Allocate, VM.Audit, VM.Clone, VM.Config.Cloudinit, VM.Config.Disk,
   VM.Config.Network, VM.Config.Options, VM.GuestAgent.Audit,
   VM.GuestAgent.Unrestricted, VM.PowerMgmt
-PVEDatastoreUser on /storage/local-lvm (provision user only)
+PVEDatastoreUser on /storage/local-zfs (provision user only)
 InuconNodeAudit (Sys.Audit) on /nodes/eevee (both users)
 InuconMode (VM.Audit, VM.Config.Options, VM.PowerMgmt) on /vms/9200 and /vms/9300
 ```

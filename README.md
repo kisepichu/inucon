@@ -80,5 +80,6 @@ pnpm --filter portal dev
 - Phase 3 設計(セルフサービス/招待): [docs/superpowers/specs/2026-07-10-phase3-selfservice-design.md](docs/superpowers/specs/2026-07-10-phase3-selfservice-design.md)
 - デプロイ runbook(本番 = main 運用): [deploy/README.md](deploy/README.md)
 - コンテスト運営 runbook: [docs/runbooks/contest-operations.md](docs/runbooks/contest-operations.md)
+- リカバリ runbook(block condition からの復旧): [docs/runbooks/contest-recovery.md](docs/runbooks/contest-recovery.md)
 - Phase 1 の手動オペレーション(Terraform での VM 増減等): [infra/docs/](infra/docs/) と
   [problems/private-isu/README.md](problems/private-isu/README.md)
