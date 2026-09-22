@@ -2,6 +2,7 @@ import { Effect, Option } from "effect"
 import type { ReadinessCheck } from "shared/schemas"
 import type { Contest } from "../../domain/contest.js"
 import type { ContestId } from "../../domain/ids.js"
+import { modeVmIdentityMismatch } from "../../domain/modeVmIds.js"
 import { ContestNotFound } from "../errors.js"
 import {
   BackupPort,
@@ -21,8 +22,9 @@ import type { ProxmoxInfrastructureInventory } from "../ports.js"
 //
 // - readiness は Contest / provider の state を一切 mutate しない。
 // - 各 check は stable key(portal_db / previous_cleanup / template / team_slots /
-//   isolation / memory / capacity_estimate / benchvm / cloudflare_token /
-//   cloudflare_inventory / cloudflare_write_proven / runner / backup / rehearsal)
+//   isolation / memory / capacity_estimate / benchvm / mode_vm_identity /
+//   cloudflare_token / cloudflare_inventory / cloudflare_write_proven / runner /
+//   backup / rehearsal)
 //   と summary(非機密文字列: 生 email / bearer / cause は絶対に含めない)を返す。
 // - Task 10/11 で実装される runner/backup/rehearsal/cloudflare_write_proven は
 //   ここでは warn を返し、start は「required key が pass、capacity_estimate は
@@ -50,6 +52,7 @@ export const START_REQUIRED_CHECK_KEYS: ReadonlyArray<string> = [
   "isolation",
   "memory",
   "benchvm",
+  "mode_vm_identity",
   "cloudflare_token",
   "cloudflare_inventory",
   "runner",
@@ -283,6 +286,32 @@ const benchvmCheck = (
     })
   })
 
+// mode_vm_identity: devvm / benchvm の observed name が期待名と一致するか。
+// 不一致は「VMID mapping が実機とズレている」= mode transition が別 VM を
+// 停止/起動しうる状態なので fail にして start を gate する(実際に
+// DEVVM_VMID / BENCHVM_VMID が逆に定義されていた)。判定材料は observed
+// name だけで、VMID から name を補完するような実装にはしない。
+const modeVmIdentityCheck = (
+  inventory: Option.Option<ProxmoxInfrastructureInventory>
+): ReadinessCheck =>
+  Option.match(inventory, {
+    onNone: () => ({
+      key: "mode_vm_identity",
+      status: "fail" as const,
+      summary: "Proxmox inventory unreadable"
+    }),
+    onSome: (inv) => {
+      const mismatch = modeVmIdentityMismatch(inv)
+      return mismatch === null
+        ? {
+            key: "mode_vm_identity",
+            status: "pass" as const,
+            summary: `observed names match expected mapping (devvm=${inv.devvm.vmid}, benchvm=${inv.benchvm.vmid})`
+          }
+        : { key: "mode_vm_identity", status: "fail" as const, summary: mismatch }
+    }
+  })
+
 const portalDbCheck: Effect.Effect<ReadinessCheck, never, ContestRepo> = Effect.gen(function* () {
   const repo = yield* ContestRepo
   const result = yield* Effect.either(repo.list)
@@ -436,6 +465,7 @@ const dbFailurePayload = (summary: string): ReadonlyArray<ReadinessCheck> => [
   { key: "memory", status: "warn" as const, summary: "portal DB unreachable; skipping" },
   { key: "capacity_estimate", status: "warn" as const, summary: "portal DB unreachable; skipping" },
   { key: "benchvm", status: "warn" as const, summary: "portal DB unreachable; skipping" },
+  { key: "mode_vm_identity", status: "warn" as const, summary: "portal DB unreachable; skipping" },
   { key: "cloudflare_token", status: "warn" as const, summary: "portal DB unreachable; skipping" },
   { key: "cloudflare_inventory", status: "warn" as const, summary: "portal DB unreachable; skipping" },
   { key: "cloudflare_write_proven", status: "warn" as const, summary: "portal DB unreachable; skipping" },
@@ -526,6 +556,7 @@ export const computeReadiness = (
       memoryCheck(inventory),
       capacityEstimateCheck(inventory, contest),
       benchvmCheck(inventory),
+      modeVmIdentityCheck(inventory),
       cfToken,
       cfInventory,
       cfWriteProven,

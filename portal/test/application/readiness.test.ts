@@ -83,8 +83,8 @@ const team1 = makeTeam({
 const healthyInventory = {
   nodeFreeMemBytes: 20_000_000_000, // 20 GiB
   templateExists: true,
-  devvm: { vmid: 9200, name: "devvm", status: "running" as const, memoryBytes: 8 * 1024 * 1024 * 1024, onBoot: true },
-  benchvm: { vmid: 9300, name: "benchvm", status: "stopped" as const, memoryBytes: 4 * 1024 * 1024 * 1024, onBoot: false },
+  devvm: { vmid: 9300, name: "devvm", status: "running" as const, memoryBytes: 8 * 1024 * 1024 * 1024, onBoot: true },
+  benchvm: { vmid: 9200, name: "benchvm", status: "stopped" as const, memoryBytes: 4 * 1024 * 1024 * 1024, onBoot: false },
   preparedTeamNumbers: [1, 2] as ReadonlyArray<number>,
   isolationServiceActive: true
 }
@@ -171,6 +171,7 @@ describe("computeReadiness の必須 key set", () => {
         "benchvm",
         "cloudflare_token",
         "cloudflare_inventory",
+        "mode_vm_identity",
         "cloudflare_write_proven",
         "runner",
         "backup",
@@ -436,10 +437,10 @@ describe("previous_cleanup", () => {
 })
 
 describe("Proxmox infrastructure inventory", () => {
-  it.effect("inventory 取得失敗は template / team_slots / isolation / memory / benchvm を fail に落とす", () =>
+  it.effect("inventory 取得失敗は template / team_slots / isolation / memory / benchvm / mode_vm_identity を fail に落とす", () =>
     Effect.gen(function* () {
       const checks = yield* computeReadiness(CONTEST_ID)
-      for (const k of ["template", "team_slots", "isolation", "memory", "benchvm"]) {
+      for (const k of ["template", "team_slots", "isolation", "memory", "benchvm", "mode_vm_identity"]) {
         expect(findCheck(checks, k).status).toBe("fail")
       }
     }).pipe(
@@ -522,6 +523,59 @@ describe("Proxmox infrastructure inventory", () => {
       expect(findCheck(checks, "memory").status).toBe("pass")
       expect(findCheck(checks, "capacity_estimate").status).toBe("warn")
     })
+  )
+
+  // production を壊した実バグ: 定数側の 9200/9300 が実機と逆だった。VMID 決め打ち
+  // を observed name で裏取りし、不一致なら start を gate する (eevee-mode.sh と
+  // 同じ fail-closed 思想)。
+  it.effect("mode VM の observed name が期待値と一致すれば mode_vm_identity=pass", () =>
+    Effect.gen(function* () {
+      const checks = yield* computeReadiness(CONTEST_ID)
+      expect(findCheck(checks, "mode_vm_identity").status).toBe("pass")
+    }).pipe(Effect.provide(buildLayer()))
+  )
+
+  it.effect("devvm/benchvm の名前が入れ替わっていれば mode_vm_identity=fail", () =>
+    Effect.gen(function* () {
+      const checks = yield* computeReadiness(CONTEST_ID)
+      const check = findCheck(checks, "mode_vm_identity")
+      expect(check.status).toBe("fail")
+      expect(check.summary).toBe(
+        "VMID mapping mismatch: VM 9300 is named 'benchvm', expected 'devvm'; " +
+          "verify /vms mapping before any power operation"
+      )
+    }).pipe(
+      Effect.provide(
+        buildLayer({
+          proxmoxInventory: {
+            ...healthyInventory,
+            devvm: { ...healthyInventory.devvm, name: "benchvm" },
+            benchvm: { ...healthyInventory.benchvm, name: "devvm" }
+          }
+        })
+      )
+    )
+  )
+
+  it.effect("benchvm 側だけ名前がズレていても mode_vm_identity=fail", () =>
+    Effect.gen(function* () {
+      const checks = yield* computeReadiness(CONTEST_ID)
+      const check = findCheck(checks, "mode_vm_identity")
+      expect(check.status).toBe("fail")
+      expect(check.summary).toBe(
+        "VMID mapping mismatch: VM 9200 is named 'vaporeon', expected 'benchvm'; " +
+          "verify /vms mapping before any power operation"
+      )
+    }).pipe(
+      Effect.provide(
+        buildLayer({
+          proxmoxInventory: {
+            ...healthyInventory,
+            benchvm: { ...healthyInventory.benchvm, name: "vaporeon" }
+          }
+        })
+      )
+    )
   )
 })
 

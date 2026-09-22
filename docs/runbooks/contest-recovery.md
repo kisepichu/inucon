@@ -165,21 +165,31 @@ apply Operation が succeeded。Cloudflare 側 dashboard で app / DNS が
 **症状**: `enter_contest_mode` / `return_normal_mode` Operation の
 `wait_devvm_stopped` step が `blocked` に落ち、summary に
 `"devvm guest shutdown did not complete within <ms>ms; verify guest
-agent then run 'qm shutdown 9200' manually (do not force stop)"` が
-出ている (`portal/src/application/usecases/modeOperation.ts` 88-93 行)。
+agent then run 'qm shutdown 9300' manually (do not force stop)"` が
+出ている (`portal/src/application/usecases/modeOperation.ts` 102-107 行)。
+
+**VMID mapping (実機 `qm list` 実測、2026-09-22)**: **9300 = devvm**
+(開発サーバ、memory 12288 MiB、onboot 1)、**9200 = benchvm** (bench
+runner VM、memory 4096 MiB、onboot 0)。`../nixos-config-private/scripts/eevee-mode.sh`
+の名前検証と一致する。**取り違えると「devvm を止めるつもりで bench
+runner を止める」**。portal 側は power 操作の前に observed name を
+突き合わせ、不一致なら `VMID mapping mismatch: VM <vmid> is named
+'<observed>', expected '<expected>'; ...` で **blocked** に落ちる
+(`portal/src/domain/modeVmIds.ts` の fail-closed ガード)。この summary が
+出たときは VM を触らず、Proxmox 側の `/vms` mapping と VM 名を先に直す。
 
 **前提の確認**:
-- eevee: `qm status 9200` で `status: running` のまま止まっているか。
-- devvm 内: `qm guest cmd 9200 ping` が応答するか (guest agent の
+- eevee: `qm status 9300` で `status: running` のまま止まっているか。
+- devvm 内: `qm guest cmd 9300 ping` が応答するか (guest agent の
   生死確認。応答が無ければ guest agent 側の障害)。
 
 **復旧手順**:
 1. devvm にログインできる (SSH or console) なら中で `sudo systemctl
    poweroff` を実行。
-2. できないなら eevee で **`qm shutdown 9200`** をもう一度発行
+2. できないなら eevee で **`qm shutdown 9300`** をもう一度発行
    (guest ACPI shutdown。`qm stop` は絶対に使わない — force stop 禁止
    は `application/ports.ts` 481 行と設計制約)。
-3. `qm status 9200` が `stopped` になったら Admin Web → Operations
+3. `qm status 9300` が `stopped` になったら Admin Web → Operations
    タブから対象 Operation を **cancel** (下記 §12 「Operation cancel の
    一般手順」)。**cancel だけでは再開しない**: `contestScheduler` の
    tick は `tickFinalize` / `tickRevokeAccess` / `tickCleanup` の 3 種
@@ -189,10 +199,27 @@ agent then run 'qm shutdown 9200' manually (do not force stop)"` が
    (または return_normal_mode) をリクエスト** する。devvm は既に
    stopped なので `wait_devvm_stopped` は即成功し、`memory_check`
    から自然に継続する (`portal/src/application/usecases/modeOperation.ts`
-   81-83 行)。
+   93-96 行)。
+
+**手で mode 遷移を通す場合**: 単発の `qm start` / `qm shutdown` を並べる
+のではなく **`../nixos-config-private/scripts/eevee-mode.sh
+{status|normal|contest}`** を使う。script 側が portal と同じ安全弁を
+実装している:
+- **名前検証 (fail closed)**: `qm list` の name で devvm=9300 /
+  benchvm=9200 を裏取りし、1 件でもズレたら何もせず exit 1。
+- **memory guard**: 起動する VM の `memory + 1024 MiB host reserve` を
+  `MemAvailable` と比較し、足りなければ起動しない (graceful shutdown 後に
+  スナップショットを取り直し、同一 run 内の累積コミット分も差し引く)。
+- **graceful shutdown 待ち・force stop 禁止**: `qm shutdown` の完了を
+  ポーリングで待ち、`qm stop` は一切発行しない。
+
+**ssh 経路の注意**: `apphost.kisen.one` は Cloudflare tunnel 経由なので
+ProxyJump に使うと `Bad packet length` で壊れる。LAN 内から実行するなら
+`EEVEE_SSH_JUMP=none`、jump が必要なら
+`EEVEE_SSH_JUMP=kise@192.0.2.20` を指定する。
 
 **復帰確認**: Operation が succeeded、または改めて enqueue した
-Operation が succeeded で終わり、`benchvm (9300)` が `running` になる
+Operation が succeeded で終わり、`benchvm (9200)` が `running` になる
 (mode transition の最終 step)。
 
 ---
@@ -205,7 +232,7 @@ Operation が succeeded で終わり、`benchvm (9300)` が `running` になる
 - mode transition 中: `enter_contest_mode` の `memory_check` step が
   `blocked` に落ち、summary に `post-shutdown MemAvailable <B> <
   benchvm(<B>) + reserve(<B>); check other workloads on the node before
-  retrying` が出る (`modeOperation.ts` 105-108 行)。
+  retrying` が出る (`modeOperation.ts` 118-121 行)。
 
 **前提の確認**:
 - eevee 側 `pvesh get /nodes/eevee/status --output-format json`
@@ -229,7 +256,7 @@ Operation が succeeded で終わり、`benchvm (9300)` が `running` になる
 
 **症状**: Readiness チェックが `runner: fail — no runner heartbeat
 within <maxAgeMillis>ms` (`portal/src/application/usecases/readiness.ts`
-358 行)。start / rehearsal が gate される。ベンチ enqueue は形式上
+387 行)。start / rehearsal が gate される。ベンチ enqueue は形式上
 可能でも runner が拾わない。
 
 **前提の確認**:
@@ -237,7 +264,7 @@ within <maxAgeMillis>ms` (`portal/src/application/usecases/readiness.ts`
 - benchvm: `journalctl -u inucon-runner --since '5 min ago'` に
   `poll` の痕跡があるか。
 - benchvm の IP: apphost から
-  `ssh root@192.0.2.10 'qm guest cmd 9300 network-get-interfaces'`
+  `ssh root@192.0.2.10 'qm guest cmd 9200 network-get-interfaces'`
   で現在 IP を確認 (DHCP 変動)。
 
 **復旧手順**:
@@ -245,8 +272,10 @@ within <maxAgeMillis>ms` (`portal/src/application/usecases/readiness.ts`
    起動しないなら `journalctl -u inucon-runner --since '5 min ago'` で
    原因確認 (agenix runtime path の EnvironmentFile が存在しない、等)。
 2. token 不整合 (401 が並ぶ): §11 「Credential rotation」に進む。
-3. benchvm 自体に到達できない: eevee で `qm status 9300`。stopped なら
-   `qm start 9300` (mode transition と衝突しないタイミングで)。
+3. benchvm 自体に到達できない: eevee で `qm status 9200`。stopped なら
+   `../nixos-config-private/scripts/eevee-mode.sh contest` で起動する
+   (単発 `qm start 9200` は memory guard と名前検証を飛ばすので使わない。
+   §5 「手で mode 遷移を通す場合」参照)。
 4. cloudflared が落ちていて portal 側から到達できないだけならベンチは
    動く (runner→portal は LAN NodePort:30080 直結)。tunnel 復旧は
    `docs/runbooks/apphost-cloudflared.md` (private repo 側 runbook)。

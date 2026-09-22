@@ -8,6 +8,7 @@ import { stemOfHostname } from "../../domain/reconciliation.js"
 import type { HostnameDesired, HostnameObservation } from "../../domain/reconciliation.js"
 import { ResourceBinding } from "../../domain/resourceBinding.js"
 import type { Team } from "../../domain/team.js"
+import { modeVmIdentityMismatch } from "../../domain/modeVmIds.js"
 import {
   AmbiguousReconciliation,
   ContestNotFound,
@@ -827,6 +828,14 @@ export const makeReturnNormalModeHandler: Effect.Effect<OperationHandler, never,
 
         // 残り step は毎回 inventory を再観測する (modeOperation.ts と同型)。
         const inv = yield* px.getInfrastructureInventory
+
+        // fail-closed な VMID mapping 検証(modeOperation.ts と同型)。
+        // return_normal_mode は「benchvm を止めて devvm を起動」するので、
+        // mapping がズレていると開発サーバを落として bench runner を起動する。
+        // observed name が期待値と一致しない限り power 操作を一切発行せず
+        // blocked に落とす(retry しない)。
+        const identityMismatch = modeVmIdentityMismatch(inv)
+        if (identityMismatch !== null) return blocked(identityMismatch)
 
         switch (step.stepKey) {
           case "set_benchvm_onboot_0": {

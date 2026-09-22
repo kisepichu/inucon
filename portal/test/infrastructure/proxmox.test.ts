@@ -782,8 +782,8 @@ describe("listManagedVms", () => {
         { vmid: 2201, name: "inucon-team2-1", status: "running" },
         // 除外対象:
         { vmid: 9100, name: "inucon-template", status: "stopped" },
-        { vmid: 9200, name: "devvm", status: "running" },
-        { vmid: 9300, name: "benchvm", status: "stopped" },
+        { vmid: 9300, name: "devvm", status: "running" },
+        { vmid: 9200, name: "benchvm", status: "stopped" },
         { vmid: 3000, name: "inucon-team1-1-clone", status: "stopped" },
         { vmid: 3001, name: "team1-1", status: "running" }
       ])
@@ -1009,11 +1009,11 @@ describe("Proxmox credential configuration (Task 8)", () => {
       const fake = makeFakeProxmox()
       const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(splitConfigLayer))
       yield* ProxmoxPort.pipe(
-        Effect.flatMap((px) => px.setVmOnBoot(9300, true)),
+        Effect.flatMap((px) => px.setVmOnBoot(9200, true)),
         Effect.provide(port)
       )
       const configReq = fake.requests.find(
-        (r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/9300/config" && r.method === "POST"
+        (r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/9200/config" && r.method === "POST"
       )
       expect(configReq!.headers.authorization).toBe(
         "PVEAPIToken=inucon-mode@pve!portal-1=mode-secret"
@@ -1029,11 +1029,11 @@ describe("setVmOnBoot", () => {
       const fake = makeFakeProxmox()
       const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(configLayer))
       yield* ProxmoxPort.pipe(
-        Effect.flatMap((px) => px.setVmOnBoot(9300, true)),
+        Effect.flatMap((px) => px.setVmOnBoot(9200, true)),
         Effect.provide(port)
       )
       const req = fake.requests.find(
-        (r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/9300/config" && r.method === "POST"
+        (r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/9200/config" && r.method === "POST"
       )
       const params = bodyParams(req!)
       expect(params.get("onboot")).toBe("1")
@@ -1045,11 +1045,11 @@ describe("setVmOnBoot", () => {
       const fake = makeFakeProxmox()
       const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(configLayer))
       yield* ProxmoxPort.pipe(
-        Effect.flatMap((px) => px.setVmOnBoot(9200, false)),
+        Effect.flatMap((px) => px.setVmOnBoot(9300, false)),
         Effect.provide(port)
       )
       const req = fake.requests.find(
-        (r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/9200/config" && r.method === "POST"
+        (r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/9300/config" && r.method === "POST"
       )
       expect(bodyParams(req!).get("onboot")).toBe("0")
     })
@@ -1063,11 +1063,11 @@ describe("shutdownVm", () => {
       const fake = makeFakeProxmox()
       const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(configLayer))
       yield* ProxmoxPort.pipe(
-        Effect.flatMap((px) => px.shutdownVm(9200)),
+        Effect.flatMap((px) => px.shutdownVm(9300)),
         Effect.provide(port)
       )
       const shutdownReq = fake.requests.find(
-        (r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/9200/status/shutdown" && r.method === "POST"
+        (r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/9300/status/shutdown" && r.method === "POST"
       )
       expect(shutdownReq).toBeDefined()
       const stopReq = fake.requests.find((r) => urlPath(r).endsWith("/status/stop"))
@@ -1085,7 +1085,7 @@ describe("waitForVmStatus", () => {
       const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(configLayer))
       // 現状 fake の status/current は 'running' を返す
       yield* ProxmoxPort.pipe(
-        Effect.flatMap((px) => px.waitForVmStatus(9200, "running", 5_000)),
+        Effect.flatMap((px) => px.waitForVmStatus(9300, "running", 5_000)),
         Effect.provide(port)
       )
     })
@@ -1097,7 +1097,7 @@ describe("waitForVmStatus", () => {
       const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(configLayer))
       const fiber = yield* Effect.fork(
         ProxmoxPort.pipe(
-          Effect.flatMap((px) => px.waitForVmStatus(9200, "stopped", 5_000)),
+          Effect.flatMap((px) => px.waitForVmStatus(9300, "stopped", 5_000)),
           Effect.provide(port)
         )
       )
@@ -1152,7 +1152,7 @@ describe("getInfrastructureInventory", () => {
       }
       // benchvm config
       if (
-        path === "/api2/json/nodes/eevee/qemu/9300/config" &&
+        path === "/api2/json/nodes/eevee/qemu/9200/config" &&
         request.method === "GET"
       ) {
         const cfg: Record<string, unknown> = { name: "benchvm" }
@@ -1178,8 +1178,8 @@ describe("getInfrastructureInventory", () => {
       const client = inventoryClient({
         vms: [
           { vmid: 9100, name: "inucon-template", status: "stopped", mem: 2 * 1024 * 1024 * 1024 },
-          { vmid: 9200, name: "devvm", status: "running", mem: 8 * 1024 * 1024 * 1024, onBoot: 1 },
-          { vmid: 9300, name: "benchvm", status: "stopped", mem: 4 * 1024 * 1024 * 1024, onBoot: 0 }
+          { vmid: 9300, name: "devvm", status: "running", mem: 8 * 1024 * 1024 * 1024, onBoot: 1 },
+          { vmid: 9200, name: "benchvm", status: "stopped", mem: 4 * 1024 * 1024 * 1024, onBoot: 0 }
         ],
         networks: [{ iface: "team1" }, { iface: "team2" }, { iface: "vmbr0" }],
         benchvmBridges: ["team1", "team2", "vmbr0"],
@@ -1195,8 +1195,8 @@ describe("getInfrastructureInventory", () => {
         Effect.provide(port)
       )
       expect(inv.templateExists).toBe(true)
-      expect(inv.devvm).toMatchObject({ vmid: 9200, status: "running", onBoot: true })
-      expect(inv.benchvm).toMatchObject({ vmid: 9300, status: "stopped", onBoot: false })
+      expect(inv.devvm).toMatchObject({ vmid: 9300, status: "running", onBoot: true })
+      expect(inv.benchvm).toMatchObject({ vmid: 9200, status: "stopped", onBoot: false })
       expect([...inv.preparedTeamNumbers].sort()).toEqual([1, 2])
       expect(inv.isolationServiceActive).toBe(true)
       expect(inv.nodeFreeMemBytes).toBe(6_000_000_000)
@@ -1208,8 +1208,8 @@ describe("getInfrastructureInventory", () => {
       const client = inventoryClient({
         vms: [
           { vmid: 9100, name: "inucon-template", status: "stopped" },
-          { vmid: 9200, name: "devvm", status: "running" },
-          { vmid: 9300, name: "benchvm", status: "stopped" }
+          { vmid: 9300, name: "devvm", status: "running" },
+          { vmid: 9200, name: "benchvm", status: "stopped" }
         ],
         networks: [{ iface: "team1" }, { iface: "team2" }, { iface: "team3" }],
         // benchvm 側は team1/team2 だけ持つ → team3 は使えない
@@ -1232,8 +1232,8 @@ describe("getInfrastructureInventory", () => {
     Effect.gen(function* () {
       const client = inventoryClient({
         vms: [
-          { vmid: 9200, name: "devvm", status: "running" },
-          { vmid: 9300, name: "benchvm", status: "stopped" }
+          { vmid: 9300, name: "devvm", status: "running" },
+          { vmid: 9200, name: "benchvm", status: "stopped" }
         ],
         networks: [],
         benchvmBridges: [],
@@ -1256,8 +1256,8 @@ describe("getInfrastructureInventory", () => {
       const client = inventoryClient({
         vms: [
           { vmid: 9100, name: "inucon-template", status: "stopped" },
-          { vmid: 9200, name: "devvm", status: "running" },
-          { vmid: 9300, name: "benchvm", status: "stopped" }
+          { vmid: 9300, name: "devvm", status: "running" },
+          { vmid: 9200, name: "benchvm", status: "stopped" }
         ],
         networks: [{ iface: "team1" }, { iface: "team2" }],
         benchvmBridges: ["team1", "team2"],

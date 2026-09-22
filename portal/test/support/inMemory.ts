@@ -1115,14 +1115,14 @@ export const makeProxmoxPortTest = (
     nodeFreeMemBytes: 20_000_000_000,
     templateExists: true,
     devvm: {
-      vmid: 9200,
+      vmid: 9300,
       name: "devvm",
       status: "running",
       memoryBytes: 8 * 1024 * 1024 * 1024,
       onBoot: true
     },
     benchvm: {
-      vmid: 9300,
+      vmid: 9200,
       name: "benchvm",
       status: "stopped",
       memoryBytes: 4 * 1024 * 1024 * 1024,

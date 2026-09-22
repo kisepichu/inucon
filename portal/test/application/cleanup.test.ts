@@ -504,14 +504,14 @@ describe("returnNormalMode", () => {
           nodeFreeMemBytes: 2 * 1024 * 1024 * 1024,
           templateExists: true,
           devvm: {
-            vmid: 9200,
+            vmid: 9300,
             name: "devvm",
             status: "stopped",
             memoryBytes: 8 * 1024 * 1024 * 1024,
             onBoot: false
           },
           benchvm: {
-            vmid: 9300,
+            vmid: 9200,
             name: "benchvm",
             status: "running",
             memoryBytes: 4 * 1024 * 1024 * 1024,
@@ -539,14 +539,14 @@ describe("returnNormalMode", () => {
           nodeFreeMemBytes: 20 * 1024 * 1024 * 1024,
           templateExists: true,
           devvm: {
-            vmid: 9200,
+            vmid: 9300,
             name: "devvm",
             status: "running",
             memoryBytes: 8 * 1024 * 1024 * 1024,
             onBoot: true
           },
           benchvm: {
-            vmid: 9300,
+            vmid: 9200,
             name: "benchvm",
             status: "stopped",
             memoryBytes: 4 * 1024 * 1024 * 1024,
@@ -564,6 +564,57 @@ describe("returnNormalMode", () => {
           .pipe(Effect.provide(layer))
         expect(outcome.status).toBe("succeeded")
       }
+    })
+  )
+
+  // production を壊した実バグ (定数側 9200/9300 が実機と逆) の再発防止。
+  // return_normal_mode は benchvm を止めて devvm を起動するので、mapping が
+  // ズレていると「開発サーバを止めて bench runner を起動」する。observed name が
+  // 期待値と一致しない限り power 操作を一切発行せず blocked に落とす。
+  it.effect("handler: mode VM の observed name が期待値と違えば blocked、power 操作は発行しない", () =>
+    Effect.gen(function* () {
+      const proxmox = makeProxmoxPortTest({
+        managedVms: [],
+        infrastructureInventory: {
+          nodeFreeMemBytes: 20 * 1024 * 1024 * 1024,
+          templateExists: true,
+          devvm: {
+            vmid: 9300,
+            name: "benchvm",
+            status: "stopped",
+            memoryBytes: 8 * 1024 * 1024 * 1024,
+            onBoot: false
+          },
+          benchvm: {
+            vmid: 9200,
+            name: "devvm",
+            status: "running",
+            memoryBytes: 4 * 1024 * 1024 * 1024,
+            onBoot: true
+          },
+          preparedTeamNumbers: [1, 2],
+          isolationServiceActive: false
+        }
+      })
+      const layer = Layer.mergeAll(proxmox.layer)
+      const registry = yield* makeReturnNormalModeHandler.pipe(Effect.provide(layer))
+      // verify_no_managed_vms は power 操作を発行しないので inventory 検証の対象外。
+      const powerStepKeys = RETURN_NORMAL_MODE_STEP_KEYS.filter((k) => k !== "verify_no_managed_vms")
+      for (const key of powerStepKeys) {
+        const outcome = yield* registry
+          .run(stepOf(key, { contestId: CONTEST_ID }))
+          .pipe(Effect.provide(layer))
+        expect(outcome.status).toBe("blocked")
+        expect(outcome.summary).toBe(
+          "VMID mapping mismatch: VM 9300 is named 'benchvm', expected 'devvm'; " +
+            "verify /vms mapping before any power operation"
+        )
+      }
+      const state = yield* proxmox.getState
+      expect(state.shutdownRequests).toEqual([])
+      expect(state.startedVmids).toEqual([])
+      expect(state.onBootByVmid).toEqual({})
+      expect(state.forceStopRequests).toEqual([])
     })
   )
 })

@@ -198,3 +198,79 @@ describe("enter_contest_mode の handler", () => {
     })
   )
 })
+
+// 実機 eevee の VMID mapping (9200=benchvm / 9300=devvm) を取り違えた状態で
+// mode transition を走らせると「devvm を止めるつもりで benchvm を止める」
+// 事故になる (production を壊した実バグ)。eevee-mode.sh と同じ「名前が正」の
+// 思想で、observed name が期待値と一致しない限り power 操作を一切発行しない。
+describe("VMID mapping の fail-closed 検証", () => {
+  // 実バグの形: inventory が返した 2 VM の名前が入れ替わっている。
+  const SWAPPED_INVENTORY = {
+    ...HEALTHY_INVENTORY,
+    devvm: { ...HEALTHY_INVENTORY.devvm, name: "benchvm", status: "running" as const, onBoot: true },
+    benchvm: { ...HEALTHY_INVENTORY.benchvm, name: "devvm", status: "stopped" as const, onBoot: false }
+  }
+
+  it.effect("observed name が期待値と一致しない場合、全 step が blocked で power 操作を発行しない", () =>
+    Effect.gen(function* () {
+      const { handler, proxmox } = buildHandler({ infrastructureInventory: SWAPPED_INVENTORY })
+      const h = yield* handler
+      for (const key of ENTER_CONTEST_MODE_STEP_KEYS) {
+        const outcome = yield* h.run(stepOf(key))
+        expect(outcome.status).toBe("blocked")
+        expect(outcome.summary).toBe(
+          `VMID mapping mismatch: VM ${DEVVM_VMID} is named 'benchvm', expected 'devvm'; ` +
+            "verify /vms mapping before any power operation"
+        )
+      }
+      const state = yield* proxmox.getState
+      // power / config 操作は 1 件も出ない (retry ではなく operator 判断待ち)。
+      expect(state.shutdownRequests).toEqual([])
+      expect(state.startedVmids).toEqual([])
+      expect(state.onBootByVmid).toEqual({})
+      expect(state.forceStopRequests).toEqual([])
+    })
+  )
+
+  it.effect("benchvm 側だけ名前がズレていても blocked (片方の mismatch で mapping 全体を疑う)", () =>
+    Effect.gen(function* () {
+      const { handler, proxmox } = buildHandler({
+        infrastructureInventory: {
+          ...HEALTHY_INVENTORY,
+          benchvm: { ...HEALTHY_INVENTORY.benchvm, name: "vaporeon" }
+        }
+      })
+      const h = yield* handler
+      const outcome = yield* h.run(stepOf("start_benchvm"))
+      expect(outcome.status).toBe("blocked")
+      expect(outcome.summary).toBe(
+        `VMID mapping mismatch: VM ${BENCHVM_VMID} is named 'vaporeon', expected 'benchvm'; ` +
+          "verify /vms mapping before any power operation"
+      )
+      const state = yield* proxmox.getState
+      expect(state.startedVmids).toEqual([])
+    })
+  )
+
+  it.effect("名前が期待どおりなら従来の step 挙動 (power 操作の発行) を維持する", () =>
+    Effect.gen(function* () {
+      const { handler, proxmox } = buildHandler({
+        infrastructureInventory: {
+          ...HEALTHY_INVENTORY,
+          devvm: { ...HEALTHY_INVENTORY.devvm, status: "running", onBoot: true },
+          benchvm: { ...HEALTHY_INVENTORY.benchvm, status: "stopped", onBoot: false }
+        }
+      })
+      const h = yield* handler
+      expect((yield* h.run(stepOf("set_devvm_onboot_0"))).status).toBe("succeeded")
+      expect((yield* h.run(stepOf("shutdown_devvm"))).status).toBe("succeeded")
+      expect((yield* h.run(stepOf("set_benchvm_onboot_1"))).status).toBe("succeeded")
+      expect((yield* h.run(stepOf("start_benchvm"))).status).toBe("succeeded")
+      const state = yield* proxmox.getState
+      // 実機 mapping: 停止するのは devvm=9300、起動するのは benchvm=9200。
+      expect(state.shutdownRequests).toEqual([DEVVM_VMID])
+      expect(state.startedVmids).toEqual([BENCHVM_VMID])
+      expect(state.onBootByVmid).toEqual({ [DEVVM_VMID]: false, [BENCHVM_VMID]: true })
+    })
+  )
+})

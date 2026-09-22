@@ -1,12 +1,13 @@
 import { Effect } from "effect"
 import type { OperationHandler } from "../ports.js"
 import { ModeTransitionTimeout, OperationExecutionError, ProxmoxPort } from "../ports.js"
+import { modeVmIdentityMismatch } from "../../domain/modeVmIds.js"
 import type { StepOutcome } from "./operations.js"
 
 // Task 8: enter_contest_mode Operation の step handler。
 //
-// enter_contest_mode は「devvm (9200) を graceful shutdown → 空 RAM を確認 →
-// benchvm (9300) を起動」する。force stop は絶対に呼ばない。60 秒 guest
+// enter_contest_mode は「devvm (9300) を graceful shutdown → 空 RAM を確認 →
+// benchvm (9200) を起動」する。force stop は絶対に呼ばない。60 秒 guest
 // shutdown が timeout に達したら ModeTransitionTimeout として blocked に落とし、
 // operator 判断待ちにする。
 //
@@ -15,6 +16,8 @@ import type { StepOutcome } from "./operations.js"
 //   step が呼ばれた場合は冪等成功として扱う。
 // - memory_check は post-shutdown MemAvailable + devvm が保持していた RAM
 //   の合計が benchvm 要求 + 1 GiB reserve を満たすかを見る(spec §mode)。
+// - power 操作を出す前に、観測した devvm / benchvm の name が期待値と一致
+//   することを必ず確かめる。不一致なら blocked(下記 fail-closed ガード)。
 //
 // return_normal_mode (Task 12) は逆順の別 Operation として実装する — この
 // handler は「入る側」だけを担当する。
@@ -61,6 +64,16 @@ export const makeEnterContestModeHandler: Effect.Effect<OperationHandler, never,
         // 毎 step 開始前に inventory を再観測する(spec §mode:
         // "re-observe status before every step")。
         const inv = yield* px.getInfrastructureInventory
+
+        // fail-closed な VMID mapping 検証。VMID 決め打ちだけで power 操作を出すと
+        // renumbering / 取り違えで「devvm を止めるつもりで benchvm を止める」
+        // 事故になる(実際に DEVVM_VMID / BENCHVM_VMID が実機と逆に定義されて
+        // いた)。eevee-mode.sh と同じ「名前が正」の思想で、observed name が
+        // 期待値と一致しない限り setVmOnBoot / shutdownVm / startVm を一切
+        // 発行せず blocked に落とす。retry はしない — operator が Proxmox の
+        // /vms mapping を直すまで進めない(force stop 禁止と同格の安全弁)。
+        const identityMismatch = modeVmIdentityMismatch(inv)
+        if (identityMismatch !== null) return blocked(identityMismatch)
 
         switch (step.stepKey) {
           case "set_devvm_onboot_0": {

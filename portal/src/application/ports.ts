@@ -477,7 +477,7 @@ export class ProxmoxPort extends Context.Tag("app/ProxmoxPort")<
     readonly getInfrastructureInventory: Effect.Effect<ProxmoxInfrastructureInventory, ProxmoxError>
 
     // Task 8: enter_contest_mode / return_normal_mode 用の power / config primitive。
-    // enter_contest_mode は「devvm (9200) を graceful shutdown → benchvm (9300)
+    // enter_contest_mode は「devvm (9300) を graceful shutdown → benchvm (9200)
     // を起動」する。force stop は絶対に呼ばない(guest shutdown が timeout に
     // 達したら ModeTransitionTimeout として blocked へ落とし、operator 判断待ち)。
     readonly setVmOnBoot: (vmid: number, enabled: boolean) => Effect.Effect<void, ProxmoxError>
