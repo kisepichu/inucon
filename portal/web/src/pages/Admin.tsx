@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react"
+import { Link } from "react-router-dom"
 import type { Contest, Instance, InviteResult, TeamId, TeamInvite, TeamWithMembers } from "shared/schemas"
 import { ApiError, api } from "../api.ts"
 
@@ -146,8 +147,6 @@ export function Admin() {
     })
   }
 
-  const handleStartContest = () => runAction(async () => setContest(await api.startContest()))
-  const handleFinishContest = () => runAction(async () => setContest(await api.finishContest()))
 
   const handleInvite = (event: React.FormEvent) => {
     event.preventDefault()
@@ -185,24 +184,10 @@ export function Admin() {
           状態:{" "}
           {contest === null ? "未作成" : <span className={`status-badge status-${contest.status}`}>{contest.status}</span>}
         </p>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button
-            type="button"
-            className="btn btn-primary"
-            onClick={handleStartContest}
-            disabled={contest === null || contest.status !== "preparing"}
-          >
-            開始
-          </button>
-          <button
-            type="button"
-            className="btn btn-secondary"
-            onClick={handleFinishContest}
-            disabled={contest === null || contest.status !== "running"}
-          >
-            終了
-          </button>
-        </div>
+        <p className="hint">
+          Task 13: start / immediate finish / cleanup / return-normal-mode などのライフサイクル操作は{' '}
+          <Link to="/admin/contests">Contests</Link> 画面へ移動しました。
+        </p>
       </section>
 
       <section className="admin-section">

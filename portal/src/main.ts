@@ -4,16 +4,61 @@ import { HttpApiBuilder, HttpMiddleware } from "@effect/platform"
 import { NodeHttpClient, NodeHttpServer, NodeRuntime } from "@effect/platform-node"
 import { Config, Effect, Layer, Option } from "effect"
 import { api } from "shared"
-import { AuthConfig, ProvisioningConfig, RunnerConfig } from "./application/ports.js"
+import {
+  AuthConfig,
+  HostnameConfig,
+  OperationHandlerRegistry,
+  OperationWorkerConfig,
+  ProvisioningConfig,
+  RunnerConfig
+} from "./application/ports.js"
+import {
+  DEFAULT_OPERATION_LEASE_DURATION_MILLIS,
+  DEFAULT_OPERATION_MAX_ATTEMPTS,
+  DEFAULT_OPERATION_POLL_INTERVAL_MILLIS,
+  DEFAULT_OPERATION_RETRY_BASE_MILLIS,
+  DEFAULT_OPERATION_RETRY_MAX_MILLIS
+} from "./application/usecases/operations.js"
+import { makeReconciliationHandler } from "./application/usecases/reconciliation.js"
+import {
+  ENTER_CONTEST_MODE_STEP_KEYS,
+  makeEnterContestModeHandler
+} from "./application/usecases/modeOperation.js"
+import {
+  makePrepareHandler,
+  PREPARE_STEP_KEY,
+  PrepareConfigDefault
+} from "./application/usecases/prepare.js"
+import {
+  BACKUP_STEP_KEYS,
+  FINISH_STEP_KEYS,
+  makeContestFinalizationHandler
+} from "./application/usecases/finalization.js"
+import {
+  makeStartContestHandler,
+  START_CONTEST_STEP_KEY
+} from "./application/usecases/startOperation.js"
+import {
+  CLEANUP_MARK_COMPLETED_STEP_KEY,
+  makeCleanupHandler,
+  makeReturnNormalModeHandler,
+  makeRevokeAccessHandler,
+  RETURN_NORMAL_MODE_STEP_KEYS,
+  REVOKE_ACCESS_STEP_KEY
+} from "./application/usecases/cleanup.js"
 import { CloudflareLive } from "./infrastructure/cloudflare/client.js"
+import { BackupPortLive } from "./infrastructure/backup/sqlite.js"
 import { GithubKeysLive } from "./infrastructure/github/keys.js"
 import { GithubOAuthLive } from "./infrastructure/github/oauth.js"
 import { AdminLive } from "./infrastructure/http/handlers/admin.js"
 import { AuthLive } from "./infrastructure/http/handlers/auth.js"
 import { BenchLive } from "./infrastructure/http/handlers/bench.js"
-import { ContestLive } from "./infrastructure/http/handlers/contest.js"
+import { ArtifactsLive } from "./infrastructure/http/handlers/artifacts.js"
+import { ContestLive, ContestsLive } from "./infrastructure/http/handlers/contest.js"
+import { ContestAdminLive } from "./infrastructure/http/handlers/contestAdmin.js"
 import { HealthLive } from "./infrastructure/http/handlers/health.js"
 import { InstancesLive } from "./infrastructure/http/handlers/instances.js"
+import { OperationsLive } from "./infrastructure/http/handlers/operations.js"
 import { RunnerLive } from "./infrastructure/http/handlers/runner.js"
 import { ScoreboardLive } from "./infrastructure/http/handlers/scoreboard.js"
 import { TeamsLive } from "./infrastructure/http/handlers/teams.js"
@@ -23,6 +68,7 @@ import { ProxmoxHttpClientLive, ProxmoxLive } from "./infrastructure/proxmox/cli
 import { InstancePortsStubLive } from "./infrastructure/stubPorts.js"
 import { MigratorLive, SqlLive } from "./infrastructure/sql/client.js"
 import { SeedLive } from "./infrastructure/sql/seed.js"
+import { TransactionRunnerLive } from "./infrastructure/sql/transactionRunner.js"
 import { BenchJobRepoLive } from "./infrastructure/sql/repos/benchJobRepo.js"
 import { ContestRepoLive } from "./infrastructure/sql/repos/contestRepo.js"
 import { InstanceRepoLive } from "./infrastructure/sql/repos/instanceRepo.js"
@@ -32,6 +78,12 @@ import { TeamRepoLive } from "./infrastructure/sql/repos/teamRepo.js"
 import { UserRepoLive } from "./infrastructure/sql/repos/userRepo.js"
 import { UuidGenLive } from "./infrastructure/sql/uuid.js"
 import { ProvisionerLive } from "./infrastructure/worker/provisioner.js"
+import { ArtifactRepoLive } from "./infrastructure/sql/repos/artifactRepo.js"
+import { OperationRepoLive } from "./infrastructure/sql/repos/operationRepo.js"
+import { ResourceBindingRepoLive } from "./infrastructure/sql/repos/resourceBindingRepo.js"
+import { RunnerAgentRepoLive } from "./infrastructure/sql/repos/runnerAgentRepo.js"
+import { ContestSchedulerLive } from "./infrastructure/worker/contestScheduler.js"
+import { OperationWorkerLive } from "./infrastructure/worker/operationWorker.js"
 import { TimeoutSweeperLive } from "./infrastructure/worker/timeoutSweeper.js"
 
 // ADMIN_GITHUB_LOGINS(カンマ区切り)に載っている githubLogin はログイン時に
@@ -51,6 +103,52 @@ const AuthConfigLive = Layer.effect(
 
 // UserRepoLive は UuidGen に依存する。provideMerge で 1 インスタンスの
 // UuidGenLive を依存解決と公開の両方に使う(repos.test.ts と同じ理由)。
+// Task 6: Operation ワーカー設定は env で上書き可能。全て正の整数に
+// バリデートし、不正値は Layer 構築失敗として早期に気付く(RunnerConfig と同型)。
+const OperationWorkerConfigLive = Layer.effect(
+  OperationWorkerConfig,
+  Effect.gen(function* () {
+    const positive = (name: string, defaultValue: number) =>
+      Config.integer(name).pipe(
+        Config.withDefault(defaultValue),
+        Config.validate({
+          message: `${name} must be a positive integer`,
+          validation: (n) => n > 0
+        })
+      )
+    const pollIntervalMillis = yield* positive(
+      "OPERATION_POLL_INTERVAL_MILLIS",
+      DEFAULT_OPERATION_POLL_INTERVAL_MILLIS
+    )
+    const retryBaseMillis = yield* positive(
+      "OPERATION_RETRY_BASE_MILLIS",
+      DEFAULT_OPERATION_RETRY_BASE_MILLIS
+    )
+    const retryMaxMillis = yield* positive(
+      "OPERATION_RETRY_MAX_MILLIS",
+      DEFAULT_OPERATION_RETRY_MAX_MILLIS
+    )
+    const maxAttempts = yield* positive(
+      "OPERATION_MAX_ATTEMPTS",
+      DEFAULT_OPERATION_MAX_ATTEMPTS
+    )
+    const leaseDurationMillis = yield* positive(
+      "OPERATION_LEASE_DURATION_MILLIS",
+      DEFAULT_OPERATION_LEASE_DURATION_MILLIS
+    )
+    return { pollIntervalMillis, retryBaseMillis, retryMaxMillis, maxAttempts, leaseDurationMillis }
+  })
+)
+
+// Task 7 review round 3 #2: reconciliation handler / provisioning が使う
+// zone suffix を env に外出しする。既定 "kisen.one"(現行本番と同値、後方互換)。
+const HostnameConfigLive = Layer.effect(
+  HostnameConfig,
+  Config.string("CF_ZONE_NAME").pipe(
+    Config.withDefault("kisen.one"),
+    Effect.map((zoneName) => ({ zoneName }))
+  )
+)
 const ReposLive = Layer.mergeAll(
   UserRepoLive,
   SessionRepoLive,
@@ -58,24 +156,41 @@ const ReposLive = Layer.mergeAll(
   ContestRepoLive,
   InstanceRepoLive,
   BenchJobRepoLive,
-  InviteRepoLive
+  InviteRepoLive,
+  OperationRepoLive,
+  ResourceBindingRepoLive,
+  ArtifactRepoLive,
+  RunnerAgentRepoLive,
+  TransactionRunnerLive
 ).pipe(
   Layer.provideMerge(UuidGenLive),
+  Layer.provide(OperationWorkerConfigLive),
   Layer.provide(SqlLive)
 )
 
-// JOB_TIMEOUT_MILLIS: running のハートビート(進捗報告)がこの時間途絶えたら
-// failed にする(スペック §BenchJob 不変条件 4)。既定 10 分。
+// RunnerConfig: JOB_TIMEOUT_MILLIS は running のハートビート(進捗報告)が
+// この時間途絶えたら failed にする既定 10 分 (spec §BenchJob 不変条件 4)。
+// Task 10: RUNNER_MAX_AGE_MILLIS は runner heartbeat の readiness / start gate
+// 判定に使う。既定 60_000ms (readiness spec)。両方とも env で上書き可能で、
+// 不正値 (<=0) は Layer 構築失敗として早期に気付く。
 const RunnerConfigLive = Layer.effect(
   RunnerConfig,
-  Config.integer("JOB_TIMEOUT_MILLIS").pipe(
-    Config.withDefault(600_000),
-    Config.validate({
-      message: "JOB_TIMEOUT_MILLIS must be a positive integer",
-      validation: (n) => n > 0
-    }),
-    Effect.map((jobTimeoutMillis) => ({ jobTimeoutMillis }))
-  )
+  Effect.all({
+    jobTimeoutMillis: Config.integer("JOB_TIMEOUT_MILLIS").pipe(
+      Config.withDefault(600_000),
+      Config.validate({
+        message: "JOB_TIMEOUT_MILLIS must be a positive integer",
+        validation: (n) => n > 0
+      })
+    ),
+    maxAgeMillis: Config.integer("RUNNER_MAX_AGE_MILLIS").pipe(
+      Config.withDefault(60_000),
+      Config.validate({
+        message: "RUNNER_MAX_AGE_MILLIS must be a positive integer",
+        validation: (n) => n > 0
+      })
+    )
+  })
 )
 
 // 払い出しガードの閾値・タイムアウト(Phase 3、Task 4)。既定は spike メモ
@@ -148,12 +263,16 @@ const ApiLive = HttpApiBuilder.api(api).pipe(
       HealthLive,
       AuthLive,
       ContestLive,
+      ContestsLive,
       TeamsLive,
       InstancesLive,
       AdminLive,
+      ContestAdminLive,
       BenchLive,
       RunnerLive,
-      ScoreboardLive
+      ScoreboardLive,
+      OperationsLive,
+      ArtifactsLive
     )
   ),
   Layer.provide(AuthenticationLive),
@@ -167,6 +286,11 @@ const ApiLive = HttpApiBuilder.api(api).pipe(
   // 閾値(ProvisioningConfig)を要求する(Task 4 で実装済みの既定値付き
   // Config、ProvisionerConditionalLive と同一参照でメモ化される)。
   Layer.provide(ProvisioningConfigLive),
+  // Task 10: readiness の backup key と Task 11 の snapshot API 用に
+  // BackupPortLive を配線する。BACKUP_PATH 未設定の環境 (dev/test 直起動) では
+  // probe が not_configured で fail するだけで HTTP サーバー自体は起動する
+  // (readiness の 1 key が fail するのみ)。
+  Layer.provide(BackupPortLive),
   Layer.provide(ReposLive)
 )
 
@@ -222,6 +346,95 @@ const WorkerLive = TimeoutSweeperLive.pipe(
   Layer.provide(MigratorLive)
 )
 
+// finish (6-step) と backup (3-step) の Operation は同一 dispatcher に相乗り。
+// stepKey の共通集合は BACKUP_STEP_KEYS ⊂ FINISH_STEP_KEYS。
+const FINALIZATION_STEP_KEYS: ReadonlyArray<string> = [
+  FINISH_STEP_KEYS.cancelQueued,
+  FINISH_STEP_KEYS.waitRunning,
+  FINISH_STEP_KEYS.writeScoreboardJson,
+  FINISH_STEP_KEYS.writeScoreboardCsv,
+  FINISH_STEP_KEYS.writeDbSnapshot,
+  FINISH_STEP_KEYS.finishContest,
+  BACKUP_STEP_KEYS.writeScoreboardJson,
+  BACKUP_STEP_KEYS.writeScoreboardCsv,
+  BACKUP_STEP_KEYS.writeDbSnapshot
+]
+
+// Task 7/8/9/10/11: Operation kind 別の step handler を登録する。
+//  - reconcile: Cloudflare/Proxmox の inventory-driven cleanup
+//  - enter_contest_mode: devvm → benchvm の graceful power transition
+//  - prepare: preparing Contest の全 team を desiredInstanceCount まで
+//    「1 台ずつ + memory recheck + KSM settle」で収束させる (Task 9)
+//  - start: preparing → running の readiness 再検査 + saveIfRevision (Task 10)
+//  - finish / backup: scheduled finalization + archive artifact 生成 (Task 11)
+const OperationHandlerRegistryLive = Layer.effect(
+  OperationHandlerRegistry,
+  Effect.gen(function* () {
+    const reconcileHandler = yield* makeReconciliationHandler
+    const modeHandler = yield* makeEnterContestModeHandler
+    const prepareHandler = yield* makePrepareHandler
+    const startHandler = yield* makeStartContestHandler
+    const finalizationHandler = yield* makeContestFinalizationHandler
+    const enterModeStepKeys: ReadonlyArray<string> = ENTER_CONTEST_MODE_STEP_KEYS
+    const revokeAccessHandler = yield* makeRevokeAccessHandler
+    const cleanupHandler = yield* makeCleanupHandler
+    const returnNormalModeHandler = yield* makeReturnNormalModeHandler
+    const returnNormalModeStepKeys: ReadonlyArray<string> = RETURN_NORMAL_MODE_STEP_KEYS
+    return {
+      lookup: (kind, stepKey) => {
+        if (kind === "reconcile" && stepKey.startsWith("reconcile:")) {
+          return Option.some(reconcileHandler)
+        }
+        if (kind === "enter_contest_mode" && enterModeStepKeys.includes(stepKey)) {
+          return Option.some(modeHandler)
+        }
+        if (kind === "prepare" && stepKey === PREPARE_STEP_KEY) {
+          return Option.some(prepareHandler)
+        }
+        if (kind === "start" && stepKey === START_CONTEST_STEP_KEY) {
+          return Option.some(startHandler)
+        }
+        if ((kind === "finish" || kind === "backup") && FINALIZATION_STEP_KEYS.includes(stepKey)) {
+          return Option.some(finalizationHandler)
+        }
+        if (kind === "revoke_access" && stepKey === REVOKE_ACCESS_STEP_KEY) {
+          return Option.some(revokeAccessHandler)
+        }
+        if (kind === "cleanup" && (stepKey.startsWith("cleanup:") || stepKey === CLEANUP_MARK_COMPLETED_STEP_KEY)) {
+          return Option.some(cleanupHandler)
+        }
+        if (kind === "return_normal_mode" && returnNormalModeStepKeys.includes(stepKey)) {
+          return Option.some(returnNormalModeHandler)
+        }
+        return Option.none()
+      }
+    }
+  })
+)
+
+// OperationWorkerLive は DB のみに依存する(handler 登録は現状無し)。
+// TimeoutSweeperLive と同じく MigratorLive を依存として明示し、migration 未完了
+// のうちの 1 tick が "no such table" にならないようにする。
+const OperationWorkerConditionalLive = OperationWorkerLive.pipe(
+  Layer.provide(OperationWorkerConfigLive),
+  Layer.provide(
+    OperationHandlerRegistryLive.pipe(
+      Layer.provide(InstancePortsLive),
+      Layer.provide(ReposLive),
+      Layer.provide(HostnameConfigLive),
+      Layer.provide(ProvisioningConfigLive),
+      // Task 9: prepare Operation の handler が使う KSM/PVE 待機設定。
+      Layer.provide(PrepareConfigDefault),
+      // Task 10: start Operation の handler が readiness を再計算するために
+      // BackupPort / RunnerConfig を要求する (readiness の backup / runner check)。
+      Layer.provide(BackupPortLive),
+      Layer.provide(RunnerConfigLive)
+    )
+  ),
+  Layer.provide(ReposLive),
+  Layer.provide(MigratorLive)
+)
+
 // 払い出し/撤収オーケストレーションのワーカー(Task 4 レビュー I3)。
 // ProvisionerLive の実行には実 port Live(ProxmoxLive / CloudflareLive /
 // GithubKeysLive)が必要だが、その配線は上記 InstancePortsLive に共通化した
@@ -249,6 +462,21 @@ const ProvisionerConditionalLive = Layer.unwrapEffect(
 // migration/seed は HttpLive・WorkerLive の依存(Layer.provide)経由で実行される
 // (メモ化により 1 回だけ)。トップレベルにはそれらを消費するコンポーネント
 // だけを並べ、順序は依存グラフに任せる。
-const MainLive = Layer.mergeAll(HttpLive, WorkerLive, ProvisionerConditionalLive)
+// Task 12: scheduler は cleanup 判定で reconciliation plan を再計算するため、
+// Proxmox/Cloudflare port も要求するようになった (revoke_access は Contest scope
+// のみ触るので Cloudflare のみで足りるが、cleanup は inventory を読むため両方)。
+const ContestSchedulerConditionalLive = ContestSchedulerLive.pipe(
+  Layer.provide(ReposLive),
+  Layer.provide(InstancePortsLive),
+  Layer.provide(MigratorLive)
+)
+
+const MainLive = Layer.mergeAll(
+  HttpLive,
+  WorkerLive,
+  ProvisionerConditionalLive,
+  OperationWorkerConditionalLive,
+  ContestSchedulerConditionalLive
+)
 
 Layer.launch(MainLive).pipe(NodeRuntime.runMain)

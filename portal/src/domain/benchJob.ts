@@ -7,17 +7,20 @@ import {
   TargetIpOutOfSubnet,
   TeamJobAlreadyQueued
 } from "./errors.js"
-import { BenchJobId, TeamId } from "./ids.js"
+import { BenchJobId, ContestId, TeamId } from "./ids.js"
 import { ipInTeamSubnet } from "./subnet.js"
 
 export type BenchJobStatus = "queued" | "running" | "finished" | "canceled" | "failed"
+export type BenchJobPurpose = "rehearsal" | "competition"
 
 export class BenchJob extends Schema.Class<BenchJob>("BenchJob")({
   id: BenchJobId,
+  contestId: ContestId,
   teamId: TeamId,
   targetIp: Schema.String,
   targetPort: Schema.Int.pipe(Schema.between(1, 65535)),
   status: Schema.Literal("queued", "running", "finished", "canceled", "failed"),
+  purpose: Schema.Literal("rehearsal", "competition"),
   score: Schema.OptionFromNullOr(Schema.Int),
   passed: Schema.OptionFromNullOr(Schema.Boolean),
   errorMessage: Schema.OptionFromNullOr(Schema.String),
@@ -27,22 +30,23 @@ export class BenchJob extends Schema.Class<BenchJob>("BenchJob")({
   lastProgressAt: Schema.OptionFromNullOr(Schema.Int)
 }) {}
 
-// キュー不変条件のチェック(スペック §BenchJob):
-// - Contest が running のときのみ enqueue 可
-// - チームごと queued+running 合計 1 本まで(呼び出し元が activeJobCountForTeam を数える)
+// キュー不変条件のチェック(スペック §BenchJob、Task 3 更新):
+// - purpose='rehearsal' は Contest が preparing のときのみ許可
+// - purpose='competition' は Contest が running のときのみ許可
 // - targetIp はチームサブネット内のみ
+// 「チームごと queued+running 合計 1 本」は TOCTOU-safe に強制する必要が
+// あるため、SQL レイヤの benchJobRepo.insertIfAllowed (NOT EXISTS) が
+// 唯一の enforcer。domain 側で件数を渡すと race で必ずずれるので、
+// ここでは扱わない。TeamJobAlreadyQueued は SQL 側からのみ発火する。
 export const checkEnqueueAllowed = (args: {
   contest: Contest
-  activeJobCountForTeam: number
-  teamId: TeamId
+  purpose: BenchJobPurpose
   teamNumber: number
   targetIp: string
-}): Either.Either<void, ContestNotRunning | TeamJobAlreadyQueued | TargetIpOutOfSubnet> => {
-  if (args.contest.status !== "running") {
+}): Either.Either<void, ContestNotRunning | TargetIpOutOfSubnet> => {
+  const expectedStatus = args.purpose === "rehearsal" ? "preparing" : "running"
+  if (args.contest.status !== expectedStatus) {
     return Either.left(new ContestNotRunning({ status: args.contest.status }))
-  }
-  if (args.activeJobCountForTeam > 0) {
-    return Either.left(new TeamJobAlreadyQueued({ teamId: args.teamId }))
   }
   if (!ipInTeamSubnet(args.targetIp, args.teamNumber)) {
     return Either.left(new TargetIpOutOfSubnet({ ip: args.targetIp, teamNumber: args.teamNumber }))
@@ -52,17 +56,21 @@ export const checkEnqueueAllowed = (args: {
 
 export const newJob = (args: {
   id: BenchJobId
+  contestId: ContestId
   teamId: TeamId
   targetIp: string
   targetPort: number
+  purpose: BenchJobPurpose
   now: number
 }): BenchJob =>
   new BenchJob({
     id: args.id,
+    contestId: args.contestId,
     teamId: args.teamId,
     targetIp: args.targetIp,
     targetPort: args.targetPort,
     status: "queued",
+    purpose: args.purpose,
     score: Option.none(),
     passed: Option.none(),
     errorMessage: Option.none(),

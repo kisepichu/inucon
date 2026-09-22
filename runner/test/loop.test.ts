@@ -10,11 +10,26 @@ import { Duration, Effect, Either, Fiber, Layer, Option, Ref } from "effect"
 import { existsSync, mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { BenchJobId, RunnerFinishRequest, RunnerJob, RunnerProgressRequest } from "shared/schemas"
+import type { BenchJobId, RunnerFinishRequest, RunnerJob, RunnerPollRequest, RunnerProgressRequest } from "shared/schemas"
 import { BenchJobId as BenchJobIdSchema, TeamId as TeamIdSchema } from "shared/schemas"
 import { describe, expect } from "vitest"
 import { AdapterParseError, type ProblemAdapter } from "../src/adapters/types.js"
+import type { LoopConfigShape } from "../src/loop.js"
 import { AdapterRegistry, LoopConfig, PortalClient, type PortalClientShape, runLoop } from "../src/loop.js"
+
+// Task 10 で poll payload と LoopConfig が拡張された。テストごとに書きたい fixture は
+// pollIntervalMillis / progressIntervalMillis だけなので、それ以外を既定値で埋める
+// 小ヘルパで新しい形の LoopConfigShape を作る。
+const testLoopConfig = (
+  overrides: Partial<LoopConfigShape> = {}
+): LoopConfigShape => ({
+  pollIntervalMillis: 50,
+  progressIntervalMillis: 150,
+  runnerId: "runner-test",
+  runnerRevision: "test",
+  benchDir: process.cwd(),
+  ...overrides
+})
 
 // 偽ベンチ: 50ms 後に進捗っぽい 1 行を stdout に出し、400ms 後に最終 JSON を
 // 出して正常終了する(node -e のワンライナー、実時間はテスト全体で 1.2 秒程度)。
@@ -61,16 +76,25 @@ const makeStubPortal = (initialJobs: ReadonlyArray<RunnerJob>) =>
     const jobsRef = yield* Ref.make(initialJobs)
     const progressCallsRef = yield* Ref.make<ReadonlyArray<RunnerProgressRequest>>([])
     const finishCallsRef = yield* Ref.make<ReadonlyArray<readonly [BenchJobId, RunnerFinishRequest]>>([])
+    const pollCallsRef = yield* Ref.make<ReadonlyArray<RunnerPollRequest>>([])
 
     const portal: PortalClientShape = {
-      poll: Ref.modify(jobsRef, (jobs): [Option.Option<RunnerJob>, ReadonlyArray<RunnerJob>] =>
-        jobs.length === 0 ? [Option.none(), jobs] : [Option.some(jobs[0]), jobs.slice(1)]
-      ),
+      poll: (request) =>
+        Effect.gen(function* () {
+          yield* Ref.update(pollCallsRef, (a) => [...a, request])
+          // benchReady=false のときは dequeue しない (portal 実装と揃える)。
+          if (!request.benchReady) return Option.none<RunnerJob>()
+          return yield* Ref.modify(
+            jobsRef,
+            (jobs): [Option.Option<RunnerJob>, ReadonlyArray<RunnerJob>] =>
+              jobs.length === 0 ? [Option.none(), jobs] : [Option.some(jobs[0]), jobs.slice(1)]
+          )
+        }),
       reportProgress: (_jobId, request) => Ref.update(progressCallsRef, (a) => [...a, request]),
       reportFinish: (jobId, request) => Ref.update(finishCallsRef, (a) => [...a, [jobId, request] as const])
     }
 
-    return { portal, progressCallsRef, finishCallsRef }
+    return { portal, progressCallsRef, finishCallsRef, pollCallsRef }
   })
 
 // runLoop を testLayer 付きで fork し、durationMillis 待ってから interrupt する。
@@ -97,7 +121,7 @@ describe("runLoop", () => {
       const testLayer = Layer.mergeAll(
         Layer.succeed(PortalClient, portal),
         Layer.succeed(AdapterRegistry, { fake: makeFakeAdapter("fake") }),
-        Layer.succeed(LoopConfig, { pollIntervalMillis: 50, progressIntervalMillis: 150 })
+        Layer.succeed(LoopConfig, testLoopConfig({ progressIntervalMillis: 150 }))
       )
 
       yield* runLoopFor(1200, testLayer)
@@ -134,7 +158,7 @@ describe("runLoop", () => {
         Layer.succeed(AdapterRegistry, { silent: makeFakeAdapter("silent", silentThenResultScript) }),
         // progress 100ms ごと、ベンチは 500ms 沈黙してから結果を出す。
         // 700ms 走らせれば、沈黙区間だけで複数回のハートビートが飛ぶはず。
-        Layer.succeed(LoopConfig, { pollIntervalMillis: 50, progressIntervalMillis: 100 })
+        Layer.succeed(LoopConfig, testLoopConfig({ progressIntervalMillis: 100 }))
       )
 
       yield* runLoopFor(700, testLayer)
@@ -163,7 +187,7 @@ describe("runLoop", () => {
       const testLayer = Layer.mergeAll(
         Layer.succeed(PortalClient, portal),
         Layer.succeed(AdapterRegistry, { "stderr-noise": makeFakeAdapter("stderr-noise", stderrNoiseScript) }),
-        Layer.succeed(LoopConfig, { pollIntervalMillis: 50, progressIntervalMillis: 150 })
+        Layer.succeed(LoopConfig, testLoopConfig({ progressIntervalMillis: 150 }))
       )
 
       yield* runLoopFor(500, testLayer)
@@ -193,7 +217,7 @@ describe("runLoop", () => {
       const testLayer = Layer.mergeAll(
         Layer.succeed(PortalClient, portal),
         Layer.succeed(AdapterRegistry, { fake: makeFakeAdapter("fake") }),
-        Layer.succeed(LoopConfig, { pollIntervalMillis: 50, progressIntervalMillis: 150 })
+        Layer.succeed(LoopConfig, testLoopConfig({ progressIntervalMillis: 150 }))
       )
 
       yield* runLoopFor(300, testLayer)
@@ -240,7 +264,7 @@ describe("runLoop", () => {
       const testLayer = Layer.mergeAll(
         Layer.succeed(PortalClient, portal),
         Layer.succeed(AdapterRegistry, { "long-running": longRunningAdapter }),
-        Layer.succeed(LoopConfig, { pollIntervalMillis: 50, progressIntervalMillis: 150 })
+        Layer.succeed(LoopConfig, testLoopConfig({ progressIntervalMillis: 150 }))
       )
 
       const fiber = yield* Effect.fork(runLoop.pipe(Effect.provide(testLayer), Effect.provide(NodeContext.layer)))
@@ -273,6 +297,77 @@ describe("runLoop", () => {
         stillAlive = false
       }
       expect(stillAlive).toBe(false)
+    })
+  )
+
+  // Task 10: poll payload に heartbeat が乗ることと、BENCH_DIR 欠落時は
+  // benchReady=false + 短い summary で portal に heartbeat だけ送られることを
+  // 確認する。stub portal は benchReady=false を dequeue しない実装なので、
+  // runJob が呼ばれないことも確かめる。
+  it.scopedLive("Task 10: poll payload に runnerId/revision/benchReady/healthSummary が乗る", () =>
+    Effect.gen(function* () {
+      const job: RunnerJob = {
+        id: BenchJobIdSchema.make("job-hb"),
+        teamId: TeamIdSchema.make("team-1"),
+        targetIp: "127.0.0.1",
+        targetPort: 12345,
+        problemKey: "fake"
+      }
+      const { pollCallsRef, portal } = yield* makeStubPortal([job])
+      const testLayer = Layer.mergeAll(
+        Layer.succeed(PortalClient, portal),
+        Layer.succeed(AdapterRegistry, { fake: makeFakeAdapter("fake") }),
+        Layer.succeed(
+          LoopConfig,
+          testLoopConfig({
+            runnerId: "benchvm",
+            runnerRevision: "abc123",
+            progressIntervalMillis: 150,
+            benchDir: process.cwd()
+          })
+        )
+      )
+      yield* runLoopFor(200, testLayer)
+      const calls = yield* Ref.get(pollCallsRef)
+      expect(calls.length).toBeGreaterThanOrEqual(1)
+      const first = calls[0]
+      expect(first.runnerId).toBe("benchvm")
+      expect(first.revision).toBe("abc123")
+      expect(first.benchReady).toBe(true)
+      expect(first.healthSummary.length).toBeLessThanOrEqual(256)
+      // 生 email / bearer / cause を含まない。
+      expect(first.healthSummary).not.toMatch(/@/)
+      expect(first.healthSummary).not.toMatch(/Bearer/i)
+    })
+  )
+
+  it.scopedLive("Task 10: BENCH_DIR が存在しなければ benchReady=false で dequeue されない", () =>
+    Effect.gen(function* () {
+      const job: RunnerJob = {
+        id: BenchJobIdSchema.make("job-nb"),
+        teamId: TeamIdSchema.make("team-1"),
+        targetIp: "127.0.0.1",
+        targetPort: 12345,
+        problemKey: "fake"
+      }
+      const { finishCallsRef, pollCallsRef, portal } = yield* makeStubPortal([job])
+      const testLayer = Layer.mergeAll(
+        Layer.succeed(PortalClient, portal),
+        Layer.succeed(AdapterRegistry, { fake: makeFakeAdapter("fake") }),
+        Layer.succeed(
+          LoopConfig,
+          testLoopConfig({ benchDir: "/definitely/does/not/exist/for/inucon/test" })
+        )
+      )
+      yield* runLoopFor(300, testLayer)
+      const calls = yield* Ref.get(pollCallsRef)
+      expect(calls.length).toBeGreaterThanOrEqual(1)
+      // heartbeat 自体は送られる (benchReady=false + summary)
+      expect(calls.every((c) => c.benchReady === false)).toBe(true)
+      expect(calls[0].healthSummary).toContain("bench dir")
+      // dequeue されず runJob 未実行なので finish 報告は 0 件。
+      const finishes = yield* Ref.get(finishCallsRef)
+      expect(finishes).toHaveLength(0)
     })
   )
 })

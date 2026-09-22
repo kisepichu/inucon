@@ -2,12 +2,10 @@ import { it } from "@effect/vitest"
 import { Effect, Either, Exit, Layer, Option } from "effect"
 import { describe, expect } from "vitest"
 import { newJob, startJob } from "../../src/domain/benchJob.js"
-import { Contest } from "../../src/domain/contest.js"
 import { InvalidInstanceTransition } from "../../src/domain/errors.js"
-import { BenchJobId, ContestId, InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
-import { Instance, ipFor, newInstance, vmidFor } from "../../src/domain/instance.js"
-import type { ProvisionStep } from "../../src/domain/instance.js"
-import { Team } from "../../src/domain/team.js"
+import { BenchJobId, InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
+import { ipFor, newInstance, vmidFor } from "../../src/domain/instance.js"
+import type { Instance, ProvisionStep } from "../../src/domain/instance.js"
 import { User } from "../../src/domain/user.js"
 import {
   Forbidden,
@@ -16,8 +14,8 @@ import {
   ProvisionInProgress,
   QuotaExceeded
 } from "../../src/application/errors.js"
-import { CloudflareError, CloudflarePort, InstanceRepo, ProxmoxError } from "../../src/application/ports.js"
-import { requestCreateInstance, requestDeleteInstance } from "../../src/application/usecases/instances.js"
+import { CloudflareError, CloudflarePort, InstanceRepo, ProxmoxError, RepoError } from "../../src/application/ports.js"
+import { listTeamInstances, requestCreateInstance, requestDeleteInstance } from "../../src/application/usecases/instances.js"
 import { collectTeamAccess, runProvisioning, runTeardown } from "../../src/application/usecases/provisioning.js"
 import {
   makeBenchJobRepoTest,
@@ -27,10 +25,12 @@ import {
   makeInstanceRepoTest,
   makeInviteRepoTest,
   makeProxmoxPortTest,
+  makeResourceBindingRepoTest,
   makeTeamRepoTest,
   ProvisioningConfigTest,
   UuidGenTest
 } from "../support/inMemory.js"
+import { DEFAULT_TEST_CONTEST_ID, makeContest, makeInstance, makeTeam } from "../support/factories.js"
 
 const team1Id = TeamId.make("11111111-1111-1111-1111-111111111111")
 const team2Id = TeamId.make("22222222-2222-2222-2222-222222222222")
@@ -39,8 +39,8 @@ const bobId = UserId.make("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 const carolId = UserId.make("cccccccc-cccc-cccc-cccc-cccccccccccc")
 const adminId = UserId.make("dddddddd-dddd-dddd-dddd-dddddddddddd")
 
-const team1 = new Team({ id: team1Id, name: "team1", teamNumber: 1 })
-const team2 = new Team({ id: team2Id, name: "team2", teamNumber: 2 })
+const team1 = makeTeam({ id: team1Id, name: "team1", teamNumber: 1 })
+const team2 = makeTeam({ id: team2Id, name: "team2", teamNumber: 2 })
 
 // alice はメール+鍵あり、bob はメール無し・鍵あり(collectTeamAccess の
 // 「メール未設定はスキップ、鍵は集約」を検証できる構成)。
@@ -80,9 +80,9 @@ const admin = new User({
 const teamRepoLayer = makeTeamRepoTest({
   teams: [team1, team2],
   memberships: [
-    { userId: aliceId, teamId: team1Id },
-    { userId: bobId, teamId: team1Id },
-    { userId: carolId, teamId: team2Id }
+    { contestId: DEFAULT_TEST_CONTEST_ID, userId: aliceId, teamId: team1Id },
+    { contestId: DEFAULT_TEST_CONTEST_ID, userId: bobId, teamId: team1Id },
+    { contestId: DEFAULT_TEST_CONTEST_ID, userId: carolId, teamId: team2Id }
   ],
   users: [alice, bob, carol, admin]
 })
@@ -97,28 +97,21 @@ const githubKeysLayer = makeGithubKeysPortTest({
 const inviteRepoLayer = makeInviteRepoTest([])
 
 const contestLayer = (instanceQuota = 3) =>
-  makeContestRepoTest(
-    Option.some(
-      new Contest({ id: ContestId.make("contest-1"), name: "INUCON", problemKey: "p", status: "running", instanceQuota })
-    )
-  )
+  makeContestRepoTest([makeContest({ id: DEFAULT_TEST_CONTEST_ID, status: "running", instanceQuota })])
 
 const hostname1 = "inucon-team1-1.kisen.one"
 const vmid1 = vmidFor(1, 1)
 const ip1 = ipFor(1, 1)
 
 const runningInstance = (args: { id: string; teamId: TeamId; index: number; teamNumber: number }) =>
-  new Instance({
+  makeInstance({
     id: InstanceId.make(args.id),
     teamId: args.teamId,
     index: args.index,
     vmid: vmidFor(args.teamNumber, args.index),
     privateIp: ipFor(args.teamNumber, args.index),
     status: "running",
-    progress: ["clone_done", "configured", "started", "route_done", "access_done"],
-    errorMessage: Option.none(),
-    createdAt: 0,
-    updatedAt: 0
+    progress: ["clone_done", "configured", "started", "route_done", "access_done"]
   })
 
 const creatingInstance = (args: {
@@ -129,7 +122,7 @@ const creatingInstance = (args: {
   progress?: ReadonlyArray<ProvisionStep>
   createdAt?: number
 }) =>
-  new Instance({
+  makeInstance({
     id: InstanceId.make(args.id),
     teamId: args.teamId,
     index: args.index,
@@ -137,9 +130,7 @@ const creatingInstance = (args: {
     privateIp: ipFor(args.teamNumber, args.index),
     status: "creating",
     progress: args.progress ?? [],
-    errorMessage: Option.none(),
-    createdAt: args.createdAt ?? 0,
-    updatedAt: 0
+    createdAt: args.createdAt ?? 0
   })
 
 describe("requestCreateInstance(ガード)", () => {
@@ -203,7 +194,7 @@ describe("requestCreateInstance(ガード)", () => {
       )
       // ガードで弾かれたので creating 行は作られていない。
       const repo = yield* InstanceRepo
-      const rows = yield* repo.listByTeam(team1Id)
+      const rows = yield* repo.listByTeam(DEFAULT_TEST_CONTEST_ID, team1Id)
       expect(rows).toHaveLength(0)
     }).pipe(Effect.provide(baseGuardLayer({ freeMemBytes: 1_000_000_000, minFreeMemBytes: 5_000_000_000 })))
   )
@@ -308,17 +299,14 @@ describe("requestCreateInstance(index のサーバー採番)", () => {
   // 想定する。「削除→再追加を繰り返すと index が増え続ける」旧 UI ロジック
   // (nextInstanceIndex = active の max+1)の問題がサーバー採番では起きない
   // (最小の空き index=1 を再利用し、単調増加しない)ことを確認する。
-  const deletedIndex1 = new Instance({
+  const deletedIndex1 = makeInstance({
     id: InstanceId.make("deleted-1"),
     teamId: team1Id,
     index: 1,
     vmid: vmidFor(1, 1),
     privateIp: ipFor(1, 1),
     status: "deleted",
-    progress: ["clone_done", "configured", "started", "route_done", "access_done"],
-    errorMessage: Option.none(),
-    createdAt: 0,
-    updatedAt: 0
+    progress: ["clone_done", "configured", "started", "route_done", "access_done"]
   })
 
   it.effect("index=1 が(削除により non-active になって)解放されていれば、単調増加せず最小の空き index=1 を再利用する", () =>
@@ -337,7 +325,7 @@ describe("requestCreateInstance(index のサーバー採番)", () => {
     )
   )
 
-  const failedIndex2 = new Instance({
+  const failedIndex2 = makeInstance({
     id: InstanceId.make("failed-idx-2"),
     teamId: team1Id,
     index: 2,
@@ -345,9 +333,7 @@ describe("requestCreateInstance(index のサーバー採番)", () => {
     privateIp: ipFor(1, 2),
     status: "failed",
     progress: ["clone_done"],
-    errorMessage: Option.some("boom"),
-    createdAt: 0,
-    updatedAt: 0
+    errorMessage: Option.some("boom")
   })
 
   // Task 6 レビュー #A: quota は creating+running の「数」だけを見ているため、
@@ -373,17 +359,14 @@ describe("requestCreateInstance(index のサーバー採番)", () => {
     )
   )
 
-  const deletedIndex2 = new Instance({
+  const deletedIndex2 = makeInstance({
     id: InstanceId.make("deleted-idx-2"),
     teamId: team1Id,
     index: 2,
     vmid: vmidFor(1, 2),
     privateIp: ipFor(1, 2),
     status: "deleted",
-    progress: ["clone_done", "configured", "started", "route_done", "access_done"],
-    errorMessage: Option.none(),
-    createdAt: 0,
-    updatedAt: 0
+    progress: ["clone_done", "configured", "started", "route_done", "access_done"]
   })
 
   // deleted になった index はもう占有していないので再利用してよい(上の
@@ -440,7 +423,7 @@ describe("requestDeleteInstance(ガード)", () => {
           jobs: [
             Either.getOrThrow(
               startJob(
-                newJob({ id: BenchJobId.make("job-1"), teamId: team1Id, targetIp: ip1, targetPort: 80, now: 0 }),
+                newJob({ id: BenchJobId.make("job-1"), contestId: DEFAULT_TEST_CONTEST_ID, teamId: team1Id, targetIp: ip1, targetPort: 80, purpose: "competition", now: 0 }),
                 0
               )
             )
@@ -458,7 +441,7 @@ describe("requestDeleteInstance(ガード)", () => {
       Effect.provide(
         deleteLayer({
           instances: [runningTeam1],
-          jobs: [newJob({ id: BenchJobId.make("job-2"), teamId: team1Id, targetIp: ip1, targetPort: 80, now: 0 })]
+          jobs: [newJob({ id: BenchJobId.make("job-2"), contestId: DEFAULT_TEST_CONTEST_ID, teamId: team1Id, targetIp: ip1, targetPort: 80, purpose: "competition", now: 0 })]
         })
       )
     )
@@ -483,7 +466,7 @@ describe("requestDeleteInstance(ガード)", () => {
   // 無かった。
   it.effect("failed インスタンスも削除できる(running/failed → deleting)", () =>
     Effect.gen(function* () {
-      const failedInstance = new Instance({
+      const failedInstance = makeInstance({
         id: InstanceId.make("failed-1"),
         teamId: team1Id,
         index: 1,
@@ -491,9 +474,7 @@ describe("requestDeleteInstance(ガード)", () => {
         privateIp: ipFor(1, 1),
         status: "failed",
         progress: ["clone_done"],
-        errorMessage: Option.some("boom"),
-        createdAt: 0,
-        updatedAt: 0
+        errorMessage: Option.some("boom")
       })
       const result = yield* requestDeleteInstance({ user: alice, instanceId: failedInstance.id })
       expect(result.status).toBe("deleting")
@@ -504,7 +485,7 @@ describe("requestDeleteInstance(ガード)", () => {
       Effect.provide(
         deleteLayer({
           instances: [
-            new Instance({
+            makeInstance({
               id: InstanceId.make("failed-1"),
               teamId: team1Id,
               index: 1,
@@ -512,9 +493,7 @@ describe("requestDeleteInstance(ガード)", () => {
               privateIp: ipFor(1, 1),
               status: "failed",
               progress: ["clone_done"],
-              errorMessage: Option.some("boom"),
-              createdAt: 0,
-              updatedAt: 0
+              errorMessage: Option.some("boom")
             })
           ]
         })
@@ -542,7 +521,7 @@ describe("requestDeleteInstance(ガード)", () => {
 describe("collectTeamAccess", () => {
   it.effect("メール設定済みメンバーのメールと、全メンバーの鍵を集約する", () =>
     Effect.gen(function* () {
-      const access = yield* collectTeamAccess(team1Id)
+      const access = yield* collectTeamAccess(DEFAULT_TEST_CONTEST_ID, team1Id)
       expect(access.emails).toStrictEqual(["alice@example.com"])
       expect([...access.sshKeys].sort()).toStrictEqual(["ssh-ed25519 AAAA alice@host", "ssh-rsa BBBB bob@host"])
     }).pipe(Effect.provide(Layer.mergeAll(teamRepoLayer, githubKeysLayer, inviteRepoLayer)))
@@ -550,7 +529,7 @@ describe("collectTeamAccess", () => {
 
   it.effect("鍵未登録(GithubKeysError)のメンバーはスキップして続行する", () =>
     Effect.gen(function* () {
-      const access = yield* collectTeamAccess(team2Id)
+      const access = yield* collectTeamAccess(DEFAULT_TEST_CONTEST_ID, team2Id)
       // carol は鍵未登録スタブ(下記)なので鍵は空だがメールは残る。
       expect(access.emails).toStrictEqual(["carol@example.com"])
       expect(access.sshKeys).toStrictEqual([])
@@ -559,7 +538,7 @@ describe("collectTeamAccess", () => {
 
   it.effect("email 未登録メンバーは missingEmailLogins に載る(Access には含めない)", () =>
     Effect.gen(function* () {
-      const access = yield* collectTeamAccess(team1Id)
+      const access = yield* collectTeamAccess(DEFAULT_TEST_CONTEST_ID, team1Id)
       // bob は email 未設定。emails には載らず、missingEmailLogins に github_login。
       expect(access.emails).toStrictEqual(["alice@example.com"])
       expect(access.missingEmailLogins).toStrictEqual(["bob"])
@@ -581,7 +560,10 @@ describe("runProvisioning(払い出し saga)", () => {
         inviteRepoLayer,
         proxmox.layer,
         cloudflare.layer,
-        ProvisioningConfigTest()
+        ProvisioningConfigTest(),
+        // Task 9: saga は ResourceBinding を各ステップ成功直後に upsert する。
+        makeResourceBindingRepoTest([]),
+        UuidGenTest
       )
     }
   }
@@ -605,7 +587,9 @@ describe("runProvisioning(払い出し saga)", () => {
         inviteRepoLayer,
         proxmox.layer,
         cloudflare.layer,
-        ProvisioningConfigTest()
+        ProvisioningConfigTest(),
+        makeResourceBindingRepoTest([]),
+        UuidGenTest
       )
     }
   }
@@ -636,7 +620,7 @@ describe("runProvisioning(払い出し saga)", () => {
     Effect.gen(function* () {
       const initial = creatingInstance({ id: "prov-fail-access", teamId: team1Id, index: 1, teamNumber: 1 })
       const { cloudflare, layer, proxmox } = sagaLayerWith(initial, {
-        cloudflare: { failWith: { ensureAccessApp: new CloudflareError({ cause: "boom" }) } }
+        cloudflare: { failWith: { ensureAccessAppExact: new CloudflareError({ cause: "boom" }) } }
       })
       const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
 
@@ -651,6 +635,80 @@ describe("runProvisioning(払い出し saga)", () => {
       const px = yield* proxmox.getState
       expect(px.destroyedVmids).toStrictEqual([vmid1])
     })
+  )
+
+  it.effect(
+    "review round 1 finding 2: AmbiguousAccessPolicy のときは removeAccessApp を呼ばない (operator の Access アプリを破壊しない)",
+    () =>
+      Effect.gen(function* () {
+        const initial = creatingInstance({ id: "prov-ambig", teamId: team1Id, index: 1, teamNumber: 1 })
+        const proxmox = makeProxmoxPortTest()
+        const cloudflare = makeCloudflarePortTest({
+          ambiguousAccessPolicyFor: [
+            { hostname: hostname1, reason: "non_email_include_present" }
+          ]
+        })
+        const layer = Layer.mergeAll(
+          makeInstanceRepoTest([initial]),
+          teamRepoLayer,
+          githubKeysLayer,
+          inviteRepoLayer,
+          proxmox.layer,
+          cloudflare.layer,
+          ProvisioningConfigTest(),
+          makeResourceBindingRepoTest([]),
+          UuidGenTest
+        )
+
+        const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
+
+        expect(result.status).toBe("failed")
+        // route / VM は portal が今回作った resource なので compensate で撤収される。
+        // Access は non-portal-owned で触れないため撤収スキップ (state に元々
+        // 何も入っていないので touched を数える術がない → 「touch されなかった」
+        // 相当は「他 hostname の access も無傷」で確認する)。
+        const cf = yield* cloudflare.getState
+        expect(cf.routesByHostname).toStrictEqual({})
+        // ensureAccessAppExact は 1 回だけ呼ばれ、そのとき AmbiguousAccessPolicy
+        // で失敗した (== state に何も書かれていない)。removeAccessApp は呼ばれて
+        // いないため state.accessEmailsByHostname / accessAppIdByHostname は
+        // 空のままで、この空状態から「消しに行っていない」ことを検証する。
+        expect(cf.accessEmailsByHostname).toStrictEqual({})
+        expect(cf.accessAppIdByHostname).toStrictEqual({})
+        // VM は破壊されている (route/VM は portal 所有)。
+        const px = yield* proxmox.getState
+        expect(px.destroyedVmids).toStrictEqual([vmid1])
+      })
+  )
+
+  it.effect(
+    "review round 1 finding 1: ResourceBinding upsert が RepoError でも saga は running に到達し VM を破壊しない",
+    () =>
+      Effect.gen(function* () {
+        const initial = creatingInstance({ id: "prov-binding-fail", teamId: team1Id, index: 1, teamNumber: 1 })
+        const proxmox = makeProxmoxPortTest()
+        const cloudflare = makeCloudflarePortTest()
+        const layer = Layer.mergeAll(
+          makeInstanceRepoTest([initial]),
+          teamRepoLayer,
+          githubKeysLayer,
+          inviteRepoLayer,
+          proxmox.layer,
+          cloudflare.layer,
+          ProvisioningConfigTest(),
+          makeResourceBindingRepoTest([], { failWithUpsert: new RepoError({ cause: "binding-db-outage" }) }),
+          UuidGenTest
+        )
+
+        const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
+
+        expect(result.status).toBe("running")
+        // VM は保持される: onFailure に落ちれば stopAndDestroyVm が呼ばれるが、
+        // binding 失敗は catchAll で吸収されるため saga は成功する。
+        const px = yield* proxmox.getState
+        expect(px.destroyedVmids).toStrictEqual([])
+        expect(px.clonedVmids).toStrictEqual([vmid1])
+      })
   )
 
   it.effect("startVm 失敗時: route は作らず、clone 済み VM だけ破棄して failed", () =>
@@ -704,7 +762,9 @@ describe("runProvisioning(払い出し saga)", () => {
         inviteRepoLayer,
         proxmox.layer,
         cloudflare.layer,
-        ProvisioningConfigTest()
+        ProvisioningConfigTest(),
+        makeResourceBindingRepoTest([]),
+        UuidGenTest
       )
 
       const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
@@ -738,7 +798,9 @@ describe("runProvisioning(払い出し saga)", () => {
           inviteRepoLayer,
           proxmox.layer,
           cloudflare.layer,
-          ProvisioningConfigTest()
+          ProvisioningConfigTest(),
+          makeResourceBindingRepoTest([]),
+          UuidGenTest
         )
 
         const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
@@ -762,7 +824,9 @@ describe("runProvisioning(払い出し saga)", () => {
         inviteRepoLayer,
         proxmox.layer,
         cloudflare.layer,
-        ProvisioningConfigTest({ minFreeMemBytes: 5_000_000_000 })
+        ProvisioningConfigTest({ minFreeMemBytes: 5_000_000_000 }),
+        makeResourceBindingRepoTest([]),
+        UuidGenTest
       )
 
       const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
@@ -789,7 +853,9 @@ describe("runProvisioning(払い出し saga)", () => {
         inviteRepoLayer,
         proxmox.layer,
         cloudflare.layer,
-        ProvisioningConfigTest({ minFreeMemBytes: 5_000_000_000 })
+        ProvisioningConfigTest({ minFreeMemBytes: 5_000_000_000 }),
+        makeResourceBindingRepoTest([]),
+        UuidGenTest
       )
 
       const result = yield* runProvisioning(initial).pipe(Effect.provide(layer))
@@ -829,17 +895,14 @@ describe("runProvisioning(払い出し saga)", () => {
 })
 
 describe("runTeardown(撤収 saga)", () => {
-  const deletingInstance = new Instance({
+  const deletingInstance = makeInstance({
     id: InstanceId.make("td-1"),
     teamId: team1Id,
     index: 1,
     vmid: vmid1,
     privateIp: ip1,
     status: "deleting",
-    progress: ["clone_done", "configured", "started", "route_done", "access_done"],
-    errorMessage: Option.none(),
-    createdAt: 0,
-    updatedAt: 0
+    progress: ["clone_done", "configured", "started", "route_done", "access_done"]
   })
 
   it.effect("正常系: route/access を消し VM を破棄して deleted", () =>
@@ -857,7 +920,7 @@ describe("runTeardown(撤収 saga)", () => {
         // 事前に route/Access を張っておき、撤収で消えることを確認する。
         const cf = yield* CloudflarePort
         yield* cf.ensureInstanceRoute({ hostname: hostname1, ip: ip1 })
-        yield* cf.ensureAccessApp({ hostname: hostname1, emails: ["alice@example.com"] })
+        yield* cf.ensureAccessAppExact({ hostname: hostname1, emails: ["alice@example.com"] })
         return yield* runTeardown(deletingInstance)
       }).pipe(Effect.provide(layer))
 
@@ -909,5 +972,41 @@ describe("runTeardown(撤収 saga)", () => {
       expect(result.status).toBe("failed")
       expect(Option.isSome(result.errorMessage)).toBe(true)
     })
+  )
+})
+
+// Task 3: listTeamInstances は「今 display すべき contest」を返す (getDisplay)。
+// contest が finished でも履歴が見えなければならない (アーカイブ表示 = provisioning
+// 履歴の閲覧)。この regression テストは getOperational に戻ると failing になる
+// (finished では None → ContestNotFound → 404 になる)。
+describe("listTeamInstances: finished contest でも履歴を返す", () => {
+  const finishedContestLayer = makeContestRepoTest([
+    makeContest({
+      id: DEFAULT_TEST_CONTEST_ID,
+      status: "finished",
+      finishedAt: Option.some(4000)
+    })
+  ])
+
+  it.effect("contest.status='finished' でも自チームの instance が list される", () =>
+    Effect.gen(function* () {
+      const instances = yield* listTeamInstances({ user: alice, teamId: team1Id })
+      expect(instances.length).toBe(1)
+      expect(instances[0]?.teamId).toBe(team1Id)
+      expect(instances[0]?.status).toBe("running")
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          UuidGenTest,
+          teamRepoLayer,
+          finishedContestLayer,
+          makeInstanceRepoTest([
+            runningInstance({ id: "fin-1", teamId: team1Id, index: 1, teamNumber: 1 })
+          ]),
+          makeProxmoxPortTest({ freeMemBytes: 6_000_000_000 }).layer,
+          ProvisioningConfigTest({ minFreeMemBytes: 5_000_000_000 })
+        )
+      )
+    )
   )
 })

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "@effect/platform"
 import { it } from "@effect/vitest"
 import { ConfigProvider, Effect, Layer } from "effect"
@@ -63,7 +64,9 @@ const makeFakeCf = (initial?: Partial<FakeState>) => {
     // --- DNS records ---
     if (path === "/client/v4/zones/zone-1/dns_records" && method === "GET") {
       const name = url.searchParams.get("name")
-      const matches = state.dnsRecords.filter((r) => r.name === name)
+      const matches = name === null
+        ? state.dnsRecords
+        : state.dnsRecords.filter((r) => r.name === name)
       return Effect.succeed(jsonResponse(request, { success: true, result: matches }))
     }
     if (path === "/client/v4/zones/zone-1/dns_records" && method === "POST") {
@@ -116,7 +119,9 @@ const makeFakeCf = (initial?: Partial<FakeState>) => {
       state.accessApps.push(app)
       return Effect.succeed(jsonResponse(request, { success: true, result: app }))
     }
-    const appDeleteMatch = path.match(/^\/client\/v4\/accounts\/acct-1\/access\/apps\/(.+)$/)
+    // policies subresource は別 branch(下)で扱う。/apps/{id} 単体の DELETE
+    // だけがここに落ちるよう `.+` から `[^/]+` に絞る。
+    const appDeleteMatch = path.match(/^\/client\/v4\/accounts\/acct-1\/access\/apps\/([^/]+)$/)
     if (appDeleteMatch && method === "DELETE") {
       const id = appDeleteMatch[1]
       state.accessApps = state.accessApps.filter((a) => a.id !== id)
@@ -154,6 +159,14 @@ const makeFakeCf = (initial?: Partial<FakeState>) => {
         })
       )
     }
+    if (policyUpdateMatch && method === "DELETE") {
+      const [, appId, policyId] = policyUpdateMatch
+      const app = state.accessApps.find((a) => a.id === appId)
+      if (app !== undefined) {
+        app.policies = app.policies.filter((p) => p.id !== policyId)
+      }
+      return Effect.succeed(jsonResponse(request, { success: true, result: { id: policyId } }))
+    }
 
     return Effect.succeed(jsonResponse(request, { success: false, errors: [{ message: "not found" }] }, 404))
   })
@@ -185,10 +198,10 @@ const policyWriteRequests = (requests: ReadonlyArray<HttpClientRequest.HttpClien
   )
 
 describe("ensureInstanceRoute", () => {
-  it.effect("新規: DNS CNAME 作成 + tunnel ingress を catch-all の前に追加", () =>
+  it.effect("新規: DNS CNAME 作成 + tunnel ingress を catch-all の前に追加し、作成した record の id を返す", () =>
     Effect.gen(function* () {
       const fake = makeFakeCf()
-      yield* CloudflarePort.pipe(
+      const returned = yield* CloudflarePort.pipe(
         Effect.flatMap((cf) => cf.ensureInstanceRoute({ hostname: "inucon-team1-1.kisen.one", ip: "10.100.1.11" })),
         Effect.provide(portLayer(fake))
       )
@@ -205,6 +218,8 @@ describe("ensureInstanceRoute", () => {
         { hostname: "inucon-team1-1.kisen.one", service: "ssh://10.100.1.11:22" },
         { service: "http_status:404" }
       ])
+      // Task 9: portal は返り値の dnsRecordId を ResourceBinding.externalId に保存する。
+      expect(returned.dnsRecordId).toBe(fake.state.dnsRecords[0].id)
     })
   )
 
@@ -374,13 +389,16 @@ describe("removeInstanceRoute", () => {
   )
 })
 
-describe("ensureAccessApp", () => {
-  it.effect("新規: Access アプリ + ポリシーを作成", () =>
+describe("ensureAccessAppExact", () => {
+  it.effect("新規: Access アプリ + ポリシーを作成し、正規化された include(sorted+lowercase+dedupe)を書き込む", () =>
     Effect.gen(function* () {
       const fake = makeFakeCf()
-      yield* CloudflarePort.pipe(
+      const returned = yield* CloudflarePort.pipe(
         Effect.flatMap((cf) =>
-          cf.ensureAccessApp({ hostname: "inucon-team1-1.kisen.one", emails: ["a@example.com", "b@example.com"] })
+          cf.ensureAccessAppExact({
+            hostname: "inucon-team1-1.kisen.one",
+            emails: [" B@Example.com ", "a@example.com", "A@example.com"]
+          })
         ),
         Effect.provide(portLayer(fake))
       )
@@ -389,14 +407,15 @@ describe("ensureAccessApp", () => {
       const app = fake.state.accessApps[0]
       expect(app.domain).toBe("inucon-team1-1.kisen.one")
       expect(app.policies).toHaveLength(1)
-      expect(emailsOf(app.policies[0].include).sort()).toStrictEqual([
-        "a@example.com",
-        "b@example.com"
-      ])
+      // 正規化: trim + lowercase + dedupe + sort。
+      expect(emailsOf(app.policies[0].include)).toStrictEqual(["a@example.com", "b@example.com"])
+      // 戻り値: appId + policyId を portal 側が ResourceBinding へ載せる。
+      expect(returned.appId).toBe(app.id)
+      expect(returned.policyId).toBe(app.policies[0].id)
     })
   )
 
-  it.effect("既存: 現行 include との和集合になる(既存メールを消さない)", () =>
+  it.effect("既存: 過去エディションの email を保持しない(exact 上書き、union しない)", () =>
     Effect.gen(function* () {
       const fake = makeFakeCf({
         accessApps: [
@@ -404,27 +423,49 @@ describe("ensureAccessApp", () => {
             id: "app-1",
             domain: "inucon-team1-1.kisen.one",
             policies: [
-              { id: "pol-1", decision: "allow", include: [{ email: { email: "existing@example.com" } }] }
+              {
+                id: "pol-1",
+                decision: "allow",
+                include: [
+                  { email: { email: "prior-edition-user@example.com" } },
+                  { email: { email: "another-old@example.com" } }
+                ]
+              }
             ]
           }
         ]
       })
       yield* CloudflarePort.pipe(
         Effect.flatMap((cf) =>
-          cf.ensureAccessApp({ hostname: "inucon-team1-1.kisen.one", emails: ["new@example.com"] })
+          cf.ensureAccessAppExact({
+            hostname: "inucon-team1-1.kisen.one",
+            emails: ["new-edition@example.com"]
+          })
         ),
         Effect.provide(portLayer(fake))
       )
 
       const app = fake.state.accessApps[0]
-      expect(emailsOf(app.policies[0].include).sort()).toStrictEqual([
-        "existing@example.com",
-        "new@example.com"
-      ])
+      // 過去エディションの 2 件は消える。exact = 新エディション 1 件のみ。
+      expect(emailsOf(app.policies[0].include)).toStrictEqual(["new-edition@example.com"])
     })
   )
 
-  it.effect("既存: 重複メールは 1 件に統合される", () =>
+  it.effect("新規: emails 空はアプリだけ作りポリシーを作らない(policyId=null)", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeCf()
+      const returned = yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) => cf.ensureAccessAppExact({ hostname: "inucon-team1-1.kisen.one", emails: [] })),
+        Effect.provide(portLayer(fake))
+      )
+      expect(fake.state.accessApps).toHaveLength(1)
+      expect(fake.state.accessApps[0].policies).toHaveLength(0)
+      expect(policyWriteRequests(fake.requests)).toHaveLength(0)
+      expect(returned.policyId).toBeNull()
+    })
+  )
+
+  it.effect("既存: emails 空は portal 所有 allow policy を削除して policyId=null を返す(deny-by-default)", () =>
     Effect.gen(function* () {
       const fake = makeFakeCf({
         accessApps: [
@@ -432,24 +473,52 @@ describe("ensureAccessApp", () => {
             id: "app-1",
             domain: "inucon-team1-1.kisen.one",
             policies: [
-              { id: "pol-1", decision: "allow", include: [{ email: { email: "existing@example.com" } }] }
+              { id: "pol-1", decision: "allow", include: [{ email: { email: "member@example.com" } }] }
             ]
           }
         ]
       })
-      yield* CloudflarePort.pipe(
-        Effect.flatMap((cf) =>
-          cf.ensureAccessApp({ hostname: "inucon-team1-1.kisen.one", emails: ["existing@example.com"] })
-        ),
+      const returned = yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) => cf.ensureAccessAppExact({ hostname: "inucon-team1-1.kisen.one", emails: [] })),
         Effect.provide(portLayer(fake))
       )
-
-      const app = fake.state.accessApps[0]
-      expect(emailsOf(app.policies[0].include)).toStrictEqual(["existing@example.com"])
+      expect(fake.state.accessApps[0].policies).toHaveLength(0)
+      expect(returned.policyId).toBeNull()
     })
   )
 
-  it.effect("既存: email 以外の未知 include(everyone 等)が混在しても decode で落ちず、そのまま保持される", () =>
+  it.effect("既存: allow policy が 2 個以上あるとき AmbiguousAccessPolicy(multiple_allow_policies)で失敗する", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeCf({
+        accessApps: [
+          {
+            id: "app-1",
+            domain: "inucon-team1-1.kisen.one",
+            policies: [
+              { id: "pol-a", decision: "allow", include: [{ email: { email: "a@example.com" } }] },
+              { id: "pol-b", decision: "allow", include: [{ email: { email: "b@example.com" } }] }
+            ]
+          }
+        ]
+      })
+      const error = yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) =>
+          cf.ensureAccessAppExact({ hostname: "inucon-team1-1.kisen.one", emails: ["new@example.com"] })
+        ),
+        Effect.provide(portLayer(fake)),
+        Effect.flip
+      )
+      expect(error._tag).toBe("AmbiguousAccessPolicy")
+      if (error._tag === "AmbiguousAccessPolicy") {
+        expect(error.hostname).toBe("inucon-team1-1.kisen.one")
+        expect(error.reason).toBe("multiple_allow_policies")
+      }
+      // policy は書き換わっていない。
+      expect(policyWriteRequests(fake.requests)).toHaveLength(0)
+    })
+  )
+
+  it.effect("既存: allow policy の include に非 email(everyone/ip)が混ざっていると AmbiguousAccessPolicy(non_email_include_present)で失敗する", () =>
     Effect.gen(function* () {
       const fake = makeFakeCf({
         accessApps: [
@@ -466,23 +535,22 @@ describe("ensureAccessApp", () => {
           }
         ]
       })
-      yield* CloudflarePort.pipe(
+      const error = yield* CloudflarePort.pipe(
         Effect.flatMap((cf) =>
-          cf.ensureAccessApp({ hostname: "inucon-team1-1.kisen.one", emails: ["new@example.com"] })
+          cf.ensureAccessAppExact({ hostname: "inucon-team1-1.kisen.one", emails: ["new@example.com"] })
         ),
-        Effect.provide(portLayer(fake))
+        Effect.provide(portLayer(fake)),
+        Effect.flip
       )
-
-      const app = fake.state.accessApps[0]
-      expect(emailsOf(app.policies[0].include).sort()).toStrictEqual([
-        "existing@example.com",
-        "new@example.com"
-      ])
-      expect(app.policies[0].include).toContainEqual({ everyone: {} })
+      expect(error._tag).toBe("AmbiguousAccessPolicy")
+      if (error._tag === "AmbiguousAccessPolicy") {
+        expect(error.reason).toBe("non_email_include_present")
+      }
+      expect(policyWriteRequests(fake.requests)).toHaveLength(0)
     })
   )
 
-  it.effect("既存: 複数ポリシーがある場合は先頭の allow ポリシーだけを対象にする(他ポリシーは変更しない)", () =>
+  it.effect("AmbiguousAccessPolicy 本体に生 email が載らない", () =>
     Effect.gen(function* () {
       const fake = makeFakeCf({
         accessApps: [
@@ -490,80 +558,24 @@ describe("ensureAccessApp", () => {
             id: "app-1",
             domain: "inucon-team1-1.kisen.one",
             policies: [
-              { id: "pol-deny", decision: "deny", include: [{ ip: { ip: "203.0.113.0/24" } }] },
-              { id: "pol-allow", decision: "allow", include: [{ email: { email: "existing@example.com" } }] }
+              { id: "pol-a", decision: "allow", include: [{ email: { email: "secret-old@example.com" } }] },
+              { id: "pol-b", decision: "allow", include: [{ email: { email: "another-secret@example.com" } }] }
             ]
           }
         ]
       })
-      yield* CloudflarePort.pipe(
+      const error = yield* CloudflarePort.pipe(
         Effect.flatMap((cf) =>
-          cf.ensureAccessApp({ hostname: "inucon-team1-1.kisen.one", emails: ["new@example.com"] })
+          cf.ensureAccessAppExact({ hostname: "inucon-team1-1.kisen.one", emails: ["new@example.com"] })
         ),
-        Effect.provide(portLayer(fake))
+        Effect.provide(portLayer(fake)),
+        Effect.flip
       )
-
-      const app = fake.state.accessApps[0]
-      expect(app.policies).toHaveLength(2)
-      expect(app.policies[0]).toStrictEqual({
-        id: "pol-deny",
-        decision: "deny",
-        include: [{ ip: { ip: "203.0.113.0/24" } }]
-      })
-      expect(emailsOf(app.policies[1].include).sort()).toStrictEqual([
-        "existing@example.com",
-        "new@example.com"
-      ])
+      const serialized = JSON.stringify(error)
+      expect(serialized).not.toContain("secret-old")
+      expect(serialized).not.toContain("another-secret")
+      expect(serialized).not.toContain("new@example.com")
     })
-  )
-
-  it.effect(
-    "新規: emails が空ならアプリは作るがポリシー作成はスキップする(空 include は CF 400、Task 7 実機検出)",
-    () =>
-      Effect.gen(function* () {
-        const fake = makeFakeCf()
-        yield* CloudflarePort.pipe(
-          Effect.flatMap((cf) => cf.ensureAccessApp({ hostname: "inucon-team1-1.kisen.one", emails: [] })),
-          Effect.provide(portLayer(fake))
-        )
-
-        expect(fake.state.accessApps).toHaveLength(1)
-        const app = fake.state.accessApps[0]
-        expect(app.domain).toBe("inucon-team1-1.kisen.one")
-        expect(app.policies).toHaveLength(0)
-        expect(policyWriteRequests(fake.requests)).toHaveLength(0)
-      })
-  )
-
-  it.effect(
-    "既存: allow ポリシーが無く emails も空ならポリシー作成をスキップする(空 include は CF 400)",
-    () =>
-      Effect.gen(function* () {
-        const fake = makeFakeCf({
-          accessApps: [
-            {
-              id: "app-1",
-              domain: "inucon-team1-1.kisen.one",
-              policies: [
-                { id: "pol-deny", decision: "deny", include: [{ ip: { ip: "203.0.113.0/24" } }] }
-              ]
-            }
-          ]
-        })
-        yield* CloudflarePort.pipe(
-          Effect.flatMap((cf) => cf.ensureAccessApp({ hostname: "inucon-team1-1.kisen.one", emails: [] })),
-          Effect.provide(portLayer(fake))
-        )
-
-        const app = fake.state.accessApps[0]
-        expect(app.policies).toHaveLength(1)
-        expect(app.policies[0]).toStrictEqual({
-          id: "pol-deny",
-          decision: "deny",
-          include: [{ ip: { ip: "203.0.113.0/24" } }]
-        })
-        expect(policyWriteRequests(fake.requests)).toHaveLength(0)
-      })
   )
 })
 
@@ -621,6 +633,113 @@ describe("removeAccessApp", () => {
       expect(cause).toContain("7003")
       expect(cause).toContain("Not authorized")
       expect(cause).not.toContain("test-cf-token")
+    })
+  )
+})
+
+// Task 7: reconciliation 向け inventory メソッド。DNS + tunnel ingress + Access
+// app + policies を横断し、hostname prefix (inucon-team\d+-\d+) の resource
+// だけを sanitized な形で返す。email 値は生では返さない(SHA-256 のみ)。
+describe("getInstanceInventory", () => {
+  it.effect("inucon-team* prefix の DNS / ingress / app / policy をまとめて返す。email は SHA-256 で返し、生の値は残さない", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeCf({
+        dnsRecords: [
+          { id: "dns-1", type: "CNAME", name: "inucon-team1-1.kisen.one", content: "tunnel.cfargotunnel.com", proxied: true },
+          { id: "dns-2", type: "CNAME", name: "inucon-team2-1.kisen.one", content: "tunnel.cfargotunnel.com", proxied: true },
+          { id: "dns-x", type: "CNAME", name: "portal.kisen.one", content: "tunnel.cfargotunnel.com", proxied: true }
+        ],
+        ingress: [
+          { hostname: "inucon-team1-1.kisen.one", service: "ssh://10.100.1.11:22" },
+          { hostname: "inucon-team2-1.kisen.one", service: "ssh://10.100.2.11:22" },
+          { hostname: "portal.kisen.one", service: "http://10.0.0.1:3000" },
+          { hostname: undefined, service: "http_status:404" }
+        ],
+        accessApps: [
+          {
+            id: "app-1",
+            domain: "inucon-team1-1.kisen.one",
+            policies: [
+              {
+                id: "policy-1",
+                decision: "allow",
+                include: [
+                  { email: { email: "Alice@Example.com" } },
+                  { email: { email: "bob@example.com" } }
+                ]
+              }
+            ]
+          },
+          {
+            id: "app-2",
+            domain: "inucon-team2-1.kisen.one",
+            policies: [
+              {
+                id: "policy-2",
+                decision: "allow",
+                include: [
+                  { email_domain: { domain: "example.com" } }
+                ]
+              }
+            ]
+          },
+          {
+            id: "app-portal",
+            domain: "portal.kisen.one",
+            policies: []
+          }
+        ]
+      })
+      const inventory = yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) => cf.getInstanceInventory),
+        Effect.provide(portLayer(fake))
+      )
+
+      // portal.kisen.one / catch-all は絶対に含まれない
+      expect(inventory.routes.map((r) => r.hostname).sort()).toEqual([
+        "inucon-team1-1",
+        "inucon-team2-1"
+      ])
+      expect(inventory.apps.map((a) => a.hostname).sort()).toEqual([
+        "inucon-team1-1",
+        "inucon-team2-1"
+      ])
+
+      const t1 = inventory.apps.find((a) => a.hostname === "inucon-team1-1")!
+      expect(t1.policyShape).toBe("owned_exact")
+      // email は生の値を含まず、sorted+normalized(小文字) の SHA-256 hex
+      // top-level static import は import 群にまとめてある(createHash)。
+      const expectedHash = createHash("sha256")
+        .update("alice@example.com\nbob@example.com")
+        .digest("hex")
+      expect(t1.emailSetHash).toBe(expectedHash)
+
+      const t2 = inventory.apps.find((a) => a.hostname === "inucon-team2-1")!
+      // email_domain のみ → owned_exact ではない
+      expect(t2.policyShape).toBe("unknown")
+
+      // response 全体を JSON 化して生 email が含まれないことを確認
+      const serialized = JSON.stringify(inventory)
+      expect(serialized).not.toContain("alice")
+      expect(serialized).not.toContain("Alice")
+      expect(serialized).not.toContain("bob@")
+    })
+  )
+
+  it.effect("DNS レコードが重複していれば dnsRecordIds に複数入り、planner が ambiguous を判定できる", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeCf({
+        dnsRecords: [
+          { id: "dns-a", type: "CNAME", name: "inucon-team1-1.kisen.one", content: "tunnel.cfargotunnel.com", proxied: true },
+          { id: "dns-b", type: "CNAME", name: "inucon-team1-1.kisen.one", content: "tunnel.cfargotunnel.com", proxied: true }
+        ]
+      })
+      const inventory = yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) => cf.getInstanceInventory),
+        Effect.provide(portLayer(fake))
+      )
+      const t1 = inventory.routes.find((r) => r.hostname === "inucon-team1-1")!
+      expect(t1.dnsRecordIds.slice().sort()).toEqual(["dns-a", "dns-b"])
     })
   )
 })

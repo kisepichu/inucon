@@ -18,12 +18,16 @@ export const TeamsLive = HttpApiBuilder.group(api, "teams", (handlers) =>
     .handle("listTeams", () =>
       listTeamsWithMembers.pipe(
         Effect.map((rows) => rows.map(({ team, members }) => ({ ...team, members: members.map(toTeamMember) }))),
+        Effect.catchTag("ContestNotFound", () => Effect.fail(new NotFound())),
         Effect.orDie
       )
     )
     .handle("createTeam", ({ payload }) =>
       createTeam(payload).pipe(
-        Effect.catchTag("TeamNumberConflict", (e) => Effect.fail(new TeamNumberConflict({ teamNumber: e.teamNumber }))),
+        Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound()),
+          TeamNumberConflict: (e) => Effect.fail(new TeamNumberConflict({ teamNumber: e.teamNumber }))
+        }),
         Effect.orDie
       )
     )
@@ -31,6 +35,7 @@ export const TeamsLive = HttpApiBuilder.group(api, "teams", (handlers) =>
       setTeamMembers({ teamId: path.id, githubLogins: payload.githubLogins }).pipe(
         Effect.map(({ team, members }) => ({ ...team, members: members.map(toTeamMember) })),
         Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound()),
           TeamNotFound: () => Effect.fail(new NotFound()),
           UnknownGithubLogins: (e) => Effect.fail(new UnknownGithubLogins({ logins: e.logins })),
           MemberConflict: (e) => Effect.fail(new MemberConflict({ logins: e.logins }))

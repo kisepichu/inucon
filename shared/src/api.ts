@@ -8,16 +8,24 @@ import {
 } from "@effect/platform"
 import { Context, Schema } from "effect"
 import {
+  Artifact,
+  ArtifactId,
   BenchJob,
   BenchJobDetail,
   BenchJobId,
   BenchJobStatus,
   Contest,
+  ContestDraftPatch,
+  ContestId,
   ContestStatus,
+  ContestTransitionRequest,
+  CopyContestRosterRequest,
+  CreateContestDraftRequest,
   CreateInstanceRequest,
   CreateTeamInstanceRequest,
   CreateTeamRequest,
   EnqueueBenchRequest,
+  EnqueueRehearsalRequest,
   Instance,
   InstanceId,
   InstanceStatus,
@@ -25,8 +33,16 @@ import {
   InviteResult,
   JobAction,
   Me,
+  Operation,
+  OperationId,
+  OperationWithSteps,
   PollJobResponse,
+  ReadinessCheck,
+  ReconciliationApplyRequest,
+  ReconciliationPlan,
+  ReconciliationPlanRequest,
   RunnerFinishRequest,
+  RunnerPollRequest,
   RunnerProgressRequest,
   ScoreboardEntry,
   SetTeamMembersRequest,
@@ -34,7 +50,10 @@ import {
   TeamId,
   TeamInvite,
   TeamWithMembers,
-  User
+  UpdateContestDraftRequest,
+  CleanupApplyRequest,
+  User,
+  VerifyArtifactRequest
 } from "./schemas.js"
 
 // --- cookie 名(ポータルのハンドラ/ミドルウェアと契約側で共有する) ---
@@ -177,6 +196,84 @@ export class InvalidContestTransition extends Schema.TaggedError<InvalidContestT
   HttpApiSchema.annotations({ status: 409 })
 ) {}
 
+// Task 5: draft wizard の schedule バリデーション(未設定/順序違反)。
+export class InvalidContestSchedule extends Schema.TaggedError<InvalidContestSchedule>()(
+  "InvalidContestSchedule",
+  {
+    reason: Schema.Literal(
+      "missing_schedule",
+      "start_not_before_end",
+      "access_close_before_end",
+      "cleanup_before_access_close"
+    )
+  },
+  HttpApiSchema.annotations({ status: 422 })
+) {}
+
+// Task 5: 新規 Contest 作成の edition 部分ユニーク違反(canceled は焼かない)。
+export class ContestEditionConflict extends Schema.TaggedError<ContestEditionConflict>()(
+  "ContestEditionConflict",
+  { edition: Schema.Int },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// Task 5: 楽観ロック競合。actual を載せて UI が再取得できるようにする。
+export class ContestRevisionConflict extends Schema.TaggedError<ContestRevisionConflict>()(
+  "ContestRevisionConflict",
+  { expected: Schema.Int, actual: Schema.Int },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// Task 5: 単一 operational Contest 制約違反。
+export class OperationalContestConflict extends Schema.TaggedError<OperationalContestConflict>()(
+  "OperationalContestConflict",
+  {},
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// Task 7: reconciliation apply の失敗マッピング。
+// - StaleReconciliationPlan: plan digest / inventory が古い(409、UI は再取得)。
+// - AmbiguousReconciliation: 分類が blocked を含む(422、operator adopt 待ち)。
+export class StaleReconciliationPlan extends Schema.TaggedError<StaleReconciliationPlan>()(
+  "StaleReconciliationPlan",
+  {},
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+export class AmbiguousReconciliation extends Schema.TaggedError<AmbiguousReconciliation>()(
+  "AmbiguousReconciliation",
+  { hostnames: Schema.Array(Schema.String) },
+  HttpApiSchema.annotations({ status: 422 })
+) {}
+
+// Task 7 review #2: 「plan は正当だが actionable が 0 件」= 既に clean な状態は
+// AmbiguousReconciliation(422) と混同されるため、専用の 409 エラーで区別する。
+export class NothingToReconcile extends Schema.TaggedError<NothingToReconcile>()(
+  "NothingToReconcile",
+  {},
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// Task 7 review round 3 #1: 上流 provider (Proxmox / Cloudflare) の失敗を
+// 500 defect にせず、明示的に 503 でマップする。UI は「provider 一時障害、
+// 数分後に再試行」と示せる。details.provider は "proxmox" / "cloudflare"。
+export class ProviderUnavailable extends Schema.TaggedError<ProviderUnavailable>()(
+  "ProviderUnavailable",
+  { provider: Schema.Literal("proxmox", "cloudflare") },
+  HttpApiSchema.annotations({ status: 503 })
+) {}
+
+// Task 8: begin-preparation の pre-save ガード(previous_cleanup /
+// unfinished_operation / transitional_instance)が失敗した際に返す。UI は
+// failingChecks に基づいて再診断へ誘導する。ContestRevisionConflict と同じ
+// 409 相当だが、原因が「revision drift」ではなく「まだ準備できない状態」なので
+// 別 tag にする。
+export class ContestNotReadyForPreparation extends Schema.TaggedError<ContestNotReadyForPreparation>()(
+  "ContestNotReadyForPreparation",
+  { failingChecks: Schema.Array(Schema.String) },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
 // POST /api/bench-jobs: Contest が running でない(domain の
 // checkEnqueueAllowed をマップ)。
 export class ContestNotRunning extends Schema.TaggedError<ContestNotRunning>()(
@@ -201,6 +298,31 @@ export class CannotCancelRunning extends Schema.TaggedError<CannotCancelRunning>
   HttpApiSchema.annotations({ status: 409 })
 ) {}
 
+// POST /api/admin/contests/:contestId/rehearsal: 対象 Instance が running でない
+// (creating/deleting/deleted/failed。application 側 InstanceNotRunning と同型)。
+export class RehearsalInstanceNotRunning extends Schema.TaggedError<RehearsalInstanceNotRunning>()(
+  "RehearsalInstanceNotRunning",
+  { instanceId: InstanceId },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// POST /api/admin/contests/:contestId/rehearsal: Contest が preparing でない。
+// contest.status を返して UI がリカバリを提示できるようにする。
+export class ContestNotPreparing extends Schema.TaggedError<ContestNotPreparing>()(
+  "ContestNotPreparing",
+  { status: ContestStatus },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// POST /api/admin/contests/:contestId/rehearsal: instanceId が存在しない
+// (もしくは他 contest/team の Instance を指している)。生の privateIp を
+// 漏らさないよう 404 に統一する。
+export class InstanceNotFound extends Schema.TaggedError<InstanceNotFound>()(
+  "InstanceNotFound",
+  { instanceId: InstanceId },
+  HttpApiSchema.annotations({ status: 404 })
+) {}
+
 // POST /api/runner/jobs/:id/{progress,finish}: ジョブが running でない状態
 // での報告(二重 poll・タイムアウト後の遅延報告など)。POST
 // /api/bench-jobs/:id/cancel が queued 以外(finished/canceled/failed)を
@@ -208,6 +330,34 @@ export class CannotCancelRunning extends Schema.TaggedError<CannotCancelRunning>
 export class InvalidJobTransition extends Schema.TaggedError<InvalidJobTransition>()(
   "InvalidJobTransition",
   { jobId: BenchJobId, from: BenchJobStatus, action: JobAction },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// Task 11: POST /api/admin/artifacts/:artifactId/verify: 表示 SHA-256 と
+// アーティファクトの sha256 が一致しない。off_host_status を "verified" に
+// 上げず、operator に再取得を促す。expected は要求から来た値、actual は
+// DB 側の値(operator が UI 上で再確認できる)。
+export class ArtifactChecksumMismatch extends Schema.TaggedError<ArtifactChecksumMismatch>()(
+  "ArtifactChecksumMismatch",
+  { expected: Schema.String, actual: Schema.String },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// Task 11: POST /api/admin/contests/:contestId/archive: 対象 Contest が
+// finished でない(legacy archive 生成は finished contest だけを対象にする)。
+export class InvalidArchiveState extends Schema.TaggedError<InvalidArchiveState>()(
+  "InvalidArchiveState",
+  { status: ContestStatus },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// Task 12: return_normal_mode Operation の verify_no_managed_vms step が
+// 「まだ inucon-team* の managed VM が Proxmox に残っている」ことを検出したときに
+// 返す。UI は「先に cleanup を完了させてください」と提示できる。生の VMID / IP は
+// 載せず、hostname stem (inucon-team1-1 等) のみ返す。
+export class ResidualManagedResource extends Schema.TaggedError<ResidualManagedResource>()(
+  "ResidualManagedResource",
+  { hostnames: Schema.Array(Schema.String) },
   HttpApiSchema.annotations({ status: 409 })
 ) {}
 
@@ -271,12 +421,35 @@ export const authGroup = HttpApiGroup.make("auth")
     HttpApiEndpoint.post("logout", "/api/auth/logout").addSuccess(HttpApiSchema.NoContent)
   )
 
-// GET /api/contest(公開): 現在のコンテスト。無ければ 404。
+// GET /api/contest(compat 公開): 現在表示すべきコンテスト(getDisplay)。
+// Task 4: この単一 endpoint に加えて、明示 ID の archive API を contestsGroup へ
+// 追加した。Web 側は Task 5 以降で contestsGroup に完全移行する。
 export const contestGroup = HttpApiGroup.make("contest").add(
   HttpApiEndpoint.get("getContest", "/api/contest")
     .addSuccess(Contest)
     .addError(NotFound)
 )
+
+// GET /api/contests / /api/contests/:contestId / /api/contests/:contestId/scoreboard
+// (公開 archive API、Task 4)。canceled は list/detail のいずれにも現れない
+// (admin は Task 5 の contestAdminGroup で includeCanceled=true 経由で参照する)。
+export const contestsGroup = HttpApiGroup.make("contests")
+  .add(
+    HttpApiEndpoint.get("listContests", "/api/contests")
+      .addSuccess(Schema.Array(Contest))
+  )
+  .add(
+    HttpApiEndpoint.get("getContestById")`/api/contests/${HttpApiSchema.param("contestId", ContestId)}`
+      .addSuccess(Contest)
+      .addError(NotFound)
+  )
+  .add(
+    HttpApiEndpoint.get(
+      "getContestScoreboard"
+    )`/api/contests/${HttpApiSchema.param("contestId", ContestId)}/scoreboard`
+      .addSuccess(Schema.Array(ScoreboardEntry))
+      .addError(NotFound)
+  )
 
 export const teamsGroup = HttpApiGroup.make("teams")
   // 参照はセッションのみ(全チームのメンバー情報込みで返す)。
@@ -403,6 +576,79 @@ export const adminGroup = HttpApiGroup.make("admin")
       .middleware(AdminOnly)
   )
 
+// Task 5: /api/admin/contests: draft wizard 用の contest scoped 管理 API。
+// - list は includeCanceled=true で canceled を返す監査経路も持つ
+// - detail は canceled も 200 で返す(public /api/contests は 404 にする)
+// - PATCH で expectedRevision + patch を受けて楽観ロック update
+// - prepare/cancel は expectedRevision のみを受けて明示的な状態遷移
+// - roster/copy は source contest から teams/members/invites を複製する
+export const contestAdminGroup = HttpApiGroup.make("contestAdmin")
+  .add(
+    HttpApiEndpoint.get("listAdminContests", "/api/admin/contests")
+      .setUrlParams(Schema.Struct({ includeCanceled: Schema.optional(Schema.String) }))
+      .addSuccess(Schema.Array(Contest))
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.post("createContestDraft", "/api/admin/contests")
+      .setPayload(CreateContestDraftRequest)
+      .addSuccess(Contest)
+      .addError(ContestEditionConflict)
+      .addError(InvalidContestSchedule)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.get("getAdminContest")`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}`
+      .addSuccess(Contest)
+      .addError(NotFound)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.patch("updateContestDraft")`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}`
+      .setPayload(UpdateContestDraftRequest)
+      .addSuccess(Contest)
+      .addError(NotFound)
+      .addError(ContestRevisionConflict)
+      .addError(InvalidContestTransition)
+      .addError(InvalidContestSchedule)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "beginContestPreparation"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/prepare`
+      .setPayload(ContestTransitionRequest)
+      .addSuccess(Contest)
+      .addError(NotFound)
+      .addError(ContestRevisionConflict)
+      .addError(OperationalContestConflict)
+      .addError(ContestNotReadyForPreparation)
+      .addError(InvalidContestTransition)
+      .addError(InvalidContestSchedule)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "cancelAdminContest"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/cancel`
+      .setPayload(ContestTransitionRequest)
+      .addSuccess(Contest)
+      .addError(NotFound)
+      .addError(ContestRevisionConflict)
+      .addError(InvalidContestTransition)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "copyContestRoster"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/roster/copy`
+      .setPayload(CopyContestRosterRequest)
+      .addSuccess(Schema.Array(Team))
+      .addError(NotFound)
+      .addError(InvalidContestTransition)
+      .middleware(AdminOnly)
+  )
+
 // enqueue/cancel はチームメンバー(自チームのみ、ユースケース側で判定)。
 // 一覧(スコア・状態)は全員可。詳細(ログ含む)は自チーム + admin のみ
 // (ユースケース側で判定、他チームは Forbidden)。
@@ -451,6 +697,7 @@ export const scoreboardGroup = HttpApiGroup.make("scoreboard").add(
 export const runnerGroup = HttpApiGroup.make("runner")
   .add(
     HttpApiEndpoint.post("pollJob", "/api/runner/jobs/poll")
+      .setPayload(RunnerPollRequest)
       .addSuccess(PollJobResponse)
       .middleware(RunnerAuth)
   )
@@ -469,13 +716,209 @@ export const runnerGroup = HttpApiGroup.make("runner")
       .middleware(RunnerAuth)
   )
 
+// Task 7: reconciliation plan/apply (durable Operation) の admin API。
+// AdminOnly。POST /plan は inventory 読み取り + 分類 + digest 計算のみで
+// mutation 無し。POST /apply は planDigest + contestRevision + adoptHostnames
+// を突き合わせ、パスすれば `reconcile` Operation を enqueue する。
+// spec §Reconciliation: apply は「plan digest と Contest revision が現在値と
+// 一致するときだけ受け付ける」「ambiguous は apply を block」。
+export const operationsGroup = HttpApiGroup.make("operations")
+  .add(
+    HttpApiEndpoint.post(
+      "planReconciliation"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/reconciliation/plan`
+      .setPayload(ReconciliationPlanRequest)
+      .addSuccess(ReconciliationPlan)
+      .addError(NotFound)
+      .addError(ProviderUnavailable)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "applyReconciliation"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/reconciliation/apply`
+      .setPayload(ReconciliationApplyRequest)
+      .addSuccess(Operation)
+      .addError(NotFound)
+      .addError(ProviderUnavailable)
+      .addError(StaleReconciliationPlan)
+      .addError(AmbiguousReconciliation)
+      .addError(NothingToReconcile)
+      .addError(OperationalContestConflict)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.get(
+      "getContestReadiness"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/readiness`
+      .addSuccess(Schema.Array(ReadinessCheck))
+      .addError(NotFound)
+      .middleware(AdminOnly)
+  )
+  // Task 10: rehearsal は preparing Contest の admin 専用エンドポイント。
+  // 指定 Instance に対して purpose='rehearsal' の BenchJob を投入する。
+  // 参加者は running 以降で /api/bench-jobs 経由でしか enqueue できない
+  // (ContestNotRunning にマップ)。
+  .add(
+    HttpApiEndpoint.post(
+      "enqueueRehearsal"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/rehearsal`
+      .setPayload(EnqueueRehearsalRequest)
+      .addSuccess(BenchJob)
+      .addError(NotFound)
+      .addError(InstanceNotFound)
+      .addError(RehearsalInstanceNotRunning)
+      .addError(ContestNotPreparing)
+      .addError(TeamJobAlreadyQueued)
+      .addError(TargetIpOutOfSubnet)
+      .middleware(AdminOnly)
+  )
+  // Task 10: start は preparing → running 遷移を含む Operation を enqueue する
+  // (202 相当、UI は Operation を polling)。fresh readiness を Operation 実行時に
+  // 再計算し、失敗した required check があれば blocked に落とす。
+  .add(
+    HttpApiEndpoint.post(
+      "requestContestStart"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/start`
+      .setPayload(ContestTransitionRequest)
+      .addSuccess(Operation)
+      .addError(NotFound)
+      .addError(ContestRevisionConflict)
+      .addError(OperationalContestConflict)
+      .addError(InvalidContestTransition)
+      .middleware(AdminOnly)
+  )
+  // Task 12: cleanup Operation を enqueue する。reconciliation apply と同型の
+  // planDigest + adoptHostnames を受け、per-hostname の cleanup steps
+  // (continueOnError=true) を持つ Operation を返す。
+  .add(
+    HttpApiEndpoint.post(
+      "requestContestCleanup"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/cleanup`
+      .setPayload(CleanupApplyRequest)
+      .addSuccess(Operation)
+      .addError(NotFound)
+      .addError(ProviderUnavailable)
+      .addError(StaleReconciliationPlan)
+      .addError(AmbiguousReconciliation)
+      .addError(NothingToReconcile)
+      .addError(OperationalContestConflict)
+      .middleware(AdminOnly)
+  )
+  // Task 12: return_normal_mode Operation を enqueue する。benchvm→devvm の
+  // graceful power transition + 事前検証 (verify_no_managed_vms) を含む 8-step。
+  // まだ managed VM が残っていれば ResidualManagedResource で 409 を返す。
+  .add(
+    HttpApiEndpoint.post(
+      "requestReturnNormalMode"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/return-normal-mode`
+      .addSuccess(Operation)
+      .addError(NotFound)
+      .addError(ProviderUnavailable)
+      .addError(OperationalContestConflict)
+      .addError(ResidualManagedResource)
+      .addError(InvalidContestTransition)
+      .middleware(AdminOnly)
+  )
+  // Task 13: OperationDetail UI 用の Operation 単体取得。step 一覧を ordinal
+  // 昇順で載せる。UI は terminal status (succeeded/failed/blocked/canceled) に
+  // 落ちるまで polling する。生 storagePath / bearer / email は載らない
+  // (境界の SanitizedOperationError と wire schema が保証する)。
+  .add(
+    HttpApiEndpoint.get(
+      "getAdminOperation"
+    )`/api/admin/operations/${HttpApiSchema.param("operationId", OperationId)}`
+      .addSuccess(OperationWithSteps)
+      .addError(NotFound)
+      .middleware(AdminOnly)
+  )
+  // Task 13: ContestAdmin の Operations タブ用一覧。createdAt DESC + limit。
+  // 生成者 (admin userId / scheduler) は Operation.actor に既に含まれる。
+  .add(
+    HttpApiEndpoint.get(
+      "listContestOperations"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/operations`
+      .setUrlParams(Schema.Struct({ limit: Schema.optional(Schema.String) }))
+      .addSuccess(Schema.Array(Operation))
+      .addError(NotFound)
+      .middleware(AdminOnly)
+  )
+
+// Task 11: 開催回の archive artifact 一覧・ダウンロード・SHA-256 verify・
+// legacy contest の archive-only 再生成 API。scoreboard JSON/CSV は公開経路、
+// DB snapshot と verify は AdminOnly。生 storagePath は返さない(id のみ)。
+export const artifactsGroup = HttpApiGroup.make("artifacts")
+  .add(
+    HttpApiEndpoint.get(
+      "listContestArtifacts"
+    )`/api/contests/${HttpApiSchema.param("contestId", ContestId)}/artifacts`
+      .addSuccess(Schema.Array(Artifact))
+      .addError(NotFound)
+  )
+  .add(
+    HttpApiEndpoint.get(
+      "downloadArtifact"
+    )`/api/artifacts/${HttpApiSchema.param("artifactId", ArtifactId)}/download`
+      // Uint8Array の生バイトを返す。scoreboard/CSV は public、snapshot は 404 に
+      // 落とす(admin download 経路は adminArtifactsGroup)。
+      .addSuccess(HttpApiSchema.Empty(200))
+      .addError(NotFound)
+  )
+  .add(
+    HttpApiEndpoint.get(
+      "downloadAdminArtifact"
+    )`/api/admin/artifacts/${HttpApiSchema.param("artifactId", ArtifactId)}/download`
+      .addSuccess(HttpApiSchema.Empty(200))
+      .addError(NotFound)
+      .middleware(AdminOnly)
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "verifyArtifactChecksum"
+    )`/api/admin/artifacts/${HttpApiSchema.param("artifactId", ArtifactId)}/verify`
+      .setPayload(VerifyArtifactRequest)
+      .addSuccess(Artifact)
+      .addError(NotFound)
+      .addError(ArtifactChecksumMismatch)
+      .middleware(AdminOnly)
+  )
+  .add(
+    // 即時 finalize: 実行中 running Contest を手動で終了させる。scheduler と
+    // 同じ Operation 経路。expectedRevision で楽観ロック。
+    HttpApiEndpoint.post(
+      "requestContestFinalize"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/finalize`
+      .setPayload(ContestTransitionRequest)
+      .addSuccess(Operation)
+      .addError(NotFound)
+      .addError(ContestRevisionConflict)
+      .addError(InvalidContestTransition)
+      .addError(OperationalContestConflict)
+      .middleware(AdminOnly)
+  )
+  .add(
+    // legacy contest の archive-only 再生成。finished Contest 限定。
+    HttpApiEndpoint.post(
+      "requestContestArchive"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/archive`
+      .addSuccess(Operation)
+      .addError(NotFound)
+      .addError(InvalidArchiveState)
+      .addError(OperationalContestConflict)
+      .middleware(AdminOnly)
+  )
+
 export const api = HttpApi.make("inucon")
   .add(healthGroup)
   .add(authGroup)
   .add(contestGroup)
+  .add(contestsGroup)
   .add(teamsGroup)
   .add(instancesGroup)
   .add(adminGroup)
+  .add(contestAdminGroup)
   .add(benchGroup)
   .add(runnerGroup)
   .add(scoreboardGroup)
+  .add(operationsGroup)
+  .add(artifactsGroup)

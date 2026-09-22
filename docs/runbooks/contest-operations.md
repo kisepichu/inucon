@@ -78,15 +78,43 @@ ssh kise@<benchvm-ip> 'journalctl -u inucon-runner -f'
 3. **DB バックアップ**: `deploy/README.md` のスナップショット手順で結果込みの DB を
    保存しておく。
 
-## 次回開催に向けて(現状の制約)
+## 次回開催(第 n 回)を作る
 
-contest は 1 行・一方向遷移のため、同じ DB で次回を開催するには手作業が要る:
+Task 1-13 (contest lifecycle automation) 以降、開催回は Admin Web の
+**Contests → 新規作成** から draft として複数作れる。第1回 (INUCON) は
+`finished` のまま履歴として残り、Team / Invite / Instance / BenchJob /
+scoreboard は開催回ごとに分離される。手順の全体像:
 
-- スコア/ジョブ履歴を持ち越さない場合: DB バックアップを取った上で、
-  pod を止めて PVC の `portal.db` を消して起動し直す(seed が preparing の contest を
-  作り直す。ユーザー/チームも消えるため再招待が必要)。
-- 持ち越したい場合: contest 行の status を SQL で preparing に戻す等の直接更新に
-  なる(状態機械の外の操作なので、必要になった時点でツール化を検討)。
+1. Contests → **新規作成 (draft)** → 5-step wizard (基本情報 / 問題 revision /
+   quota / 期間 / Team 編成コピー) を埋める。**日付は operator が確定した
+   値を入力する (推測しない)**。desiredInstanceCount / instanceQuota は第2回
+   でも設定値であり、コード側にハードコードしない (Global Constraints)。
+2. ContestAdmin → **Reconciliation** タブで plan を Refresh → adopt 対象
+   hostname を明示 → apply。差分ゼロを確認。
+3. ContestAdmin → **Readiness** タブで runner heartbeat / backup /
+   rehearsal 実績 / Cloudflare write proven がすべて pass になるまで
+   Instance 払い出し・招待・リハーサルを実施。
+4. Readiness all-pass 後に **「開始」(preparing → running)**。
+5. 終了は **scheduledEndAt 到達で worker が自動 finalize**。急ぐ場合のみ
+   Admin Web の即時 finalize (`POST /api/admin/contests/:id/finalize`) を
+   使う。
+6. `finalizing → finished` 遷移で archive Operation が自動 enqueue され、
+   scoreboard JSON/CSV + DB snapshot artifact が生成される。Artifacts
+   タブから SHA-256 verify を実行し、off-host に取り出して確認する
+   (`docs/superpowers/reviews/2026-08-13-contest-lifecycle-rollout.md`
+   に off-host 検証結果を記録)。
+7. 後片付けは Contests → 該当開催 → **Return normal mode** (devvm
+   復帰) と **Cleanup** Operation (managed 外部 resource の撤収) を
+   Admin Web から実行する。
 
-このあたりの「第2回」体験(コンテスト複数回、アーカイブ)は未設計。開催が見えたら
-仕様化する。
+**古い制約 (第1回時点) は撤廃済み**: 「同じ DB で次回を開催するには pod を
+止めて `portal.db` を消して seed し直す」「contest 行の status を SQL で
+preparing に戻す」といった手順はもう不要。DB / 状態機械への直接介入は
+リカバリ以外では行わない。
+
+## block condition に落ちたとき
+
+plan/apply、mode transition、finalization、cleanup が blocked / failed で
+止まったとき、または資格情報を回すときは
+**[`docs/runbooks/contest-recovery.md`](contest-recovery.md)** に従う。
+通常フロー (この runbook) は Admin Web で完結する前提で書いてある。

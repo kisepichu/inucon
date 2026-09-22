@@ -17,6 +17,32 @@ export type ContestId = typeof ContestId.Type
 export const InstanceId = Schema.String.pipe(Schema.brand("InstanceId"))
 export type InstanceId = typeof InstanceId.Type
 
+// Task 1 (multi-edition lifecycle): 後続タスクの durable Operation / ResourceBinding /
+// Artifact の識別子。portal/src/domain/ids.ts と同名の構造的ブランド。
+export const OperationId = Schema.String.pipe(Schema.brand("OperationId"))
+export type OperationId = typeof OperationId.Type
+
+export const OperationStepId = Schema.String.pipe(Schema.brand("OperationStepId"))
+export type OperationStepId = typeof OperationStepId.Type
+
+export const ResourceBindingId = Schema.String.pipe(Schema.brand("ResourceBindingId"))
+export type ResourceBindingId = typeof ResourceBindingId.Type
+
+export const ArtifactId = Schema.String.pipe(Schema.brand("ArtifactId"))
+export type ArtifactId = typeof ArtifactId.Type
+
+// Task 8: readiness aggregation の wire schema。key/status/summary の 3 タプル。
+// summary は非機密文字列(生 email / bearer / cause 等を絶対に含まない)。
+export const ReadinessCheckStatus = Schema.Literal("pass", "warn", "fail")
+export type ReadinessCheckStatus = typeof ReadinessCheckStatus.Type
+
+export const ReadinessCheck = Schema.Struct({
+  key: Schema.String,
+  status: ReadinessCheckStatus,
+  summary: Schema.String
+})
+export type ReadinessCheck = typeof ReadinessCheck.Type
+
 export const User = Schema.Struct({
   id: UserId,
   githubId: Schema.Int,
@@ -33,8 +59,10 @@ export type User = typeof User.Type
 
 export const Team = Schema.Struct({
   id: TeamId,
+  contestId: ContestId,
   name: Schema.String,
-  teamNumber: Schema.Int.pipe(Schema.between(1, 254))
+  teamNumber: Schema.Int.pipe(Schema.between(1, 254)),
+  desiredInstanceCount: Schema.Int.pipe(Schema.nonNegative())
 })
 export type Team = typeof Team.Type
 
@@ -45,19 +73,106 @@ export const Me = Schema.Struct({
 })
 export type Me = typeof Me.Type
 
-export const ContestStatus = Schema.Literal("preparing", "running", "finished")
+// Task 1 (multi-edition lifecycle): 6状態遷移 (draft -> preparing -> running ->
+// finalizing -> finished、draft|preparing -> canceled)。
+export const ContestStatus = Schema.Literal(
+  "draft",
+  "preparing",
+  "running",
+  "finalizing",
+  "finished",
+  "canceled"
+)
 export type ContestStatus = typeof ContestStatus.Type
 
 // Phase 3: チームごとのインスタンス上限(domain/contest.ts の instanceQuota と
 // 同形。Team ページの追加ボタン活性判定に使う)。
+// Task 1: 開催回スコープ(edition/problemRevision/templateVmid)と schedule/
+// closed timestamps(Option -> nullable int)を追加。domain 側は Option、
+// wire 側は null で表現する(既存の User.email と同じ規約)。
 export const Contest = Schema.Struct({
   id: ContestId,
+  edition: Schema.Int.pipe(Schema.positive()),
   name: Schema.String,
   problemKey: Schema.String,
+  problemRevision: Schema.String,
+  templateVmid: Schema.Int.pipe(Schema.positive()),
   status: ContestStatus,
-  instanceQuota: Schema.Int.pipe(Schema.positive())
+  instanceQuota: Schema.Int.pipe(Schema.positive()),
+  scheduledStartAt: Schema.OptionFromNullOr(Schema.Int),
+  scheduledEndAt: Schema.OptionFromNullOr(Schema.Int),
+  accessClosesAt: Schema.OptionFromNullOr(Schema.Int),
+  cleanupAt: Schema.OptionFromNullOr(Schema.Int),
+  accessClosedAt: Schema.OptionFromNullOr(Schema.Int),
+  cleanupCompletedAt: Schema.OptionFromNullOr(Schema.Int),
+  startedAt: Schema.OptionFromNullOr(Schema.Int),
+  finalizingAt: Schema.OptionFromNullOr(Schema.Int),
+  finishedAt: Schema.OptionFromNullOr(Schema.Int),
+  canceledAt: Schema.OptionFromNullOr(Schema.Int),
+  revision: Schema.Int.pipe(Schema.positive())
 })
 export type Contest = typeof Contest.Type
+
+// Task 5: admin draft wizard 用のリクエスト DTO。domain の Contest は Option
+// を持つが、wire は null 許容の Int にする(User.email と同じ規約)。schedule
+// の順序検査は portal usecase 側 (InvalidContestSchedule) が担うのでここでは
+// 値の presence だけを型で表現する。
+export const CreateContestDraftRequest = Schema.Struct({
+  edition: Schema.Int.pipe(Schema.positive()),
+  name: Schema.String,
+  problemKey: Schema.String,
+  problemRevision: Schema.String,
+  templateVmid: Schema.Int.pipe(Schema.positive()),
+  instanceQuota: Schema.Int.pipe(Schema.positive()),
+  scheduledStartAt: Schema.NullOr(Schema.Int),
+  scheduledEndAt: Schema.NullOr(Schema.Int),
+  accessClosesAt: Schema.NullOr(Schema.Int),
+  cleanupAt: Schema.NullOr(Schema.Int)
+})
+export type CreateContestDraftRequest = typeof CreateContestDraftRequest.Type
+
+// PATCH /api/admin/contests/:contestId(部分更新)。patch 内は「省略=変更なし」、
+// null = 明示的に unset(schedule フィールドのみ)。expectedRevision は楽観
+// ロック用。
+export const ContestDraftPatch = Schema.Struct({
+  name: Schema.optional(Schema.String),
+  problemKey: Schema.optional(Schema.String),
+  problemRevision: Schema.optional(Schema.String),
+  templateVmid: Schema.optional(Schema.Int.pipe(Schema.positive())),
+  instanceQuota: Schema.optional(Schema.Int.pipe(Schema.positive())),
+  scheduledStartAt: Schema.optional(Schema.NullOr(Schema.Int)),
+  scheduledEndAt: Schema.optional(Schema.NullOr(Schema.Int)),
+  accessClosesAt: Schema.optional(Schema.NullOr(Schema.Int)),
+  cleanupAt: Schema.optional(Schema.NullOr(Schema.Int))
+})
+export type ContestDraftPatch = typeof ContestDraftPatch.Type
+
+export const UpdateContestDraftRequest = Schema.Struct({
+  expectedRevision: Schema.Int.pipe(Schema.positive()),
+  patch: ContestDraftPatch
+})
+export type UpdateContestDraftRequest = typeof UpdateContestDraftRequest.Type
+
+// POST /api/admin/contests/:contestId/{prepare,cancel}: 楽観ロック用の
+// expectedRevision のみを受ける空 body 系のラッパ。
+export const ContestTransitionRequest = Schema.Struct({
+  expectedRevision: Schema.Int.pipe(Schema.positive())
+})
+export type ContestTransitionRequest = typeof ContestTransitionRequest.Type
+
+// POST /api/admin/contests/:contestId/roster/copy: source contest から現在の
+// draft contest へロスターを複製する。
+export const CopyContestRosterRequest = Schema.Struct({
+  sourceContestId: ContestId
+})
+export type CopyContestRosterRequest = typeof CopyContestRosterRequest.Type
+
+// POST /api/admin/contests/:contestId/rehearsal: 指定 Instance に対して
+// purpose='rehearsal' の BenchJob を投入する(admin + preparing のみ)。
+export const EnqueueRehearsalRequest = Schema.Struct({
+  instanceId: InstanceId
+})
+export type EnqueueRehearsalRequest = typeof EnqueueRehearsalRequest.Type
 
 // GET /api/teams のメンバー表現。チームメイトの githubLogin を返す(auth の
 // User 全体を返すと isAdmin 等の不要な情報まで漏れるため最小限にする)。
@@ -87,6 +202,7 @@ export type ProvisionStep = typeof ProvisionStep.Type
 // 同じ方針)。
 export const Instance = Schema.Struct({
   id: InstanceId,
+  contestId: ContestId,
   teamId: TeamId,
   index: Schema.Int.pipe(Schema.positive()),
   vmid: Schema.Int,
@@ -142,6 +258,7 @@ export type InviteRequest = typeof InviteRequest.Type
 
 // GET /api/admin/teams/:id/invites: 招待中(未消費)の team_invites 行。
 export const TeamInvite = Schema.Struct({
+  contestId: ContestId,
   githubLogin: Schema.String,
   teamId: TeamId,
   email: Schema.String,
@@ -181,15 +298,20 @@ export type BenchJobId = typeof BenchJobId.Type
 export const BenchJobStatus = Schema.Literal("queued", "running", "finished", "canceled", "failed")
 export type BenchJobStatus = typeof BenchJobStatus.Type
 
+export const BenchJobPurpose = Schema.Literal("rehearsal", "competition")
+export type BenchJobPurpose = typeof BenchJobPurpose.Type
+
 // domain の BenchJob(Option フィールド)は境界を跨がないため、ハンドラが
 // Option.getOrNull で変換してこの Struct(null 許容)に合わせる(teams.ts の
 // toTeamMember と同じ方針)。
 export const BenchJob = Schema.Struct({
   id: BenchJobId,
+  contestId: ContestId,
   teamId: TeamId,
   targetIp: Schema.String,
   targetPort: Schema.Int.pipe(Schema.between(1, 65535)),
   status: BenchJobStatus,
+  purpose: BenchJobPurpose,
   score: Schema.NullOr(Schema.Int),
   passed: Schema.NullOr(Schema.Boolean),
   errorMessage: Schema.NullOr(Schema.String),
@@ -233,6 +355,20 @@ export const RunnerJob = Schema.Struct({
 })
 export type RunnerJob = typeof RunnerJob.Type
 
+// POST /api/runner/jobs/poll: Task 10 で追加した heartbeat 兼 poll。
+// runnerId は複数 runner を将来サポートするための識別子(現行は "benchvm" 固定
+// 相当)、revision は動作している runner バイナリの識別子(git commit hash / dev)、
+// benchReady はランナー側で BENCH_DIR / adapter 実行可能性を確認した結果、
+// healthSummary は非機密の短文サマリ(bearer / 生 cause / email を含まない、
+// 長さは DB 側の CHECK と同じ 256 文字以内)。
+export const RunnerPollRequest = Schema.Struct({
+  runnerId: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(64)),
+  revision: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(64)),
+  benchReady: Schema.Boolean,
+  healthSummary: Schema.String.pipe(Schema.maxLength(256))
+})
+export type RunnerPollRequest = typeof RunnerPollRequest.Type
+
 // POST /api/runner/jobs/poll
 export const PollJobResponse = Schema.Struct({ job: Schema.NullOr(RunnerJob) })
 export type PollJobResponse = typeof PollJobResponse.Type
@@ -265,3 +401,198 @@ export const ScoreboardEntry = Schema.Struct({
   latestAt: Schema.NullOr(Schema.Int)
 })
 export type ScoreboardEntry = typeof ScoreboardEntry.Type
+
+// Task 7: reconciliation plan の wire 表現。domain/reconciliation.ts と同型で、
+// 生 email / bearer / provider ID は含まない(hostname / classification /
+// action / 観測件数 / sanitized reason のみ)。
+export const ReconciliationClass = Schema.Literal(
+  "in_sync",
+  "missing",
+  "drifted",
+  "managed_orphan",
+  "unmanaged_orphan",
+  "ambiguous"
+)
+export type ReconciliationClass = typeof ReconciliationClass.Type
+
+export const ReconciliationAction = Schema.Literal("noop", "cleanup", "adopt_cleanup", "blocked")
+export type ReconciliationAction = typeof ReconciliationAction.Type
+
+export const ReconciliationEntry = Schema.Struct({
+  hostname: Schema.String,
+  classification: ReconciliationClass,
+  action: ReconciliationAction,
+  reason: Schema.String,
+  proxmoxVmObserved: Schema.Boolean,
+  cloudflareRouteCount: Schema.Int,
+  cloudflareIngressCount: Schema.Int,
+  cloudflareAppCount: Schema.Int,
+  bindingIds: Schema.Array(ResourceBindingId),
+  instanceId: Schema.NullOr(InstanceId)
+})
+export type ReconciliationEntry = typeof ReconciliationEntry.Type
+
+export const ReconciliationPlan = Schema.Struct({
+  contestId: ContestId,
+  contestRevision: Schema.Int.pipe(Schema.positive()),
+  planDigest: Schema.String,
+  generatedAt: Schema.Int,
+  entries: Schema.Array(ReconciliationEntry),
+  adoptHostnames: Schema.Array(Schema.String)
+})
+export type ReconciliationPlan = typeof ReconciliationPlan.Type
+
+export const ReconciliationPlanRequest = Schema.Struct({
+  adoptHostnames: Schema.Array(Schema.String)
+})
+export type ReconciliationPlanRequest = typeof ReconciliationPlanRequest.Type
+
+// review round 8 #2: 以前は planDigest と別に contestRevision を受けていたが、
+// planDigest は contestRevision を digest 材料に含むため、planDigest 一致 ⇒
+// contestRevision 一致で dead check になっていた(round 3 で dead 分岐を
+// 削除済み)。UI に「stale revision を弾く」誤解を招く dead surface だったので
+// wire からも外す。楽観ロックは planDigest のみで機能する。
+export const ReconciliationApplyRequest = Schema.Struct({
+  planDigest: Schema.String,
+  adoptHostnames: Schema.Array(Schema.String)
+})
+export type ReconciliationApplyRequest = typeof ReconciliationApplyRequest.Type
+
+// Task 7: Operation の wire 表現。durable operation の enqueue 応答 / 取得で使う。
+// sanitizedError は非機密 code + summary + details のみ(domain の
+// SanitizedOperationError と同型)。
+export const OperationKind = Schema.Literal(
+  "reconcile",
+  "enter_contest_mode",
+  "prepare",
+  "start",
+  "finish",
+  "revoke_access",
+  "cleanup",
+  "return_normal_mode",
+  "backup"
+)
+export type OperationKind = typeof OperationKind.Type
+
+export const OperationStatus = Schema.Literal(
+  "queued",
+  "running",
+  "succeeded",
+  "failed",
+  "blocked",
+  "canceled"
+)
+export type OperationStatus = typeof OperationStatus.Type
+
+export const SanitizedOperationError = Schema.Struct({
+  code: Schema.String,
+  summary: Schema.String,
+  details: Schema.Record({ key: Schema.String, value: Schema.String })
+})
+export type SanitizedOperationError = typeof SanitizedOperationError.Type
+
+export const OperationActor = Schema.Union(
+  Schema.Struct({ kind: Schema.Literal("admin"), userId: UserId }),
+  Schema.Struct({ kind: Schema.Literal("scheduler") })
+)
+export type OperationActor = typeof OperationActor.Type
+
+export const Operation = Schema.Struct({
+  id: OperationId,
+  contestId: ContestId,
+  kind: OperationKind,
+  status: OperationStatus,
+  actor: OperationActor,
+  planDigest: Schema.String,
+  contestRevision: Schema.Int.pipe(Schema.positive()),
+  sanitizedError: Schema.NullOr(SanitizedOperationError),
+  createdAt: Schema.Int,
+  startedAt: Schema.NullOr(Schema.Int),
+  finishedAt: Schema.NullOr(Schema.Int)
+})
+export type Operation = typeof Operation.Type
+
+// Task 11: contest_artifacts 行を UI/公開 API に返すための wire schema。
+// domain の Artifact (Option verifiedAt) は境界を跨がないため、null 許容 struct
+// を境界にする(BenchJob/Operation と同じ方針)。storagePath は返さない
+// (path traversal の攻撃面を狭くする; download 経路は artifactId → ArtifactRepo
+// で解決するのが唯一の path source。)
+export const ArtifactKind = Schema.Literal("scoreboard", "scoreboard_csv", "snapshot")
+export type ArtifactKind = typeof ArtifactKind.Type
+
+export const ArtifactOffHostStatus = Schema.Literal("not_applicable", "pending", "verified")
+export type ArtifactOffHostStatus = typeof ArtifactOffHostStatus.Type
+
+export const Artifact = Schema.Struct({
+  id: ArtifactId,
+  contestId: ContestId,
+  kind: ArtifactKind,
+  sha256: Schema.String,
+  sizeBytes: Schema.Int.pipe(Schema.nonNegative()),
+  offHostStatus: ArtifactOffHostStatus,
+  verifiedAt: Schema.NullOr(Schema.Int),
+  createdAt: Schema.Int
+})
+export type Artifact = typeof Artifact.Type
+
+// POST /api/admin/artifacts/:artifactId/verify: 表示 SHA-256 を再入力して
+// off_host copy を "verified" に上げる。64 桁 hex (`[0-9a-f]{64}`) を強制する
+// (review round 1 finding 3: 空文字 / 非 hex を application まで通すと
+// 常に mismatch (409) になり、operator が「なぜ 409 か」を推測する必要が
+// 出るため、契約層で 422 に落とす)。
+export const VerifyArtifactRequest = Schema.Struct({
+  sha256: Schema.String.pipe(Schema.pattern(/^[0-9a-f]{64}$/))
+})
+export type VerifyArtifactRequest = typeof VerifyArtifactRequest.Type
+
+// Task 12: /api/admin/contests/:contestId/cleanup の payload。cleanup は
+// unmanaged_orphan の adopt 経路を持たない (reconciliation 責務)。plan は
+// サーバー側で adoptHostnames=[] 固定で再計算するため、payload は planDigest のみ。
+// review round 1 finding 1: adoptHostnames を残すと「非空を送ると必ず 409」と
+// なる罠なので、wire から外して曖昧さを排除する。
+export const CleanupApplyRequest = Schema.Struct({
+  planDigest: Schema.String
+})
+export type CleanupApplyRequest = typeof CleanupApplyRequest.Type
+
+// Task 13: OperationStep の wire schema。domain (OptionFromNullOr) との
+// 構造対応は BenchJob/Operation と同じ null 許容パターン。ハンドラは
+// Option.getOrNull で境界に畳んで返す。
+export const OperationStepStatus = Schema.Literal(
+  "queued",
+  "running",
+  "succeeded",
+  "failed",
+  "blocked",
+  "canceled"
+)
+export type OperationStepStatus = typeof OperationStepStatus.Type
+
+export const OperationStep = Schema.Struct({
+  id: OperationStepId,
+  operationId: OperationId,
+  ordinal: Schema.Int.pipe(Schema.nonNegative()),
+  stepKey: Schema.String,
+  status: OperationStepStatus,
+  attempt: Schema.Int.pipe(Schema.nonNegative()),
+  continueOnError: Schema.Boolean,
+  retryAt: Schema.NullOr(Schema.Int),
+  leaseExpiresAt: Schema.NullOr(Schema.Int),
+  inputSummary: Schema.String,
+  progressJson: Schema.String,
+  resultSummary: Schema.NullOr(Schema.String),
+  sanitizedError: Schema.NullOr(SanitizedOperationError),
+  createdAt: Schema.Int,
+  startedAt: Schema.NullOr(Schema.Int),
+  finishedAt: Schema.NullOr(Schema.Int)
+})
+export type OperationStep = typeof OperationStep.Type
+
+// Task 13: GET /api/admin/operations/:operationId の応答 body。
+// Operation aggregate に紐づく OperationStep 一覧を ordinal 昇順で載せる。
+// UI(OperationDetail)が step ごとの attempt/error/lease を可視化するために使う。
+export const OperationWithSteps = Schema.Struct({
+  ...Operation.fields,
+  steps: Schema.Array(OperationStep)
+})
+export type OperationWithSteps = typeof OperationWithSteps.Type

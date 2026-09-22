@@ -2,7 +2,7 @@ import { it } from "@effect/vitest"
 import { Effect, Either, Exit, Layer, Option, TestClock } from "effect"
 import { describe, expect } from "vitest"
 import { BenchJob, newJob, startJob } from "../../src/domain/benchJob.js"
-import { Contest } from "../../src/domain/contest.js"
+import type { Contest } from "../../src/domain/contest.js"
 import {
   CannotCancelRunning,
   ContestNotRunning,
@@ -10,36 +10,40 @@ import {
   TargetIpOutOfSubnet,
   TeamJobAlreadyQueued
 } from "../../src/domain/errors.js"
-import { BenchJobId, ContestId, TeamId, UserId } from "../../src/domain/ids.js"
-import { Team } from "../../src/domain/team.js"
+import { BenchJobId, InstanceId, TeamId, UserId } from "../../src/domain/ids.js"
 import { User } from "../../src/domain/user.js"
-import { Forbidden, NotInTeam } from "../../src/application/errors.js"
+import { Forbidden, InstanceNotRunning, NotInTeam } from "../../src/application/errors.js"
 import { BenchJobRepo } from "../../src/application/ports.js"
 import {
   cancelBench,
+  ContestNotPreparing,
   enqueueBench,
-  pollNextJob,
+  enqueueRehearsal,
+  listBenchJobs,
+  pollNextJobFor,
   reportFinish,
   reportProgress,
   sweepTimedOutJobs
 } from "../../src/application/usecases/bench.js"
+import { startContestUsecase } from "../../src/application/usecases/contest.js"
+import { DEFAULT_TEST_CONTEST_ID, makeContest, makeInstance, makeTeam } from "../support/factories.js"
 import {
   makeBenchJobRepoTest,
   makeContestRepoTest,
+  makeInstanceRepoTest,
   makeTeamRepoTest,
   RunnerConfigTest,
   UuidGenTest
 } from "../support/inMemory.js"
 
-const contestId = ContestId.make("11111111-1111-1111-1111-111111111111")
 const team1Id = TeamId.make("22222222-2222-2222-2222-222222222222")
 const team2Id = TeamId.make("33333333-3333-3333-3333-333333333333")
 const user1Id = UserId.make("44444444-4444-4444-4444-444444444444")
 const user2Id = UserId.make("55555555-5555-5555-5555-555555555555")
 const noTeamUserId = UserId.make("66666666-6666-6666-6666-666666666666")
 
-const team1 = new Team({ id: team1Id, name: "team1", teamNumber: 1 })
-const team2 = new Team({ id: team2Id, name: "team2", teamNumber: 2 })
+const team1 = makeTeam({ id: team1Id, name: "team1", teamNumber: 1 })
+const team2 = makeTeam({ id: team2Id, name: "team2", teamNumber: 2 })
 const user1 = new User({
   id: user1Id,
   githubId: 1,
@@ -57,35 +61,50 @@ const noTeamUser = new User({
   email: Option.none()
 })
 
-const makeContest = (status: Contest["status"]) =>
-  new Contest({ id: contestId, name: "INUCON", problemKey: "problem-1", status, instanceQuota: 3 })
-
 // startJob は queued な BenchJob からのみ成功するので、テストデータ作りは
 // 常に newJob() から作った queued ジョブを起点にする。
 const runningJobAt = (args: { id: BenchJobId; teamId: TeamId; targetIp: string; enqueuedAt: number; now: number }) =>
   Either.getOrThrow(
     startJob(
-      newJob({ id: args.id, teamId: args.teamId, targetIp: args.targetIp, targetPort: 8080, now: args.enqueuedAt }),
+      newJob({
+        id: args.id,
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        teamId: args.teamId,
+        targetIp: args.targetIp,
+        targetPort: 8080,
+        purpose: "competition",
+        now: args.enqueuedAt
+      }),
       args.now
     )
   )
 
+const queuedJob = (args: { id: BenchJobId; teamId: TeamId; targetIp: string; now: number }) =>
+  newJob({
+    id: args.id,
+    contestId: DEFAULT_TEST_CONTEST_ID,
+    teamId: args.teamId,
+    targetIp: args.targetIp,
+    targetPort: 8080,
+    purpose: "competition",
+    now: args.now
+  })
+
 const teamRepoLayer = makeTeamRepoTest({
   teams: [team1, team2],
   memberships: [
-    { userId: user1Id, teamId: team1Id },
-    { userId: user2Id, teamId: team2Id }
+    { contestId: DEFAULT_TEST_CONTEST_ID, userId: user1Id, teamId: team1Id },
+    { contestId: DEFAULT_TEST_CONTEST_ID, userId: user2Id, teamId: team2Id }
   ]
 })
-
 const testLayer = (
   contestStatus: Contest["status"],
-  jobs: ReadonlyArray<ReturnType<typeof newJob>> = [],
+  jobs: ReadonlyArray<BenchJob> = [],
   jobTimeoutMillis = 600_000
 ) =>
   Layer.mergeAll(
     UuidGenTest,
-    makeContestRepoTest(Option.some(makeContest(contestStatus))),
+    makeContestRepoTest([makeContest({ id: DEFAULT_TEST_CONTEST_ID, status: contestStatus })]),
     teamRepoLayer,
     makeBenchJobRepoTest(jobs),
     RunnerConfigTest(jobTimeoutMillis)
@@ -98,10 +117,11 @@ describe("enqueueBench", () => {
       expect(job.status).toBe("queued")
       expect(job.teamId).toBe(team1Id)
       expect(job.targetIp).toBe("10.100.1.5")
+      expect(job.purpose).toBe("competition")
     }).pipe(Effect.provide(testLayer("running")))
   )
 
-  it.effect("contest が preparing なら ContestNotRunning", () =>
+  it.effect("contest が preparing で 非 admin なら ContestNotRunning", () =>
     Effect.gen(function* () {
       const exit = yield* Effect.exit(enqueueBench({ user: user1, targetIp: "10.100.1.5", targetPort: 8080 }))
       expect(exit).toStrictEqual(Exit.fail(new ContestNotRunning({ status: "preparing" })))
@@ -115,11 +135,10 @@ describe("enqueueBench", () => {
     }).pipe(
       Effect.provide(
         testLayer("running", [
-          newJob({
+          queuedJob({
             id: BenchJobId.make("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
             teamId: team1Id,
             targetIp: "10.100.1.9",
-            targetPort: 8080,
             now: 1000
           })
         ])
@@ -142,6 +161,149 @@ describe("enqueueBench", () => {
   )
 })
 
+// preparing→running 遷移で queued rehearsal を残すと、runner は running phase で
+// purpose='competition' しか dequeue しないため orphan として queued に残り、
+// dashboard / 履歴 UI を汚す。同一チームの competition enqueue 自体は
+// iter 13 の insertIfAllowed purpose スコープ化で影響を受けないが、
+// startContestUsecase 側で orphan を掃除して起動後の状態を清潔に保つ。
+describe("startContestUsecase: preparing 中の queued rehearsal を running 遷移でキャンセルする", () => {
+  const admin1 = new User({ ...user1, isAdmin: true })
+
+  it.effect("admin の rehearsal が queued のまま start しても、member の competition enqueue が阻害されない", () =>
+    Effect.gen(function* () {
+      // 1. preparing: admin が rehearsal を enqueue → queued のまま runner が拾わない状態を模す。
+      const rehearsal = yield* enqueueBench({ user: admin1, targetIp: "10.100.1.5", targetPort: 8080 })
+      expect(rehearsal.status).toBe("queued")
+      expect(rehearsal.purpose).toBe("rehearsal")
+
+      // 2. startContestUsecase: preparing → running 遷移 + queued rehearsal を一括キャンセル。
+      yield* startContestUsecase
+
+      // 3. 同一チームの一般ユーザが competition を enqueue できる (rehearsal が
+      //    canceled でも queued でも insertIfAllowed は purpose-scoped なので
+      //    通るが、下記 4. で rehearsal が実際に canceled されていることを
+      //    確認する)。
+      const competition = yield* enqueueBench({ user: user1, targetIp: "10.100.1.5", targetPort: 8080 })
+      expect(competition.status).toBe("queued")
+      expect(competition.purpose).toBe("competition")
+      expect(competition.teamId).toBe(team1Id)
+
+      // 4. 元の rehearsal が canceled になっていることも直接確認する。
+      const jobs = yield* BenchJobRepo
+      const found = yield* jobs.findById(rehearsal.id)
+      expect(Option.isSome(found)).toBe(true)
+      if (Option.isSome(found)) {
+        expect(found.value.status).toBe("canceled")
+      }
+    }).pipe(Effect.provide(testLayer("preparing")))
+  )
+})
+
+// Task 10: enqueueRehearsal は admin 専用エンドポイントの usecase。
+// rehearsal は preparing / running Instance / TeamJobAlreadyQueued 契約を検証する。
+describe("enqueueRehearsal (Task 10)", () => {
+  const adminUser = new User({ ...user1, isAdmin: true })
+  const rehearsalInstanceId = InstanceId.make("i-team1-1")
+
+  const rehearsalLayer = (contestStatus: Contest["status"]) =>
+    Layer.mergeAll(
+      UuidGenTest,
+      makeContestRepoTest([makeContest({ id: DEFAULT_TEST_CONTEST_ID, status: contestStatus })]),
+      teamRepoLayer,
+      makeInstanceRepoTest([
+        makeInstance({
+          id: rehearsalInstanceId,
+          teamId: team1Id,
+          contestId: DEFAULT_TEST_CONTEST_ID,
+          index: 1,
+          vmid: 1101,
+          privateIp: "10.100.1.11",
+          status: "running"
+        })
+      ]),
+      makeBenchJobRepoTest([]),
+      RunnerConfigTest(600_000)
+    )
+
+  it.effect("admin + preparing + running Instance → rehearsal BenchJob が queued で返る", () =>
+    Effect.gen(function* () {
+      const job = yield* enqueueRehearsal({
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        instanceId: rehearsalInstanceId,
+        actor: adminUser
+      })
+      expect(job.status).toBe("queued")
+      expect(job.purpose).toBe("rehearsal")
+      expect(job.targetIp).toBe("10.100.1.11")
+      expect(job.teamId).toBe(team1Id)
+    }).pipe(Effect.provide(rehearsalLayer("preparing")))
+  )
+
+  it.effect("非 admin は Forbidden (privateIp / VMID を漏らさない)", () =>
+    Effect.gen(function* () {
+      const exit = yield* Effect.exit(
+        enqueueRehearsal({
+          contestId: DEFAULT_TEST_CONTEST_ID,
+          instanceId: rehearsalInstanceId,
+          actor: user1
+        })
+      )
+      expect(exit).toStrictEqual(Exit.fail(new Forbidden()))
+    }).pipe(Effect.provide(rehearsalLayer("preparing")))
+  )
+
+  it.effect("Contest が running のときは ContestNotPreparing で拒否 (競争中に rehearsal は投げない)", () =>
+    Effect.gen(function* () {
+      const exit = yield* Effect.exit(
+        enqueueRehearsal({
+          contestId: DEFAULT_TEST_CONTEST_ID,
+          instanceId: rehearsalInstanceId,
+          actor: adminUser
+        })
+      )
+      expect(exit).toStrictEqual(Exit.fail(new ContestNotPreparing({ status: "running" })))
+    }).pipe(Effect.provide(rehearsalLayer("running")))
+  )
+
+  it.effect("Instance が running でなければ InstanceNotRunning", () =>
+    Effect.gen(function* () {
+      const exit = yield* Effect.exit(
+        enqueueRehearsal({
+          contestId: DEFAULT_TEST_CONTEST_ID,
+          instanceId: rehearsalInstanceId,
+          actor: adminUser
+        })
+      )
+      expect(exit).toStrictEqual(
+        Exit.fail(new InstanceNotRunning({ instanceId: rehearsalInstanceId }))
+      )
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          UuidGenTest,
+          makeContestRepoTest([
+            makeContest({ id: DEFAULT_TEST_CONTEST_ID, status: "preparing" })
+          ]),
+          teamRepoLayer,
+          makeInstanceRepoTest([
+            makeInstance({
+              id: rehearsalInstanceId,
+              teamId: team1Id,
+              contestId: DEFAULT_TEST_CONTEST_ID,
+              index: 1,
+              vmid: 1101,
+              privateIp: "10.100.1.11",
+              status: "creating"
+            })
+          ]),
+          makeBenchJobRepoTest([]),
+          RunnerConfigTest(600_000)
+        )
+      )
+    )
+  )
+})
+
 describe("cancelBench", () => {
   const jobId = BenchJobId.make("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 
@@ -151,9 +313,7 @@ describe("cancelBench", () => {
       expect(job.status).toBe("canceled")
     }).pipe(
       Effect.provide(
-        testLayer("running", [
-          newJob({ id: jobId, teamId: team1Id, targetIp: "10.100.1.9", targetPort: 8080, now: 1000 })
-        ])
+        testLayer("running", [queuedJob({ id: jobId, teamId: team1Id, targetIp: "10.100.1.9", now: 1000 })])
       )
     )
   )
@@ -177,9 +337,7 @@ describe("cancelBench", () => {
       expect(exit).toStrictEqual(Exit.fail(new Forbidden()))
     }).pipe(
       Effect.provide(
-        testLayer("running", [
-          newJob({ id: jobId, teamId: team2Id, targetIp: "10.100.2.9", targetPort: 8080, now: 1000 })
-        ])
+        testLayer("running", [queuedJob({ id: jobId, teamId: team2Id, targetIp: "10.100.2.9", now: 1000 })])
       )
     )
   )
@@ -190,34 +348,52 @@ describe("cancelBench", () => {
       expect(exit).toStrictEqual(Exit.fail(new Forbidden()))
     }).pipe(Effect.provide(testLayer("running", [])))
   )
+
+  // Task 3 認可: admin は cancelBench でチーム所有者チェックを素通りする
+  // (ダッシュボードから任意チームの queued ジョブを止められる)。
+  // !args.user.isAdmin ブランチが誤って強化されると発火する。
+  const otherTeamJobId = BenchJobId.make("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+  const adminUser = new User({ ...user1, isAdmin: true })
+
+  it.effect("admin は他チームの queued ジョブを cancel できる", () =>
+    Effect.gen(function* () {
+      const canceled = yield* cancelBench({ user: adminUser, jobId: otherTeamJobId })
+      expect(canceled.status).toBe("canceled")
+      expect(canceled.teamId).toBe(team2Id)
+    }).pipe(
+      Effect.provide(
+        testLayer("running", [queuedJob({ id: otherTeamJobId, teamId: team2Id, targetIp: "10.100.2.9", now: 1000 })])
+      )
+    )
+  )
 })
 
-describe("pollNextJob", () => {
+describe("pollNextJobFor: running contest + competition purpose", () => {
+  const runningCompetition = { contestId: DEFAULT_TEST_CONTEST_ID, purpose: "competition" as const }
+
   it.effect("queued 2 本(team1 が古い)→ team1 が running で返り、次は None", () =>
     Effect.gen(function* () {
-      const first = yield* pollNextJob
+      const first = yield* pollNextJobFor(runningCompetition)
       expect(Option.isSome(first)).toBe(true)
       if (Option.isSome(first)) {
         expect(first.value.teamId).toBe(team1Id)
         expect(first.value.status).toBe("running")
       }
-      const second = yield* pollNextJob
+      const second = yield* pollNextJobFor(runningCompetition)
       expect(second).toStrictEqual(Option.none())
     }).pipe(
       Effect.provide(
         testLayer("running", [
-          newJob({
+          queuedJob({
             id: BenchJobId.make("cccccccc-cccc-cccc-cccc-cccccccccccc"),
             teamId: team1Id,
             targetIp: "10.100.1.9",
-            targetPort: 8080,
             now: 1000
           }),
-          newJob({
+          queuedJob({
             id: BenchJobId.make("dddddddd-dddd-dddd-dddd-dddddddddddd"),
             teamId: team2Id,
             targetIp: "10.100.2.9",
-            targetPort: 8080,
             now: 2000
           })
         ])
@@ -255,9 +431,7 @@ describe("reportProgress", () => {
       )
     }).pipe(
       Effect.provide(
-        testLayer("running", [
-          newJob({ id: jobId, teamId: team1Id, targetIp: "10.100.1.9", targetPort: 8080, now: 1000 })
-        ])
+        testLayer("running", [queuedJob({ id: jobId, teamId: team1Id, targetIp: "10.100.1.9", now: 1000 })])
       )
     )
   )
@@ -287,9 +461,7 @@ describe("reportFinish", () => {
       expect(exit).toStrictEqual(Exit.fail(new InvalidJobTransition({ jobId, from: "queued", action: "finish" })))
     }).pipe(
       Effect.provide(
-        testLayer("running", [
-          newJob({ id: jobId, teamId: team1Id, targetIp: "10.100.1.9", targetPort: 8080, now: 1000 })
-        ])
+        testLayer("running", [queuedJob({ id: jobId, teamId: team1Id, targetIp: "10.100.1.9", now: 1000 })])
       )
     )
   )
@@ -298,11 +470,10 @@ describe("reportFinish", () => {
 describe("sweepTimedOutJobs", () => {
   const staleId = BenchJobId.make("11111111-2222-3333-4444-555555555555")
   const freshId = BenchJobId.make("66666666-7777-8888-9999-000000000000")
-  const jobTimeoutMillis = 600_000 // 10 分
+  const jobTimeoutMillis = 600_000
 
   it.effect("進捗途絶(10 分超)の running は failed(timeout) になり、直近進捗ありは無傷", () =>
     Effect.gen(function* () {
-      // now=700_000, timeout=600_000 → cutoff=100_000
       yield* TestClock.setTime(700_000)
       const count = yield* sweepTimedOutJobs
       expect(count).toBe(1)
@@ -326,11 +497,11 @@ describe("sweepTimedOutJobs", () => {
           [
             new BenchJob({
               ...runningJobAt({ id: staleId, teamId: team1Id, targetIp: "10.100.1.9", enqueuedAt: 0, now: 0 }),
-              lastProgressAt: Option.some(0) // 700_000 - 0 > timeout → 対象
+              lastProgressAt: Option.some(0)
             }),
             new BenchJob({
               ...runningJobAt({ id: freshId, teamId: team2Id, targetIp: "10.100.2.9", enqueuedAt: 0, now: 0 }),
-              lastProgressAt: Option.some(650_000) // 700_000 - 650_000 < timeout → 無傷
+              lastProgressAt: Option.some(650_000)
             })
           ],
           jobTimeoutMillis
@@ -341,13 +512,10 @@ describe("sweepTimedOutJobs", () => {
 
   it.effect("reportFinish 済みのジョブは cutoff 条件を満たしても failed にならない(件数 0)", () =>
     Effect.gen(function* () {
-      // running(lastProgressAt=0)のジョブを先に finish してから sweep する。
-      // 判定と更新が原子的でない実装だと、finished を failed で上書きしうる
-      // 競合(TOCTOU)の代表ケース。
       const finished = yield* reportFinish({ jobId: staleId, score: 100, passed: true })
       expect(finished.status).toBe("finished")
 
-      yield* TestClock.setTime(700_000) // cutoff=100_000、lastProgressAt=0 < cutoff
+      yield* TestClock.setTime(700_000)
       const count = yield* sweepTimedOutJobs
       expect(count).toBe(0)
 
@@ -375,15 +543,10 @@ describe("sweepTimedOutJobs", () => {
   )
 })
 
-// reportProgress/reportFinish/cancel を「判定+更新」を単一の原子的操作に
-// 寄せた(recordProgressIfRunning/finishIfRunning/cancelIfQueued)ことの回帰
-// テスト。sweep や dequeue が先にジョブの状態を変えてしまうケースで、後続の
-// ユースケースが古い状態を前提に上書きしないことを確認する。
 describe("状態遷移の競合(TOCTOU 回帰)", () => {
   it.effect("sweep で failed になったジョブへの reportFinish は InvalidJobTransition で失敗し failed のまま", () =>
     Effect.gen(function* () {
       const staleId = BenchJobId.make("77777777-8888-9999-aaaa-bbbbbbbbbbbb")
-      // now=700_000, timeout=600_000 → cutoff=100_000。lastProgressAt=0 は対象。
       yield* TestClock.setTime(700_000)
       const count = yield* sweepTimedOutJobs
       expect(count).toBe(1)
@@ -425,7 +588,7 @@ describe("状態遷移の競合(TOCTOU 回帰)", () => {
     Effect.gen(function* () {
       const queuedId = BenchJobId.make("99999999-aaaa-bbbb-cccc-dddddddddddd")
 
-      const dequeued = yield* pollNextJob
+      const dequeued = yield* pollNextJobFor({ contestId: DEFAULT_TEST_CONTEST_ID, purpose: "competition" })
       expect(Option.isSome(dequeued)).toBe(true)
       if (Option.isSome(dequeued)) {
         expect(dequeued.value.status).toBe("running")
@@ -443,12 +606,50 @@ describe("状態遷移の競合(TOCTOU 回帰)", () => {
     }).pipe(
       Effect.provide(
         testLayer("running", [
-          newJob({
+          queuedJob({
             id: BenchJobId.make("99999999-aaaa-bbbb-cccc-dddddddddddd"),
             teamId: team1Id,
             targetIp: "10.100.1.9",
-            targetPort: 8080,
             now: 1000
+          })
+        ])
+      )
+    )
+  )
+})
+
+// Task 3: listBenchJobs は「今 display すべき contest」を返す (getDisplay)。
+// contest が finished でも履歴が見えなければならない (アーカイブ表示)。
+// この regression テストは getOperational に戻ると failing になる (finished
+// では None → [] になる)。
+describe("listBenchJobs: finished contest でも履歴を返す", () => {
+  const finishedJobId = BenchJobId.make("ffffffff-ffff-ffff-ffff-ffffffffffff")
+
+  it.effect("contest.status='finished' でも自チームの finished job が list される", () =>
+    Effect.gen(function* () {
+      const jobs = yield* listBenchJobs({ teamId: team1Id })
+      expect(jobs.length).toBe(1)
+      expect(jobs[0]?.id).toBe(finishedJobId)
+      expect(jobs[0]?.status).toBe("finished")
+      expect(jobs[0]?.teamId).toBe(team1Id)
+    }).pipe(
+      Effect.provide(
+        testLayer("finished", [
+          new BenchJob({
+            id: finishedJobId,
+            contestId: DEFAULT_TEST_CONTEST_ID,
+            teamId: team1Id,
+            targetIp: "10.100.1.9",
+            targetPort: 8080,
+            status: "finished",
+            purpose: "competition",
+            score: Option.some(1234),
+            passed: Option.some(true),
+            errorMessage: Option.none(),
+            enqueuedAt: 1000,
+            startedAt: Option.some(2000),
+            finishedAt: Option.some(3000),
+            lastProgressAt: Option.some(2500)
           })
         ])
       )

@@ -21,3 +21,18 @@ export type BenchJobId = typeof BenchJobId.Type
 
 export const SessionId = Schema.String.pipe(Schema.brand("SessionId"))
 export type SessionId = typeof SessionId.Type
+
+// Task 1: 後続タスク (Task 6, 7, 11) が使う durable Operation / ResourceBinding /
+// Artifact の識別子。ここでブランドを定義しておくことで、shared 側 wire schema
+// (Task 6-) と domain 型を同じ名前で参照できる。
+export const OperationId = Schema.String.pipe(Schema.brand("OperationId"))
+export type OperationId = typeof OperationId.Type
+
+export const OperationStepId = Schema.String.pipe(Schema.brand("OperationStepId"))
+export type OperationStepId = typeof OperationStepId.Type
+
+export const ResourceBindingId = Schema.String.pipe(Schema.brand("ResourceBindingId"))
+export type ResourceBindingId = typeof ResourceBindingId.Type
+
+export const ArtifactId = Schema.String.pipe(Schema.brand("ArtifactId"))
+export type ArtifactId = typeof ArtifactId.Type

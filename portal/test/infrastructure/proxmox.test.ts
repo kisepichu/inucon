@@ -2,7 +2,7 @@ import { HttpClient, HttpClientRequest, HttpClientResponse } from "@effect/platf
 import { it } from "@effect/vitest"
 import { ConfigProvider, Effect, Either, Exit, Fiber, Layer, Option, TestClock } from "effect"
 import { describe, expect } from "vitest"
-import { ProvisionTimeout, ProxmoxError, ProxmoxPort } from "../../src/application/ports.js"
+import { ModeTransitionTimeout, ProvisionTimeout, ProxmoxError, ProxmoxPort } from "../../src/application/ports.js"
 import {
   ProxmoxLive,
   resolveProxmoxTlsPolicy,
@@ -119,6 +119,13 @@ const makeFakeProxmox = (
         return Effect.succeed(jsonResponse(request, { errors: "no such VM" }, 404))
       }
       const upid = registerTask("start")
+      return Effect.succeed(jsonResponse(request, { data: upid }))
+    }
+
+    // shutdown (Task 8)
+    const shutdownMatch = path.match(/^\/api2\/json\/nodes\/eevee\/qemu\/(\d+)\/status\/shutdown$/)
+    if (shutdownMatch && method === "POST") {
+      const upid = registerTask("shutdown")
       return Effect.succeed(jsonResponse(request, { data: upid }))
     }
 
@@ -741,6 +748,84 @@ describe("getNodeFreeMemBytes", () => {
   )
 })
 
+// Task 7: reconciliation 向けの inventory メソッド。qemu 一覧を叩いて
+// name が `^inucon-team[0-9]+-[0-9]+$` に一致する VM のみ返す(catch-all や
+// devvm/benchvm 等は絶対に混ぜない)。
+describe("listManagedVms", () => {
+  const inventoryClient = (vms: ReadonlyArray<{
+    vmid: number
+    name: string
+    status: "running" | "stopped"
+    mem?: number
+  }>) =>
+    HttpClient.make((request) => {
+      if (urlPath(request) === "/api2/json/nodes/eevee/qemu" && request.method === "GET") {
+        return Effect.succeed(
+          jsonResponse(request, {
+            data: vms.map((v) => ({
+              vmid: v.vmid,
+              name: v.name,
+              status: v.status,
+              maxmem: v.mem ?? 4 * 1024 * 1024 * 1024
+            }))
+          })
+        )
+      }
+      return Effect.succeed(jsonResponse(request, { errors: "not found" }, 404))
+    })
+
+  it.effect("`^inucon-team[0-9]+-[0-9]+$` に完全一致する VM のみを返す", () =>
+    Effect.gen(function* () {
+      const client = inventoryClient([
+        { vmid: 1101, name: "inucon-team1-1", status: "running" },
+        { vmid: 1102, name: "inucon-team1-2", status: "stopped" },
+        { vmid: 2201, name: "inucon-team2-1", status: "running" },
+        // 除外対象:
+        { vmid: 9100, name: "inucon-template", status: "stopped" },
+        { vmid: 9300, name: "devvm", status: "running" },
+        { vmid: 9200, name: "benchvm", status: "stopped" },
+        { vmid: 3000, name: "inucon-team1-1-clone", status: "stopped" },
+        { vmid: 3001, name: "team1-1", status: "running" }
+      ])
+      const layer = ProxmoxLive.pipe(
+        Layer.provide(Layer.succeed(HttpClient.HttpClient, client)),
+        Layer.provide(configLayer)
+      )
+      const vms = yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.listManagedVms),
+        Effect.provide(layer)
+      )
+      expect(vms.map((v) => v.name).sort()).toStrictEqual([
+        "inucon-team1-1",
+        "inucon-team1-2",
+        "inucon-team2-1"
+      ])
+      expect(vms.find((v) => v.name === "inucon-team1-1")).toMatchObject({
+        vmid: 1101,
+        status: "running"
+      })
+    })
+  )
+
+  it.effect("HTTP エラーは ProxmoxError", () =>
+    Effect.gen(function* () {
+      const brokenClient = HttpClient.make((request) =>
+        Effect.succeed(jsonResponse(request, { errors: "boom" }, 500))
+      )
+      const brokenLayer = ProxmoxLive.pipe(
+        Layer.provide(Layer.succeed(HttpClient.HttpClient, brokenClient)),
+        Layer.provide(configLayer)
+      )
+      const error = yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.listManagedVms),
+        Effect.provide(brokenLayer),
+        Effect.flip
+      )
+      expect(error).toBeInstanceOf(ProxmoxError)
+    })
+  )
+})
+
 describe("resolveProxmoxTlsPolicy(TLS 方針の決定、純粋関数)", () => {
   it("PROXMOX_TLS_INSECURE=true なら insecure(検証スキップ)", () => {
     const policy = resolveProxmoxTlsPolicy({ insecure: true, fingerprint: Option.none() })
@@ -812,4 +897,381 @@ describe("verifyInsecureHost(insecure 分岐のホスト限定、純粋関数)",
   it("ホスト名の大小差は許容する(case-insensitive)", () => {
     expect(verifyInsecureHost("Eevee.Kisen.One", "eevee.kisen.one")).toBeUndefined()
   })
+})
+
+// Task 8: split provision/mode credentials + infrastructure inventory +
+// mode power primitives。
+
+const splitConfigLayer = Layer.setConfigProvider(
+  ConfigProvider.fromMap(
+    new Map([
+      ["PROXMOX_API_URL", "https://192.0.2.10:8006/api2/json"],
+      ["PROXMOX_PROVISION_TOKEN_ID", "inucon-provision@pve!portal-1"],
+      ["PROXMOX_PROVISION_TOKEN_SECRET", "provision-secret"],
+      ["PROXMOX_MODE_TOKEN_ID", "inucon-mode@pve!portal-1"],
+      ["PROXMOX_MODE_TOKEN_SECRET", "mode-secret"]
+    ])
+  )
+)
+
+describe("Proxmox credential configuration (Task 8)", () => {
+  it.effect("四つの split fields が揃っていれば Layer 構築成功", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox()
+      const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(splitConfigLayer))
+      // 何らかの実 API を叩いて Layer が起動できることだけ確認する。
+      yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.getNodeFreeMemBytes),
+        Effect.provide(port)
+      )
+    })
+  )
+
+  it.effect("split 四つのうち一部だけ設定されている場合は Layer 構築が失敗する(部分設定禁止)", () =>
+    Effect.gen(function* () {
+      const partialLayer = Layer.setConfigProvider(
+        ConfigProvider.fromMap(
+          new Map([
+            ["PROXMOX_API_URL", "https://192.0.2.10:8006/api2/json"],
+            ["PROXMOX_PROVISION_TOKEN_ID", "inucon-provision@pve!portal-1"],
+            // PROXMOX_PROVISION_TOKEN_SECRET を欠落させる
+            ["PROXMOX_MODE_TOKEN_ID", "inucon-mode@pve!portal-1"],
+            ["PROXMOX_MODE_TOKEN_SECRET", "mode-secret"]
+          ])
+        )
+      )
+      const fake = makeFakeProxmox()
+      const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(partialLayer))
+      const exit = yield* Effect.exit(
+        ProxmoxPort.pipe(
+          Effect.flatMap((px) => px.getNodeFreeMemBytes),
+          Effect.provide(port)
+        )
+      )
+      expect(Exit.isFailure(exit)).toBe(true)
+    })
+  )
+
+  it.effect("四つの split がすべて未設定なら legacy PROXMOX_TOKEN_ID/SECRET を両クライアントで受け入れる(rolling migration)", () =>
+    Effect.gen(function* () {
+      const legacyLayer = Layer.setConfigProvider(
+        ConfigProvider.fromMap(
+          new Map([
+            ["PROXMOX_API_URL", "https://192.0.2.10:8006/api2/json"],
+            ["PROXMOX_TOKEN_ID", "portal@pve!inucon"],
+            ["PROXMOX_TOKEN_SECRET", "legacy-secret"]
+          ])
+        )
+      )
+      const fake = makeFakeProxmox()
+      const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(legacyLayer))
+      yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.getNodeFreeMemBytes),
+        Effect.provide(port)
+      )
+      // node status リクエストの Authorization ヘッダは legacy tuple を使う。
+      const req = fake.requests.find((r) => urlPath(r) === "/api2/json/nodes/eevee/status")
+      expect(req!.headers.authorization).toBe("PVEAPIToken=portal@pve!inucon=legacy-secret")
+    })
+  )
+
+  it.effect("split と legacy が同居していたら split を採用する(migration 途中の安全側)", () =>
+    Effect.gen(function* () {
+      const bothLayer = Layer.setConfigProvider(
+        ConfigProvider.fromMap(
+          new Map([
+            ["PROXMOX_API_URL", "https://192.0.2.10:8006/api2/json"],
+            ["PROXMOX_PROVISION_TOKEN_ID", "inucon-provision@pve!portal-1"],
+            ["PROXMOX_PROVISION_TOKEN_SECRET", "provision-secret"],
+            ["PROXMOX_MODE_TOKEN_ID", "inucon-mode@pve!portal-1"],
+            ["PROXMOX_MODE_TOKEN_SECRET", "mode-secret"],
+            ["PROXMOX_TOKEN_ID", "portal@pve!inucon"],
+            ["PROXMOX_TOKEN_SECRET", "legacy-secret"]
+          ])
+        )
+      )
+      const fake = makeFakeProxmox()
+      const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(bothLayer))
+      yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.cloneVm({ templateVmid: 9100, newVmid: 1101, name: "inucon-team1-1" })),
+        Effect.provide(port)
+      )
+      const cloneReq = fake.requests.find((r) => urlPath(r).endsWith("/qemu/9100/clone"))
+      // provision 系(cloneVm)は provision credential を使う。
+      expect(cloneReq!.headers.authorization).toBe(
+        "PVEAPIToken=inucon-provision@pve!portal-1=provision-secret"
+      )
+    })
+  )
+
+  it.effect("mode primitive(shutdownVm/setVmOnBoot 等)は mode credential を使い、provision credential は使わない", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox()
+      const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(splitConfigLayer))
+      yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.setVmOnBoot(9200, true)),
+        Effect.provide(port)
+      )
+      const configReq = fake.requests.find(
+        (r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/9200/config" && r.method === "POST"
+      )
+      expect(configReq!.headers.authorization).toBe(
+        "PVEAPIToken=inucon-mode@pve!portal-1=mode-secret"
+      )
+    })
+  )
+})
+
+// setVmOnBoot: /nodes/eevee/qemu/:vmid/config を POST し、onboot パラメータを書く。
+describe("setVmOnBoot", () => {
+  it.effect("enabled=true なら onboot=1 を POST する", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox()
+      const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(configLayer))
+      yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.setVmOnBoot(9200, true)),
+        Effect.provide(port)
+      )
+      const req = fake.requests.find(
+        (r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/9200/config" && r.method === "POST"
+      )
+      const params = bodyParams(req!)
+      expect(params.get("onboot")).toBe("1")
+    })
+  )
+
+  it.effect("enabled=false なら onboot=0 を POST する", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox()
+      const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(configLayer))
+      yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.setVmOnBoot(9300, false)),
+        Effect.provide(port)
+      )
+      const req = fake.requests.find(
+        (r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/9300/config" && r.method === "POST"
+      )
+      expect(bodyParams(req!).get("onboot")).toBe("0")
+    })
+  )
+})
+
+// shutdownVm: /nodes/eevee/qemu/:vmid/status/shutdown を POST。force stop は絶対に呼ばない。
+describe("shutdownVm", () => {
+  it.effect("guest shutdown を POST し、force stop は呼ばない", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox()
+      const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(configLayer))
+      yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.shutdownVm(9300)),
+        Effect.provide(port)
+      )
+      const shutdownReq = fake.requests.find(
+        (r) => urlPath(r) === "/api2/json/nodes/eevee/qemu/9300/status/shutdown" && r.method === "POST"
+      )
+      expect(shutdownReq).toBeDefined()
+      const stopReq = fake.requests.find((r) => urlPath(r).endsWith("/status/stop"))
+      expect(stopReq).toBeUndefined()
+    })
+  )
+})
+
+// waitForVmStatus: TestClock で status/current が期待値に達するまで poll し、
+// timeout に達したら ModeTransitionTimeout。
+describe("waitForVmStatus", () => {
+  it.effect("status が期待値に到達すれば成功", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox()
+      const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(configLayer))
+      // 現状 fake の status/current は 'running' を返す
+      yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.waitForVmStatus(9300, "running", 5_000)),
+        Effect.provide(port)
+      )
+    })
+  )
+
+  it.effect("timeoutMillis を超えると ModeTransitionTimeout", () =>
+    Effect.gen(function* () {
+      const fake = makeFakeProxmox() // status/current always 'running'
+      const port = ProxmoxLive.pipe(Layer.provide(fake.layer), Layer.provide(configLayer))
+      const fiber = yield* Effect.fork(
+        ProxmoxPort.pipe(
+          Effect.flatMap((px) => px.waitForVmStatus(9300, "stopped", 5_000)),
+          Effect.provide(port)
+        )
+      )
+      yield* TestClock.adjust("10 seconds")
+      const result = yield* Fiber.join(fiber).pipe(Effect.either)
+      expect(Either.isLeft(result)).toBe(true)
+      if (Either.isLeft(result)) {
+        expect(result.left).toBeInstanceOf(ModeTransitionTimeout)
+      }
+    })
+  )
+})
+
+// getInfrastructureInventory: 単一呼び出しで template/devvm/benchvm/team slots/isolation/memory を返す。
+describe("getInfrastructureInventory", () => {
+  const inventoryClient = (opts: {
+    vms: ReadonlyArray<{ vmid: number; name: string; status: "running" | "stopped"; mem?: number; onBoot?: 0 | 1 }>
+    networks: ReadonlyArray<{ iface: string }>
+    benchvmBridges: ReadonlyArray<string>
+    isolationStatus: "active" | "inactive"
+    memoryFreeBytes?: number
+  }) =>
+    HttpClient.make((request) => {
+      const path = urlPath(request)
+      if (path === "/api2/json/nodes/eevee/status" && request.method === "GET") {
+        return Effect.succeed(
+          jsonResponse(request, {
+            data: { memory: { free: opts.memoryFreeBytes ?? 20_000_000_000 } }
+          })
+        )
+      }
+      if (path === "/api2/json/nodes/eevee/qemu" && request.method === "GET") {
+        return Effect.succeed(
+          jsonResponse(request, {
+            data: opts.vms.map((v) => ({
+              vmid: v.vmid,
+              name: v.name,
+              status: v.status,
+              maxmem: v.mem ?? 4 * 1024 * 1024 * 1024,
+              onboot: v.onBoot ?? 0,
+              // Task 8: template VM は Proxmox 側 template=1 で返る。テストは
+              // 名前に "template" を含むかで template=1 を返し、それ以外は 0。
+              template: v.name.includes("template") ? 1 : 0
+            }))
+          })
+        )
+      }
+      if (path === "/api2/json/nodes/eevee/network" && request.method === "GET") {
+        return Effect.succeed(
+          jsonResponse(request, { data: opts.networks.map((n) => ({ iface: n.iface, type: "bridge" })) })
+        )
+      }
+      // benchvm config
+      if (
+        path === "/api2/json/nodes/eevee/qemu/9200/config" &&
+        request.method === "GET"
+      ) {
+        const cfg: Record<string, unknown> = { name: "benchvm" }
+        opts.benchvmBridges.forEach((br, i) => {
+          cfg[`net${i}`] = `virtio,bridge=${br},firewall=0`
+        })
+        return Effect.succeed(jsonResponse(request, { data: cfg }))
+      }
+      // isolation service
+      if (
+        path === "/api2/json/nodes/eevee/services/inucon-team-isolation/state" &&
+        request.method === "GET"
+      ) {
+        return Effect.succeed(
+          jsonResponse(request, { data: { state: opts.isolationStatus === "active" ? "running" : "inactive" } })
+        )
+      }
+      return Effect.succeed(jsonResponse(request, { errors: "not found" }, 404))
+    })
+
+  it.effect("template + devvm + benchvm + team slots + isolation + memory を単発 inventory で返す", () =>
+    Effect.gen(function* () {
+      const client = inventoryClient({
+        vms: [
+          { vmid: 9100, name: "inucon-template", status: "stopped", mem: 2 * 1024 * 1024 * 1024 },
+          { vmid: 9300, name: "devvm", status: "running", mem: 8 * 1024 * 1024 * 1024, onBoot: 1 },
+          { vmid: 9200, name: "benchvm", status: "stopped", mem: 4 * 1024 * 1024 * 1024, onBoot: 0 }
+        ],
+        networks: [{ iface: "team1" }, { iface: "team2" }, { iface: "vmbr0" }],
+        benchvmBridges: ["team1", "team2", "vmbr0"],
+        isolationStatus: "active",
+        memoryFreeBytes: 6_000_000_000
+      })
+      const port = ProxmoxLive.pipe(
+        Layer.provide(Layer.succeed(HttpClient.HttpClient, client)),
+        Layer.provide(configLayer)
+      )
+      const inv = yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.getInfrastructureInventory),
+        Effect.provide(port)
+      )
+      expect(inv.templateExists).toBe(true)
+      expect(inv.devvm).toMatchObject({ vmid: 9300, status: "running", onBoot: true })
+      expect(inv.benchvm).toMatchObject({ vmid: 9200, status: "stopped", onBoot: false })
+      expect([...inv.preparedTeamNumbers].sort()).toEqual([1, 2])
+      expect(inv.isolationServiceActive).toBe(true)
+      expect(inv.nodeFreeMemBytes).toBe(6_000_000_000)
+    })
+  )
+
+  it.effect("preparedTeamNumbers は 'node network の teamN' と 'benchvm config bridges' の積集合", () =>
+    Effect.gen(function* () {
+      const client = inventoryClient({
+        vms: [
+          { vmid: 9100, name: "inucon-template", status: "stopped" },
+          { vmid: 9300, name: "devvm", status: "running" },
+          { vmid: 9200, name: "benchvm", status: "stopped" }
+        ],
+        networks: [{ iface: "team1" }, { iface: "team2" }, { iface: "team3" }],
+        // benchvm 側は team1/team2 だけ持つ → team3 は使えない
+        benchvmBridges: ["team1", "team2"],
+        isolationStatus: "active"
+      })
+      const port = ProxmoxLive.pipe(
+        Layer.provide(Layer.succeed(HttpClient.HttpClient, client)),
+        Layer.provide(configLayer)
+      )
+      const inv = yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.getInfrastructureInventory),
+        Effect.provide(port)
+      )
+      expect([...inv.preparedTeamNumbers].sort()).toEqual([1, 2])
+    })
+  )
+
+  it.effect("template VM が inventory に存在しなければ templateExists=false", () =>
+    Effect.gen(function* () {
+      const client = inventoryClient({
+        vms: [
+          { vmid: 9300, name: "devvm", status: "running" },
+          { vmid: 9200, name: "benchvm", status: "stopped" }
+        ],
+        networks: [],
+        benchvmBridges: [],
+        isolationStatus: "active"
+      })
+      const port = ProxmoxLive.pipe(
+        Layer.provide(Layer.succeed(HttpClient.HttpClient, client)),
+        Layer.provide(configLayer)
+      )
+      const inv = yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.getInfrastructureInventory),
+        Effect.provide(port)
+      )
+      expect(inv.templateExists).toBe(false)
+    })
+  )
+
+  it.effect("isolation service が inactive/未定義なら isolationServiceActive=false", () =>
+    Effect.gen(function* () {
+      const client = inventoryClient({
+        vms: [
+          { vmid: 9100, name: "inucon-template", status: "stopped" },
+          { vmid: 9300, name: "devvm", status: "running" },
+          { vmid: 9200, name: "benchvm", status: "stopped" }
+        ],
+        networks: [{ iface: "team1" }, { iface: "team2" }],
+        benchvmBridges: ["team1", "team2"],
+        isolationStatus: "inactive"
+      })
+      const port = ProxmoxLive.pipe(
+        Layer.provide(Layer.succeed(HttpClient.HttpClient, client)),
+        Layer.provide(configLayer)
+      )
+      const inv = yield* ProxmoxPort.pipe(
+        Effect.flatMap((px) => px.getInfrastructureInventory),
+        Effect.provide(port)
+      )
+      expect(inv.isolationServiceActive).toBe(false)
+    })
+  )
 })

@@ -43,12 +43,16 @@ spec:
               value: "3000"
             - name: DB_PATH
               value: /data/portal.db
+            - name: BACKUP_PATH
+              value: /backups
           envFrom:
             - secretRef:
                 name: inucon-portal-env
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: backups
+              mountPath: /backups
           readinessProbe:
             httpGet:
               path: /api/health
@@ -72,3 +76,6 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: inucon-portal-data
+        - name: backups
+          persistentVolumeClaim:
+            claimName: inucon-portal-backups

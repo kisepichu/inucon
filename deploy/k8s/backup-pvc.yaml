@@ -1,0 +1,20 @@
+# Task 11: contest ごとの archive artifact (scoreboard JSON/CSV + DB snapshot)
+# を書き出す PVC。inucon-portal-data(SQLite 本体)とは別 PVC で、
+# ReadWriteOnce + replicas=1 前提。local-path-provisioner(k3s 同梱)を使う。
+#
+# 容量は 5Gi:
+#   - 1 開催回あたり scoreboard JSON/CSV は数 KB、DB snapshot は < 100MB を想定。
+#   - 過去 30 回分の履歴を残しても余裕がある大きさに設定する。
+#   - 縮小はできないため、初期割り当ては控えめに。
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: inucon-portal-backups
+  namespace: inucon
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi

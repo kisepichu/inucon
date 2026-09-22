@@ -11,26 +11,18 @@ import {
   recordProgress,
   startJob
 } from "../../src/domain/benchJob.js"
-import { Contest } from "../../src/domain/contest.js"
-import {
-  CannotCancelRunning,
-  ContestNotRunning,
-  InvalidJobTransition,
-  TargetIpOutOfSubnet,
-  TeamJobAlreadyQueued
-} from "../../src/domain/errors.js"
+import { CannotCancelRunning, ContestNotRunning, InvalidJobTransition, TargetIpOutOfSubnet } from "../../src/domain/errors.js"
 import { BenchJobId, ContestId, TeamId } from "../../src/domain/ids.js"
+import { makeContest } from "../support/factories.js"
 
-const contestId = ContestId.make("11111111-1111-1111-1111-111111111111")
 const teamId = TeamId.make("22222222-2222-2222-2222-222222222222")
 const jobId = BenchJobId.make("33333333-3333-3333-3333-333333333333")
+const contestId = ContestId.make("44444444-4444-4444-4444-444444444444")
 
-const makeContest = (status: Contest["status"]) =>
-  new Contest({ id: contestId, name: "INUCON", problemKey: "problem-1", status, instanceQuota: 3 })
 
 const baseEnqueueArgs = {
-  contest: makeContest("running"),
-  activeJobCountForTeam: 0,
+  contest: makeContest({ status: "running" }),
+  purpose: "competition" as const,
   teamId,
   teamNumber: 1,
   targetIp: "10.100.1.11"
@@ -38,13 +30,8 @@ const baseEnqueueArgs = {
 
 describe("checkEnqueueAllowed", () => {
   it("contest が preparing なら ContestNotRunning", () => {
-    const result = checkEnqueueAllowed({ ...baseEnqueueArgs, contest: makeContest("preparing") })
+    const result = checkEnqueueAllowed({ ...baseEnqueueArgs, contest: makeContest({ status: "preparing" }) })
     expect(result).toStrictEqual(Either.left(new ContestNotRunning({ status: "preparing" })))
-  })
-
-  it("チームに既に queued/running のジョブがあれば TeamJobAlreadyQueued", () => {
-    const result = checkEnqueueAllowed({ ...baseEnqueueArgs, activeJobCountForTeam: 1 })
-    expect(result).toStrictEqual(Either.left(new TeamJobAlreadyQueued({ teamId })))
   })
 
   it("targetIp がチームのサブネット外なら TargetIpOutOfSubnet", () => {
@@ -59,7 +46,8 @@ describe("checkEnqueueAllowed", () => {
   })
 })
 
-const makeQueuedJob = () => newJob({ id: jobId, teamId, targetIp: "10.100.1.11", targetPort: 8080, now: 1000 })
+const makeQueuedJob = () =>
+  newJob({ id: jobId, contestId, teamId, targetIp: "10.100.1.11", targetPort: 8080, purpose: "competition", now: 1000 })
 
 describe("startJob", () => {
   it("queued → running に成功する(startedAt/lastProgressAt = now)", () => {

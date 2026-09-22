@@ -14,11 +14,11 @@ import { Clock, ConfigProvider, Duration, Effect, Layer, Option, Schema } from "
 import { describe, expect } from "vitest"
 import { AdminOnly, api, InvalidOAuthState, OAuthExchangeFailed, RunnerAuth, SESSION_COOKIE, STATE_COOKIE } from "shared"
 import { TeamId } from "../../src/domain/ids.js"
-import { Team } from "../../src/domain/team.js"
-import { SessionRepo, TeamRepo } from "../../src/application/ports.js"
+import { ContestRepo, SessionRepo, TeamRepo } from "../../src/application/ports.js"
 import { AdminOnlyLive, RunnerAuthLive } from "../../src/infrastructure/http/middleware.js"
 import { login } from "../support/login.js"
 import { makeAppTestLayer, ReposTestLive } from "../support/testApi.js"
+import { DEFAULT_TEST_CONTEST_ID, makeContest, makeTeam } from "../support/factories.js"
 
 const stubCodes = {
   "code-taro": { githubId: 100, githubLogin: "taro", displayName: "Taro" }
@@ -235,17 +235,26 @@ describe("GET /api/me", () => {
   it.effect("チーム所属ユーザーは user と team が返る", () =>
     Effect.gen(function* () {
       const { user, cookieHeader } = yield* login({ githubLogin: "taro-me", githubId: 300 })
+      const contests = yield* ContestRepo
+      // getMe は getDisplay を経由する。running な contest を用意して team を紐づける。
+      yield* contests.create(makeContest({ id: DEFAULT_TEST_CONTEST_ID, status: "running" }))
       const teams = yield* TeamRepo
-      const team = new Team({ id: TeamId.make("team-me"), name: "team me", teamNumber: 1 })
+      const team = makeTeam({ id: TeamId.make("team-me"), name: "team me", teamNumber: 1 })
       yield* teams.create(team)
-      yield* teams.setMembers(team.id, [user.id])
+      yield* teams.setMembers(DEFAULT_TEST_CONTEST_ID, team.id, [user.id])
 
       const client = yield* HttpClient.HttpClient
       const res = yield* client.get("/api/me", { headers: { cookie: cookieHeader } })
       expect(res.status).toBe(200)
       const body = (yield* res.json) as { user: { githubLogin: string }; team: { name: string; teamNumber: number } | null }
       expect(body.user.githubLogin).toBe("taro-me")
-      expect(body.team).toStrictEqual({ id: "team-me", name: "team me", teamNumber: 1 })
+      expect(body.team).toStrictEqual({
+        id: "team-me",
+        contestId: DEFAULT_TEST_CONTEST_ID,
+        name: "team me",
+        teamNumber: 1,
+        desiredInstanceCount: 3
+      })
     }).pipe(Effect.provide(TestLayer))
   )
 

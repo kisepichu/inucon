@@ -1,8 +1,7 @@
 import { it } from "@effect/vitest"
 import { Effect } from "effect"
 import { describe, expect } from "vitest"
-import { Contest } from "../../src/domain/contest.js"
-import { ContestId } from "../../src/domain/ids.js"
+import { DEFAULT_TEST_CONTEST_ID, makeContest } from "../support/factories.js"
 import { ContestRepo } from "../../src/application/ports.js"
 import { asAdmin, makeApiClient, makeRunnerApiClient, TestLayer } from "../support/apiTestHelpers.js"
 import { login } from "../support/login.js"
@@ -19,15 +18,7 @@ describe("E2E: チーム作成からベンチ実行・スコアボード反映�
       const teamNumber = 90
 
       const contests = yield* ContestRepo
-      yield* contests.save(
-        new Contest({
-          id: ContestId.make("contest-e2e-1"),
-          name: "INUCON",
-          problemKey: "private-isu",
-          status: "preparing",
-          instanceQuota: 3
-        })
-      )
+      yield* contests.create(makeContest({ id: DEFAULT_TEST_CONTEST_ID, status: "preparing" }))
 
       // 1. admin がチームを作る。
       const { cookieHeader: adminCookie } = yield* asAdmin()
@@ -61,7 +52,9 @@ describe("E2E: チーム作成からベンチ実行・スコアボード反映�
 
       // 6. runner が poll し、problemKey 込みでジョブを受け取る。
       const runnerClient = yield* makeRunnerApiClient()
-      const polled = yield* runnerClient.runner.pollJob()
+      const polled = yield* runnerClient.runner.pollJob({
+        payload: { runnerId: "e2e-runner", revision: "test", benchReady: true, healthSummary: "ok" }
+      })
       expect(polled.job?.id).toBe(job.id)
       expect(polled.job?.teamId).toBe(team.id)
       expect(polled.job?.problemKey).toBe("private-isu")
