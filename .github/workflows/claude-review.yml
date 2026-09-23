@@ -59,10 +59,31 @@ jobs:
           # --allowedTools が無いと agent モードで github_inline_comment /
           # github_comment MCP サーバが導入されず、Claude はコメント投稿手段を持てない
           # ("No buffered inline comments" & サマリコメントも出ない) ので必須。
+          #
+          # allowlist は閉じている (ここに無い Bash prefix は既定で拒否) ため、
+          # 実質これが CI 上の Claude の権限境界になる。したがって:
+          # - `find` は入れない。`-exec` / `-delete` で disallowedTools の
+          #   Edit/Write を迂回できてしまう。ファイル探索は read-only な
+          #   組込み Glob / Grep で足りる。
+          # - `gh api` は入れない。任意の POST が通ってしまう。
+          # - `gh pr comment` だけは sentinel サマリ投稿に必要な write。
+          #
+          # --max-turns の実測: 50 では Task 6/7 の大きめ PR (#60 / #61) で
+          # `Reached maximum number of turns (50)` に繰り返し到達し、手動
+          # `@claude review` 再トリガが必要だった。sibling repo
+          # nixos-config-private でも中規模 PR が 53 turns を要した
+          # (run 35839011031)。余裕を見て 80 にする。cost は per-token でなく
+          # seat allowance なので上げても実害はない。
+          #
+          # 注意: inline comment には github_inline_comment MCP サーバの
+          # provision が必要で、それは open PR の review context がある場合
+          # だけ。merged PR に trigger すると allowedTools に列挙していても
+          # SDK options に mcpServers が入らず summary のみになる。CI の
+          # 動作確認は必ず open PR で行う。
           claude_args: |
             --model claude-sonnet-4-6
-            --max-turns 50
-            --allowedTools "Read,WebFetch,WebSearch,Bash(grep:*),Bash(find:*),Bash(cat:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git rev-parse:*),Bash(git branch:*),Bash(gh pr list:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),mcp__github_inline_comment__create_inline_comment"
+            --max-turns 80
+            --allowedTools "Read,Grep,Glob,WebFetch,WebSearch,Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git rev-parse:*),Bash(git branch:*),Bash(gh pr list:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),mcp__github_inline_comment__create_inline_comment"
             --disallowedTools "Edit,Write,Agent"
           prompt: |
             You are reviewing this pull request for the INUCON project
@@ -70,8 +91,8 @@ jobs:
             portal / runner / shared). Design docs live under docs/superpowers/.
             This is a CI environment with restricted tool access.
 
-            Available tools: Read, WebFetch, WebSearch,
-            Bash (grep/find/cat/ls/head/tail/wc),
+            Available tools: Read, Grep, Glob, WebFetch, WebSearch,
+            Bash (grep/cat/ls/head/tail/wc),
             Bash (git diff/log/show/status/rev-parse/branch),
             Bash (gh pr list/diff/view/comment),
             and mcp__github_inline_comment__create_inline_comment.
