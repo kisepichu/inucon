@@ -222,29 +222,55 @@ Phase 2 の当ドキュメントの「remotely managed」記述は誤りだっ�
 
 ランナー(`runner/`)は benchvm 上に常駐プロセスとして置く。こちらも実体は `nixos-config-private` の `hosts/benchvm` に systemd unit を追加する形になる(このリポジトリには手順のみ記載)。
 
-systemd unit は `nixos-config-private/hosts/benchvm` に定義済み(nixos-config-private #7:
-User=kise、WorkingDirectory=/home/kise/inucon、EnvironmentFile=/home/kise/.inucon/runner-env、
-Restart=always)。アプリの配置・更新手順(Phase 2 実績):
+systemd unit は `nixos-config-private/hosts/benchvm` に定義済み(User=kise、
+WorkingDirectory=/home/kise/inucon、Restart=always)。env は agenix の
+`runner-env.age` を runtime path 経由で読む(`PORTAL_URL` / `RUNNER_TOKEN` /
+`BENCH_DIR` / `RUNNER_ID`)。以前の平文 `/home/kise/.inucon/runner-env` は廃止。
+
+`PORTAL_URL` は LAN 直結の NodePort(`http://192.0.2.20:30080`)で、Tunnel
+(`https://inucon.kisen.one`)は経由しない(内→内で外に出る意味がないため)。
+この IP は router の DHCP 予約で apphost に固定している。予約を外すと runner が
+portal に到達できなくなるので、変更するなら age envelope の再封入と同時に行う。
+`POLL_INTERVAL_MILLIS` / `PROGRESS_INTERVAL_MILLIS` は既定値(2000ms / 5000ms)
+のままで問題なければ省略可。
+
+アプリの配置・更新手順:
 
 1. ソース配置とビルド(benchvm は private リポジトリの認証を持たないため rsync 方式):
    ```sh
    # 手元(リポジトリルート)から。benchvm の IP は DHCP で変動する(下記 §8)ので都度確認
+   REV=$(git rev-parse HEAD)
    rsync -a --delete --exclude .git --exclude node_modules --exclude dist \
      --exclude .superpowers --exclude portal/data --exclude portal/web/dist \
      ./ kise@<benchvm-ip>:/home/kise/inucon/
+   # REVISION は rsync --delete で消えるので必ず毎回書き直す(下記の注意を参照)
+   ssh kise@<benchvm-ip> "printf '%s\n' '$REV' > /home/kise/inucon/REVISION"
    ssh kise@<benchvm-ip> \
      'cd ~/inucon && pnpm install --frozen-lockfile && pnpm --filter shared build && pnpm --filter runner build'
    ```
-2. 環境変数ファイル `/home/kise/.inucon/runner-env`(kise 所有 600。**TODO: 開催前に agenix 化**):
+
+   **`/home/kise/inucon/REVISION` は必須**。unit の ExecStart wrapper が
+   `RUNNER_REVISION` をここから取り、無ければ **起動を拒否する**。rsync 配置では
+   `.git` が無いため `git rev-parse` は使えない(clone 方式で置いた場合のみ
+   fallback として機能する)。rsync だけして REVISION を書き忘れた場合に
+   「古い revision を報告し続ける」のではなく「起動を拒否する」方へ倒す意図的な
+   設計。値は 64 byte 以内(portal の `RunnerPollRequest.revision` が
+   `maxLength(64)`)。
+
+2. NixOS 設定の適用。**benchvm には flake の checkout が無い**(`/etc/nixos` は空、
+   `~/repos` も無い)ので、手元の `nixos-config-private` から remote deploy する:
+   ```sh
+   cd ~/repos/nixos-config-private
+   nixos-rebuild switch --flake .#benchvm \
+     --target-host kise@<benchvm-ip> --use-remote-sudo
    ```
-   PORTAL_URL=http://192.0.2.20:30080
-   RUNNER_TOKEN=<apphost の ~/.inucon/runner-token と同じ値>
-   BENCH_DIR=/home/kise/private-isu/benchmarker
-   ```
-   `PORTAL_URL` は LAN 直結の NodePort(30080)。Tunnel(https://inucon.kisen.one)を経由しない。
-   `POLL_INTERVAL_MILLIS` / `PROGRESS_INTERVAL_MILLIS` は既定値(2000ms / 5000ms)のままで問題なければ省略可。
-3. `sudo systemctl restart inucon-runner` → `systemctl status inucon-runner` で起動確認。
+3. `systemctl status inucon-runner` で起動確認。起動拒否している場合は
+   `journalctl -u inucon-runner -n 20` に理由が出る(REVISION 不在 / 長すぎ)。
 4. 確認: `journalctl -u inucon-runner -f` で poll が回っていること(job なし時は静かに poll し続ける)。ポータルからベンチを 1 件 enqueue して、実行・進捗・finish が通ることまで確認する。
+
+   runner が古いと portal の heartbeat 契約を満たせず、poll ごとに
+   `HttpApiDecodeError: Expected { runnerId, revision, benchReady, healthSummary }, actual null`
+   が出る。この場合は手順 1 のソース更新が未実施。
 
 ## 7. 動作確認チェックリスト
 
