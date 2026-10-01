@@ -704,7 +704,7 @@ function ArchivePanel({ contestId }: { readonly contestId: ContestId }) {
 
   const load = useCallback(async () => {
     try {
-      setArtifacts(await api.listContestArtifacts(contestId))
+      setArtifacts(await api.listAdminContestArtifacts(contestId))
       setError(null)
     } catch (err) {
       setError(messageForError(err, "artifact 一覧の取得に失敗しました"))
@@ -760,15 +760,14 @@ function ArchivePanel({ contestId }: { readonly contestId: ContestId }) {
                   <td className="mono">{a.sha256.slice(0, 12)}…</td>
                   <td>{a.offHostStatus}</td>
                   <td>
-                    <a
-                      href={
-                        a.kind === "snapshot"
-                          ? `/api/admin/artifacts/${a.id}/download`
-                          : `/api/artifacts/${a.id}/download`
-                      }
-                    >
-                      download
-                    </a>
+                    {/* 全 kind を AdminOnly download に通す。公開 download は
+                        snapshot を 404 にするうえ、scoreboard 系は
+                        `public, max-age=60` を返す。artifact 行は
+                        unique(contest_id, kind) の in-place upsert なので
+                        archive 再生成後も id が変わらず、公開経路だと表示中の
+                        sha256 と食い違う stale bytes を掴みうる。admin download は
+                        `no-store` なので常に検証対象の実体を取得できる。 */}
+                    <a href={`/api/admin/artifacts/${a.id}/download`}>download</a>
                   </td>
                   <td>
                     {a.offHostStatus === "pending" ? (

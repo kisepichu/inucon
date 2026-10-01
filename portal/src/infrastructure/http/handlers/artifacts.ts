@@ -11,15 +11,34 @@ import {
   OperationalContestConflict
 } from "shared"
 import { ArtifactRepo, BackupPort, ContestRepo } from "../../../application/ports.js"
+import type { Artifact } from "../../../domain/artifact.js"
 import {
   requestFinalization,
   requestLegacyArchive,
   verifyArtifactChecksum
 } from "../../../application/usecases/finalization.js"
 
+// Artifact の wire 射影。生 storagePath を落とすのがこの境界の契約なので、
+// 3 つの応答経路 (公開 list / admin list / verify) で lockstep に保つ。
+const toWireArtifact = (a: Artifact) => ({
+  id: a.id,
+  contestId: a.contestId,
+  kind: a.kind,
+  sha256: a.sha256,
+  sizeBytes: a.sizeBytes,
+  offHostStatus: a.offHostStatus,
+  verifiedAt: Option.getOrNull(a.verifiedAt),
+  createdAt: a.createdAt
+})
+
 // Task 11: artifact group の handler。
 // - listContestArtifacts: 公開経路。scoreboard/scoreboard_csv のみを返す
 //   (snapshot は admin だけが取得できる情報)。
+// - listAdminContestArtifacts: AdminOnly。snapshot を含む全 kind を返す。
+//   canceled Contest でも 404 にしない (contestAdmin.ts の getAdminContest /
+//   listAdminContests({includeCanceled}) と同じく、admin には canceled を
+//   隠さない前例に合わせる。canceled でも DB snapshot の off-host 検証は
+//   必要になる)。公開 list と違い存在しない contestId のみ 404。
 // - downloadArtifact: 公開経路。scoreboard/CSV のみを 200 で返す。snapshot は
 //   URL 存在自体を隠すため 404。
 // - downloadAdminArtifact: AdminOnly。任意 kind を返す。DB snapshot は
@@ -39,18 +58,20 @@ export const ArtifactsLive = HttpApiBuilder.group(api, "artifacts", (handlers) =
         }
         const repo = yield* ArtifactRepo
         const all = yield* repo.listByContest(path.contestId)
-        return all
-          .filter((a) => a.kind !== "snapshot")
-          .map((a) => ({
-            id: a.id,
-            contestId: a.contestId,
-            kind: a.kind,
-            sha256: a.sha256,
-            sizeBytes: a.sizeBytes,
-            offHostStatus: a.offHostStatus,
-            verifiedAt: Option.getOrNull(a.verifiedAt),
-            createdAt: a.createdAt
-          }))
+        return all.filter((a) => a.kind !== "snapshot").map(toWireArtifact)
+      }).pipe(Effect.orDie)
+    )
+    .handle("listAdminContestArtifacts", ({ path }) =>
+      Effect.gen(function* () {
+        const contests = yield* ContestRepo
+        const contest = yield* contests.findById(path.contestId)
+        if (Option.isNone(contest)) {
+          return yield* Effect.fail(new NotFound())
+        }
+        const repo = yield* ArtifactRepo
+        const all = yield* repo.listByContest(path.contestId)
+        // filter しない。生 storagePath だけは公開 list と同様に落とす。
+        return all.map(toWireArtifact)
       }).pipe(Effect.orDie)
     )
     .handleRaw("downloadArtifact", ({ path }) =>
@@ -128,16 +149,7 @@ export const ArtifactsLive = HttpApiBuilder.group(api, "artifacts", (handlers) =
           expectedSha256: payload.sha256,
           now
         })
-        return {
-          id: a.id,
-          contestId: a.contestId,
-          kind: a.kind,
-          sha256: a.sha256,
-          sizeBytes: a.sizeBytes,
-          offHostStatus: a.offHostStatus,
-          verifiedAt: Option.getOrNull(a.verifiedAt),
-          createdAt: a.createdAt
-        }
+        return toWireArtifact(a)
       }).pipe(
         Effect.catchTags({
           ArtifactNotFound: () => Effect.fail(new NotFound()),
