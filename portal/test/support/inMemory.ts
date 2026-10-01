@@ -1093,12 +1093,15 @@ export interface ManagedVmSeed {
 //
 // getInfrastructureInventory の各フィールドは Option(None = 観測不能)なので、
 // テストは plain な seed を書き、makeInfrastructureInventory が Option に包む。
-// 明示的に null を渡したフィールドだけが None になる。
+// 明示的に null を渡したフィールドだけが None になる。VM の onBoot も同じ規約で、
+// null は「VM config が読めなかった」(VmInventoryItem.onBoot = None)を表す。
+export type VmInventorySeed = Omit<VmInventoryItem, "onBoot"> & { readonly onBoot: boolean | null }
+
 export interface InfrastructureInventorySeed {
   nodeFreeMemBytes?: number | null
   templateExists?: boolean | null
-  devvm?: VmInventoryItem | null
-  benchvm?: VmInventoryItem | null
+  devvm?: VmInventorySeed | null
+  benchvm?: VmInventorySeed | null
   preparedTeamNumbers?: ReadonlyArray<number> | null
   isolationServiceActive?: boolean | null
 }
@@ -1131,8 +1134,12 @@ export const makeInfrastructureInventory = (
   return {
     nodeFreeMemBytes: Option.fromNullable(merged.nodeFreeMemBytes),
     templateExists: Option.fromNullable(merged.templateExists),
-    devvm: Option.fromNullable(merged.devvm),
-    benchvm: Option.fromNullable(merged.benchvm),
+    devvm: Option.fromNullable(merged.devvm).pipe(
+      Option.map((vm) => ({ ...vm, onBoot: Option.fromNullable(vm.onBoot) }))
+    ),
+    benchvm: Option.fromNullable(merged.benchvm).pipe(
+      Option.map((vm) => ({ ...vm, onBoot: Option.fromNullable(vm.onBoot) }))
+    ),
     preparedTeamNumbers: Option.fromNullable(merged.preparedTeamNumbers),
     isolationServiceActive: Option.fromNullable(merged.isolationServiceActive)
   }

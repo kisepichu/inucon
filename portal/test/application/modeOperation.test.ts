@@ -199,6 +199,49 @@ describe("enter_contest_mode の handler", () => {
   )
 })
 
+// 2026-10-01 本番障害: inventory の onBoot が実値によらず false に畳まれていた
+// ため、set_devvm_onboot_0 が「already 0」とスキップし devvm の onboot=1 が
+// 残った(eevee 再起動で devvm と benchvm が両方自動起動しうる)。ショートカット
+// は観測が確定している(Some)ときだけ。null = VM config が読めなかった(None)
+// なら目標値を書く(setVmOnBoot は冪等な PUT)。
+describe("enter_contest_mode の onboot step は観測が確定しているときだけスキップする", () => {
+  it.effect.each([
+    { observed: true, summary: "devvm.onBoot set to 0", written: { [DEVVM_VMID]: false } },
+    { observed: null, summary: "devvm.onBoot set to 0", written: { [DEVVM_VMID]: false } },
+    { observed: false, summary: "devvm.onBoot already 0", written: {} }
+  ])("set_devvm_onboot_0: devvm.onBoot=$observed → $summary", ({ observed, summary, written }) =>
+    Effect.gen(function* () {
+      const { handler, proxmox } = buildHandler({
+        infrastructureInventory: {
+          ...HEALTHY_INVENTORY,
+          devvm: { ...HEALTHY_INVENTORY.devvm, onBoot: observed }
+        }
+      })
+      const outcome = yield* (yield* handler).run(stepOf("set_devvm_onboot_0"))
+      expect(outcome).toEqual({ status: "succeeded", summary })
+      expect((yield* proxmox.getState).onBootByVmid).toEqual(written)
+    })
+  )
+
+  it.effect.each([
+    { observed: false, summary: "benchvm.onBoot set to 1", written: { [BENCHVM_VMID]: true } },
+    { observed: null, summary: "benchvm.onBoot set to 1", written: { [BENCHVM_VMID]: true } },
+    { observed: true, summary: "benchvm.onBoot already 1", written: {} }
+  ])("set_benchvm_onboot_1: benchvm.onBoot=$observed → $summary", ({ observed, summary, written }) =>
+    Effect.gen(function* () {
+      const { handler, proxmox } = buildHandler({
+        infrastructureInventory: {
+          ...HEALTHY_INVENTORY,
+          benchvm: { ...HEALTHY_INVENTORY.benchvm, onBoot: observed }
+        }
+      })
+      const outcome = yield* (yield* handler).run(stepOf("set_benchvm_onboot_1"))
+      expect(outcome).toEqual({ status: "succeeded", summary })
+      expect((yield* proxmox.getState).onBootByVmid).toEqual(written)
+    })
+  )
+})
+
 // 実機 eevee の VMID mapping (9200=benchvm / 9300=devvm) を取り違えた状態で
 // mode transition を走らせると「devvm を止めるつもりで benchvm を止める」
 // 事故になる (production を壊した実バグ)。eevee-mode.sh と同じ「名前が正」の

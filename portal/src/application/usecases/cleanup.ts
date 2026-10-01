@@ -835,8 +835,11 @@ export const makeReturnNormalModeHandler: Effect.Effect<OperationHandler, never,
         if (identityMismatch !== null) return blocked(identityMismatch)
 
         switch (step.stepKey) {
+          // onboot の冪等ショートカットは観測が確定している(Some)ときだけ
+          // (modeOperation.ts と同型)。None を「already」とみなすと benchvm の
+          // onboot=1 が残り、eevee 再起動で devvm と両方が自動起動しうる。
           case "set_benchvm_onboot_0": {
-            if (benchvm.onBoot === false) return succeeded("benchvm.onBoot already 0")
+            if (Option.contains(benchvm.onBoot, false)) return succeeded("benchvm.onBoot already 0")
             yield* px.setVmOnBoot(benchvm.vmid, false)
             return succeeded("benchvm.onBoot set to 0")
           }
@@ -880,7 +883,7 @@ export const makeReturnNormalModeHandler: Effect.Effect<OperationHandler, never,
                 )
           }
           case "set_devvm_onboot_1": {
-            if (devvm.onBoot === true) return succeeded("devvm.onBoot already 1")
+            if (Option.contains(devvm.onBoot, true)) return succeeded("devvm.onBoot already 1")
             yield* px.setVmOnBoot(devvm.vmid, true)
             return succeeded("devvm.onBoot set to 1")
           }

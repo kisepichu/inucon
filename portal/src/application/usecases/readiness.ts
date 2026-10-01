@@ -306,7 +306,8 @@ const benchvmCheck = (
     onSome: (benchvm) => ({
       key: "benchvm",
       status: "pass" as const,
-      summary: `benchvm inventory present (status=${benchvm.status}, onBoot=${benchvm.onBoot})`
+      // onBoot は VM config 由来。読めなかったときは false ではなく unobserved。
+      summary: `benchvm inventory present (status=${benchvm.status}, onBoot=${Option.match(benchvm.onBoot, { onNone: () => "unobserved", onSome: String })})`
     })
   })
 

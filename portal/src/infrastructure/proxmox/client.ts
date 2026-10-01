@@ -77,7 +77,9 @@ const SdnVnetEntry = Schema.Struct({
 const SdnVnetsResponse = Schema.Struct({ data: Schema.Array(SdnVnetEntry) })
 
 // Task 8: /nodes/:node/qemu/:vmid/config は任意のフィールドを返すため
-// necessary な項目だけ抽出する。onboot は 0/1 の integer or string。
+// necessary な項目だけ抽出する。onboot は 0/1 の integer or string で、
+// devvm/benchvm の onBoot の唯一の情報源(qemu 一覧には無い。VmListEntry 参照)。
+// PVE は既定値 0 の onboot を config に書かないので、キー無しは 0 を意味する。
 // name は inventory の name と一致する保証がないため config 側は無視する
 // (list 側の name を使う)。net<N> は bridge=... を含む文字列。
 const VmConfig = Schema.Record({
@@ -99,16 +101,14 @@ const VmStatusCurrentResponse = Schema.Struct({ data: VmStatusCurrent })
 // PVE の GET /nodes/<node>/qemu は maxmem/mem/status/name/vmid/template を返す。
 // template は既定 0(non-template)/1(template)で integer。managed VM の判定は
 // 名前パターンで別途行うため、ここでは template を除外しないでそのまま受ける。
+// onboot は返らない(2026-10-01 eevee 実測、PVE 9.2.3: 9200/9300 とも要素に
+// onboot フィールド自体が無い)。onBoot は VM config から読む。
 const VmListEntry = Schema.Struct({
   vmid: Schema.Int,
   name: Schema.optional(Schema.String),
   status: Schema.String,
   maxmem: Schema.optional(Schema.Union(Schema.Int, Schema.String)),
-  template: Schema.optional(Schema.Union(Schema.Int, Schema.String)),
-  // Task 8: qemu 一覧に onboot=0/1(integer or string)が含まれることがある。
-  // getInfrastructureInventory は devvm/benchvm の onBoot をここから拾う
-  // (存在しないときは qemu/:vmid/config を fallback で叩く)。
-  onboot: Schema.optional(Schema.Union(Schema.Int, Schema.String))
+  template: Schema.optional(Schema.Union(Schema.Int, Schema.String))
 })
 const VmListResponse = Schema.Struct({ data: Schema.Array(VmListEntry) })
 
@@ -441,10 +441,11 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
       requestExistsOrNotFound(HttpClientRequest.get(`${nodeUrl}/qemu/${vmid}/status/current`))
 
     // Task 8: getInfrastructureInventory は次を単発で返す集約 endpoint。
-    // - mode qemu list: devvm / benchvm の inventory 化。
+    // - mode qemu list: devvm / benchvm の inventory 化(vmid/name/status/maxmem)。
+    // - devvm / benchvm config: onBoot(config の onboot)。benchvm は bridge=teamN
+    //   が入っている net<N> の集合も同じ response から取る(config を 2 回読まない)。
     // - provision qemu list: template (9100) の存在確認。
     // - node network + SDN vnets: teamN として用意済みの N の集合。
-    // - benchvm config: bridge=teamN が入っている net<N> の集合。
     // - node service inucon-team-isolation の state。
     // - node status の memory.free。
     //
@@ -467,8 +468,17 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
     // 各 sub-request は optionalSubRead で Option に畳む。1 本の失敗を
     // inventory 全体の失敗に伝播させない(= その情報に依存する check だけが
     // degrade する)。
-    const parseOnBoot = (v: unknown): boolean =>
-      v === 1 || v === "1" || v === true
+
+    // config の onboot を onBoot に読む。キー無しは PVE 既定 0 なので Some(false)。
+    // 0/1 として解釈できない値は「読めなかった」と同じく None にし、false に
+    // 畳まない(VmInventoryItem.onBoot 参照)。
+    const onBootFromConfig = (config: Schema.Schema.Type<typeof VmConfig>): Option.Option<boolean> => {
+      const v = config.onboot
+      if (v === undefined) return Option.some(false)
+      if (v === 1 || v === "1") return Option.some(true)
+      if (v === 0 || v === "0") return Option.some(false)
+      return Option.none()
+    }
 
     const parseMaxmem = (v: unknown): number =>
       typeof v === "string" ? Number(v) : typeof v === "number" ? v : 0
@@ -478,7 +488,8 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
 
     const vmInventoryFromList = (
       vms: ReadonlyArray<Schema.Schema.Type<typeof VmListEntry>>,
-      vmid: number
+      vmid: number,
+      onBoot: Option.Option<boolean>
     ): Option.Option<VmInventoryItem> => {
       const found = vms.find((v) => v.vmid === vmid)
       if (found === undefined || found.name === undefined) return Option.none()
@@ -487,7 +498,7 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         name: found.name,
         status: (found.status === "running" ? "running" : "stopped") as "running" | "stopped",
         memoryBytes: parseMaxmem(found.maxmem),
-        onBoot: parseOnBoot(found.onboot)
+        onBoot
       })
     }
 
@@ -505,24 +516,17 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         Effect.option
       )
 
-    // benchvm の VM config を single request で読み、"net<N>" のうち
-    // bridge=teamK が含まれるものの K だけ集める(intersection の benchvm 側)。
-    const readBenchvmBridges: Effect.Effect<ReadonlyArray<number>, ProxmoxError> =
-      requestWith(
-        modeClient,
-        HttpClientRequest.get(`${nodeUrl}/qemu/${BENCHVM_VMID}/config`),
-        VmConfigResponse
-      ).pipe(
-        Effect.map((r) => {
-          const acc: Array<number> = []
-          for (const [k, v] of Object.entries(r.data)) {
-            if (!/^net\d+$/.test(k) || typeof v !== "string") continue
-            const m = v.match(/bridge=team(\d+)\b/)
-            if (m !== null) acc.push(Number(m[1]))
-          }
-          return acc
-        })
-      )
+    // benchvm の VM config の "net<N>" のうち bridge=teamK が含まれるものの K だけ
+    // 集める(intersection の benchvm 側)。
+    const benchvmTeamBridgesOf = (config: Schema.Schema.Type<typeof VmConfig>): ReadonlyArray<number> => {
+      const acc: Array<number> = []
+      for (const [k, v] of Object.entries(config)) {
+        if (!/^net\d+$/.test(k) || typeof v !== "string") continue
+        const m = v.match(/bridge=team(\d+)\b/)
+        if (m !== null) acc.push(Number(m[1]))
+      }
+      return acc
+    }
 
     const teamNumbersOf = (names: ReadonlyArray<string>): ReadonlyArray<number> => {
       const acc: Array<number> = []
@@ -622,7 +626,7 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
       ProxmoxInfrastructureInventory,
       ProxmoxError
     > = Effect.gen(function* () {
-      const [nodeFreeMemBytes, modeVms, templateExists, isolationActive, benchvmBridges, nodeTeamNumbers] =
+      const [nodeFreeMemBytes, modeVms, templateExists, isolationActive, devvmConfig, benchvmConfig, nodeTeamNumbers] =
         yield* Effect.all(
           [
             optionalSubRead("node status", readNodeFreeMemBytes),
@@ -634,7 +638,14 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
             ),
             optionalSubRead("provision qemu list (template)", readTemplateExists),
             optionalSubRead("isolation service state", readIsolationServiceActive),
-            optionalSubRead("benchvm config bridges", readBenchvmBridges),
+            optionalSubRead(
+              "devvm config",
+              requestWith(modeClient, HttpClientRequest.get(`${nodeUrl}/qemu/${DEVVM_VMID}/config`), VmConfigResponse)
+            ),
+            optionalSubRead(
+              "benchvm config",
+              requestWith(modeClient, HttpClientRequest.get(`${nodeUrl}/qemu/${BENCHVM_VMID}/config`), VmConfigResponse)
+            ),
             readNodeTeamNumbers
           ],
           { concurrency: "unbounded" }
@@ -642,7 +653,7 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
       // preparedTeamNumbers は「node 側に teamN がある」∩「benchvm が teamN に
       // 足を持つ」。片方でも観測できなければ判定不能(None)。
       const preparedTeamNumbers = Option.map(
-        Option.all([nodeTeamNumbers, benchvmBridges]),
+        Option.all([nodeTeamNumbers, Option.map(benchvmConfig, (r) => benchvmTeamBridgesOf(r.data))]),
         ([nodeNumbers, benchvmNumbers]): ReadonlyArray<number> => {
           const benchvmSet = new Set(benchvmNumbers)
           return [...new Set(nodeNumbers.filter((n) => benchvmSet.has(n)))].sort((a, b) => a - b)
@@ -651,8 +662,12 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
       return {
         nodeFreeMemBytes,
         templateExists,
-        devvm: Option.flatMap(modeVms, (vms) => vmInventoryFromList(vms, DEVVM_VMID)),
-        benchvm: Option.flatMap(modeVms, (vms) => vmInventoryFromList(vms, BENCHVM_VMID)),
+        devvm: Option.flatMap(modeVms, (vms) =>
+          vmInventoryFromList(vms, DEVVM_VMID, Option.flatMap(devvmConfig, (r) => onBootFromConfig(r.data)))
+        ),
+        benchvm: Option.flatMap(modeVms, (vms) =>
+          vmInventoryFromList(vms, BENCHVM_VMID, Option.flatMap(benchvmConfig, (r) => onBootFromConfig(r.data)))
+        ),
         preparedTeamNumbers,
         isolationServiceActive: isolationActive
       }

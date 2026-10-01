@@ -2,7 +2,17 @@ import { HttpClient, HttpClientRequest, HttpClientResponse } from "@effect/platf
 import { it } from "@effect/vitest"
 import { ConfigProvider, Effect, Either, Exit, Fiber, Layer, Option, TestClock } from "effect"
 import { describe, expect } from "vitest"
-import { ModeTransitionTimeout, ProvisionTimeout, ProxmoxError, ProxmoxPort } from "../../src/application/ports.js"
+import {
+  ModeTransitionTimeout,
+  type OperationHandler,
+  ProvisionTimeout,
+  ProxmoxError,
+  ProxmoxPort
+} from "../../src/application/ports.js"
+import { makeReturnNormalModeHandler } from "../../src/application/usecases/cleanup.js"
+import { makeEnterContestModeHandler } from "../../src/application/usecases/modeOperation.js"
+import { OperationId, OperationStepId } from "../../src/domain/ids.js"
+import { OperationStep } from "../../src/domain/operation.js"
 import {
   ProxmoxLive,
   resolveProxmoxTlsPolicy,
@@ -1118,7 +1128,13 @@ describe("getInfrastructureInventory", () => {
     name: string
     status: "running" | "stopped"
     mem?: number
-    onBoot?: 0 | 1
+    // GET /nodes/eevee/qemu/:vmid/config の onboot。未指定なら config に onboot
+    // キーを出さない(PVE は既定値 0 のキーを config に書かない)。qemu 一覧には
+    // 出さない: 2026-10-01 実測(PVE 9.2.3)で一覧に onboot フィールドは無い。
+    // 数値/文字列以外の想定外値も渡せるよう unknown にしている。
+    onBoot?: unknown
+    // 指定すると GET .../qemu/:vmid/config をこの HTTP status で失敗させる。
+    configStatus?: number
   }
 
   const MODE_AUTH = "PVEAPIToken=inucon-mode@pve!portal-1=mode-secret"
@@ -1136,8 +1152,11 @@ describe("getInfrastructureInventory", () => {
     // (PVE 9.2.3 はカスタム unit 名に 400 を返す)。
     isolationStatus: "active" | "inactive" | number
     memoryFreeBytes?: number
+    // 渡すと受けた request をすべて積む(mode handler 越しの POST 検証用)。
+    recorded?: Array<HttpClientRequest.HttpClientRequest>
   }) =>
     HttpClient.make((request) => {
+      opts.recorded?.push(request)
       const path = urlPath(request)
       if (path === "/api2/json/nodes/eevee/status" && request.method === "GET") {
         return Effect.succeed(
@@ -1153,12 +1172,13 @@ describe("getInfrastructureInventory", () => {
           : opts.provisionVms ?? opts.vms
         return Effect.succeed(
           jsonResponse(request, {
+            // 2026-10-01 eevee 実測(PVE 9.2.3、mode token): qemu 一覧の各要素に
+            // onboot フィールドは無い。onboot は config 側にしか出さない。
             data: visible.map((v) => ({
               vmid: v.vmid,
               name: v.name,
               status: v.status,
               maxmem: v.mem ?? 4 * 1024 * 1024 * 1024,
-              onboot: v.onBoot ?? 0,
               // Task 8: template VM は Proxmox 側 template=1 で返る。テストは
               // 名前に "template" を含むかで template=1 を返し、それ以外は 0。
               template: v.name.includes("template") ? 1 : 0
@@ -1178,15 +1198,24 @@ describe("getInfrastructureInventory", () => {
           })
         )
       }
-      // benchvm config
-      if (
-        path === "/api2/json/nodes/eevee/qemu/9200/config" &&
-        request.method === "GET"
-      ) {
-        const cfg: Record<string, unknown> = { name: "benchvm" }
-        opts.benchvmBridges.forEach((br, i) => {
-          cfg[`net${i}`] = `virtio,bridge=${br},firewall=0`
-        })
+      // VM config。mode token に見える VM(opts.vms)だけ返す。benchvm (9200) は
+      // net<N> に benchvmBridges を載せる。POST は setVmOnBoot。
+      const configMatch = path.match(/^\/api2\/json\/nodes\/eevee\/qemu\/(\d+)\/config$/)
+      if (configMatch !== null && request.method === "POST") {
+        return Effect.succeed(jsonResponse(request, { data: null }))
+      }
+      const configVm = configMatch === null ? undefined : opts.vms.find((v) => v.vmid === Number(configMatch[1]))
+      if (configVm !== undefined && request.method === "GET") {
+        if (configVm.configStatus !== undefined) {
+          return Effect.succeed(jsonResponse(request, { data: null }, configVm.configStatus))
+        }
+        const cfg: Record<string, unknown> = { name: configVm.name }
+        if (configVm.onBoot !== undefined) cfg.onboot = configVm.onBoot
+        if (configVm.vmid === 9200) {
+          opts.benchvmBridges.forEach((br, i) => {
+            cfg[`net${i}`] = `virtio,bridge=${br},firewall=0`
+          })
+        }
         return Effect.succeed(jsonResponse(request, { data: cfg }))
       }
       // isolation service
@@ -1242,8 +1271,10 @@ describe("getInfrastructureInventory", () => {
       })
       const inv = yield* inventoryOf(client)
       expect(inv.templateExists).toEqual(Option.some(true))
-      expect(Option.getOrThrow(inv.devvm)).toMatchObject({ vmid: 9300, status: "running", onBoot: true })
-      expect(Option.getOrThrow(inv.benchvm)).toMatchObject({ vmid: 9200, status: "stopped", onBoot: false })
+      expect(Option.getOrThrow(inv.devvm)).toMatchObject({ vmid: 9300, status: "running" })
+      expect(Option.getOrThrow(inv.devvm).onBoot).toEqual(Option.some(true))
+      expect(Option.getOrThrow(inv.benchvm)).toMatchObject({ vmid: 9200, status: "stopped" })
+      expect(Option.getOrThrow(inv.benchvm).onBoot).toEqual(Option.some(false))
       expect([...Option.getOrThrow(inv.preparedTeamNumbers)].sort()).toEqual([1, 2])
       expect(inv.isolationServiceActive).toEqual(Option.some(true))
       expect(inv.nodeFreeMemBytes).toEqual(Option.some(6_000_000_000))
@@ -1424,4 +1455,161 @@ describe("getInfrastructureInventory", () => {
       expect(inv.isolationServiceActive).toEqual(Option.some(true))
     })
   )
+
+  // 2026-10-01 本番障害: PVE 9.2.3 の qemu 一覧は onboot を返さないのに、onBoot を
+  // 一覧から読んで「無い = false」に畳んでいたため、実値によらず常に false だった
+  // (eevee 実測: benchvm config onboot=1 / devvm config onboot=0)。
+  it.effect("qemu 一覧に onboot が無くても onBoot は VM config の onboot から取る(eevee 実測形)", () =>
+    Effect.gen(function* () {
+      const client = inventoryClient({
+        vms: [
+          { vmid: 9200, name: "benchvm", status: "running", onBoot: 1 },
+          { vmid: 9300, name: "devvm", status: "stopped", onBoot: 0 }
+        ],
+        networks: [],
+        sdnVnets: [{ vnet: "team1" }],
+        benchvmBridges: ["team1"],
+        isolationStatus: 400
+      })
+      const inv = yield* inventoryOf(client)
+      expect(Option.getOrThrow(inv.benchvm).onBoot).toEqual(Option.some(true))
+      expect(Option.getOrThrow(inv.devvm).onBoot).toEqual(Option.some(false))
+    })
+  )
+
+  it.effect("VM config が読めない(403 / 500)なら onBoot は None で、false に畳まない", () =>
+    Effect.gen(function* () {
+      const client = inventoryClient({
+        vms: [
+          { vmid: 9300, name: "devvm", status: "running", onBoot: 1, configStatus: 403 },
+          { vmid: 9200, name: "benchvm", status: "stopped", onBoot: 1, configStatus: 500 }
+        ],
+        networks: [],
+        sdnVnets: [{ vnet: "team1" }],
+        benchvmBridges: ["team1"],
+        isolationStatus: "active"
+      })
+      const inv = yield* inventoryOf(client)
+      // VM item 自体は一覧から観測できる(power 操作の identity 検証は継続できる)。
+      const devvm = Option.getOrThrow(inv.devvm)
+      const benchvm = Option.getOrThrow(inv.benchvm)
+      expect(devvm).toMatchObject({ vmid: 9300, name: "devvm", status: "running" })
+      expect(benchvm).toMatchObject({ vmid: 9200, name: "benchvm", status: "stopped" })
+      expect(devvm.onBoot).toEqual(Option.none())
+      expect(benchvm.onBoot).toEqual(Option.none())
+    })
+  )
+
+  it.effect("VM config に onboot キーが無ければ PVE 既定値 0 として onBoot=Some(false)", () =>
+    Effect.gen(function* () {
+      const client = inventoryClient({
+        vms: [
+          { vmid: 9300, name: "devvm", status: "running" },
+          { vmid: 9200, name: "benchvm", status: "stopped" }
+        ],
+        networks: [],
+        benchvmBridges: [],
+        isolationStatus: "active"
+      })
+      const inv = yield* inventoryOf(client)
+      expect(Option.getOrThrow(inv.devvm).onBoot).toEqual(Option.some(false))
+      expect(Option.getOrThrow(inv.benchvm).onBoot).toEqual(Option.some(false))
+    })
+  )
+
+  it.effect("VM config の onboot が 0/1 として解釈できない値なら onBoot は None", () =>
+    Effect.gen(function* () {
+      const client = inventoryClient({
+        vms: [
+          { vmid: 9300, name: "devvm", status: "running", onBoot: "yes" },
+          { vmid: 9200, name: "benchvm", status: "stopped", onBoot: "1" }
+        ],
+        networks: [],
+        benchvmBridges: [],
+        isolationStatus: "active"
+      })
+      const inv = yield* inventoryOf(client)
+      expect(Option.getOrThrow(inv.devvm).onBoot).toEqual(Option.none())
+      // 文字列 "1" は PVE の boolean 表現として受ける。
+      expect(Option.getOrThrow(inv.benchvm).onBoot).toEqual(Option.some(true))
+    })
+  )
+
+  // 上の inventory を実際の mode handler に通し、本番障害の「片側しか onboot を
+  // 切り替えない」が再現しないことを HTTP 境界で確かめる。
+  describe("mode handler の onboot step(ProxmoxLive 越し)", () => {
+    // vms を mode token の qemu 一覧 + VM config として見せた ProxmoxLive 上で
+    // handler の 1 step を実行し、outcome と発行された onboot POST
+    // ([vmid, onboot] の列)を返す。
+    const runOnBootStep = (
+      handler: Effect.Effect<OperationHandler, never, ProxmoxPort>,
+      vms: ReadonlyArray<InventoryVm>,
+      stepKey: string
+    ) =>
+      Effect.gen(function* () {
+        const recorded: Array<HttpClientRequest.HttpClientRequest> = []
+        const client = inventoryClient({ vms, networks: [], benchvmBridges: [], isolationStatus: 400, recorded })
+        const step = new OperationStep({
+          id: OperationStepId.make(`s-${stepKey}`),
+          operationId: OperationId.make("op-onboot"),
+          ordinal: 0,
+          stepKey,
+          status: "queued",
+          attempt: 1,
+          continueOnError: false,
+          retryAt: Option.none(),
+          leaseExpiresAt: Option.none(),
+          inputSummary: "{}",
+          progressJson: "{}",
+          resultSummary: Option.none(),
+          sanitizedError: Option.none(),
+          createdAt: 0,
+          startedAt: Option.none(),
+          finishedAt: Option.none()
+        })
+        const outcome = yield* handler.pipe(
+          Effect.flatMap((h) => h.run(step)),
+          Effect.provide(
+            ProxmoxLive.pipe(
+              Layer.provide(Layer.succeed(HttpClient.HttpClient, client)),
+              Layer.provide(splitConfigLayer)
+            )
+          )
+        )
+        const onBootPosts = recorded
+          .filter((r) => r.method === "POST" && /\/qemu\/\d+\/config$/.test(urlPath(r)))
+          .map((r) => [urlPath(r).match(/\/qemu\/(\d+)\/config$/)![1], bodyParams(r).get("onboot")])
+        return { outcome, onBootPosts }
+      })
+
+    it.effect("enter_contest_mode: devvm config onboot=1 なら set_devvm_onboot_0 は 9300 に onboot=0 を POST する", () =>
+      Effect.gen(function* () {
+        const { onBootPosts, outcome } = yield* runOnBootStep(
+          makeEnterContestModeHandler,
+          [
+            { vmid: 9300, name: "devvm", status: "running", onBoot: 1 },
+            { vmid: 9200, name: "benchvm", status: "stopped", onBoot: 0 }
+          ],
+          "set_devvm_onboot_0"
+        )
+        expect(outcome).toEqual({ status: "succeeded", summary: "devvm.onBoot set to 0" })
+        expect(onBootPosts).toEqual([["9300", "0"]])
+      })
+    )
+
+    it.effect("return_normal_mode: benchvm config onboot=1 なら set_benchvm_onboot_0 は 9200 に onboot=0 を POST する", () =>
+      Effect.gen(function* () {
+        const { onBootPosts, outcome } = yield* runOnBootStep(
+          makeReturnNormalModeHandler,
+          [
+            { vmid: 9200, name: "benchvm", status: "running", onBoot: 1 },
+            { vmid: 9300, name: "devvm", status: "stopped", onBoot: 0 }
+          ],
+          "set_benchvm_onboot_0"
+        )
+        expect(outcome).toEqual({ status: "succeeded", summary: "benchvm.onBoot set to 0" })
+        expect(onBootPosts).toEqual([["9200", "0"]])
+      })
+    )
+  })
 })

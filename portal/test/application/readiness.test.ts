@@ -603,6 +603,33 @@ describe("Proxmox infrastructure inventory", () => {
       )
     )
   )
+
+  // 2026-10-01 本番: benchvm config は onboot=1 なのに summary は onBoot=false と
+  // 出ていた。summary は inventory の観測値をそのまま出し、VM config が読めずに
+  // 観測できないときは false ではなく unobserved と出す(check 自体は「benchvm が
+  // inventory に居るか」なので pass のまま)。
+  it.effect.each([
+    { onBoot: true, rendered: "true" },
+    { onBoot: false, rendered: "false" },
+    { onBoot: null, rendered: "unobserved" }
+  ])("benchvm summary は観測した onBoot=$onBoot を $rendered と出す", ({ onBoot, rendered }) =>
+    Effect.gen(function* () {
+      const checks = yield* computeReadiness(CONTEST_ID)
+      expect(findCheck(checks, "benchvm")).toMatchObject({
+        status: "pass",
+        summary: `benchvm inventory present (status=running, onBoot=${rendered})`
+      })
+    }).pipe(
+      Effect.provide(
+        buildLayer({
+          proxmoxInventory: {
+            ...healthyInventory,
+            benchvm: { ...healthyInventory.benchvm, status: "running", onBoot }
+          }
+        })
+      )
+    )
+  )
 })
 
 describe("Cloudflare probe", () => {
