@@ -113,13 +113,29 @@ scoreboard は開催回ごとに分離される。手順の全体像:
    | --- | --- | --- | --- |
    | 7-1 | **Reconciliation** タブ → **診断** → 未 adopt の orphan があれば adopt をチェック → **adopt を反映した plan を取得** → **適用** | — | Cleanup が押せない (blocked の理由を表示)。Cleanup は常に `adoptHostnames: []` で plan を取り直すため、**Cleanup 側から orphan を adopt する経路は無い** |
    | 7-2 | **Cleanup** Operation (managed 外部 resource の撤収 + Instance を `deleted` に遷移)。7-1 の Operation 完了後に **Reconciliation** タブ → **診断** → Cleanup 欄の対象 hostname / VMID を確認 → 「影響を確認しました」→ **cleanup 実行**。対象 0 件なら「既に clean」と表示される | blocked entry が 0 件 | Return normal mode が `ResidualManagedResource` (409) で拒否される。また Instance が `deleted` に落ちないため、次回開催の readiness `previous_cleanup` が fail し続け **draft から `preparing` に上がれない** |
-   | 7-3 | **Return normal mode** (benchvm 停止 → devvm 復帰) | managed VM が Proxmox に残っていない | handler の `verify_no_managed_vms` で blocked |
+   | 7-3 | **Return normal mode** (benchvm 停止 → devvm 復帰)。**devvm を開発用途で使う期間に入るときだけ実施** (下記) | managed VM が Proxmox に残っていない | handler の `verify_no_managed_vms` で blocked |
 
    7-1 で adopt を要求されるのは「命名規約に合致する hostname の
    Cloudflare resource があるが、DB 側に対応する Instance / binding が
    無い」場合 (`unmanaged_orphan`)。portal が作ったものではない可能性が
    あるため、**明示 adopt なしには絶対に消さない**設計になっている。
    adopt する前に対象 hostname が本当に過去開催の残骸かを確認する。
+
+   **7-3 は次回開催に必須ではない**。次回開催を `preparing` に上げる gate
+   は readiness `previous_cleanup` (7-2 で満たされる) だけで、mode は
+   見ない。devvm を当面使わないなら contest mode のまま置いておくのが
+   手間が少ない。enter contest mode の handler は contest mode からは 7 step
+   すべてが「already」で何も変更せず通る設計。ただし 2026-10-01 時点で
+   Admin Web に enter contest mode の起動経路は無いので、7-3 を実施した後に
+   contest mode へ戻すには eevee 側で
+   `../nixos-config-private/scripts/eevee-mode.sh contest` を使う。
+
+   7-3 の memory_check は benchvm を停止した**後**に「node free ≥ devvm
+   の割当 + reserve 1 GiB」を要求し、ZFS ARC (eevee では上限 4 GiB) を
+   空きとして数えない。足りなければ blocked になり、その時点で benchvm
+   は停止・onboot 0、devvm も停止・onboot 0 のまま止まる (8 step 中
+   5 番目)。復旧は `docs/runbooks/contest-recovery.md` §6 (Insufficient
+   RAM) に従う。
 
 **古い制約 (第1回時点) は撤廃済み**: 「同じ DB で次回を開催するには pod を
 止めて `portal.db` を消して seed し直す」「contest 行の status を SQL で

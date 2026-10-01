@@ -242,24 +242,48 @@ Operation が succeeded で終わり、`benchvm (9200)` が `running` になる
 **症状**:
 - Instance 払い出し時: `InsufficientMemory` (`freeBytes` <
   `minFreeMemBytes`)。API/UI に `409` 相当のエラー。
+- prepare Operation 中: 1 台ごとの判定 (clone 直前に node free ≥
+  `PROVISION_MIN_FREE_MEM_BYTES`、未設定時の既定 5,000,000,000 B) を満たさず、
+  KSM 統合待ち (最大 10 分) の後に step が `blocked` に落ちる。summary は
+  `ksm_settle_timeout:free=<B>:need=<B>`。
 - mode transition 中: `enter_contest_mode` の `memory_check` step が
   `blocked` に落ち、summary に `post-shutdown MemAvailable <B> <
   benchvm(<B>) + reserve(<B>); check other workloads on the node before
   retrying` が出る (`modeOperation.ts` 118-121 行)。
+- `return_normal_mode` の `memory_check` step (benchvm 停止**後**に
+  node free ≥ devvm の割当 + reserve 1 GiB) が `blocked`。この時点で
+  benchvm は停止・onboot 0、devvm も停止・onboot 0 (8 step 中 5 番目)。
 
 **前提の確認**:
 - eevee 側 `pvesh get /nodes/eevee/status --output-format json`
-  (WebUI でも可) の `memory.free` を確認。KSM 統合待ちの直後は数分で
-  下がるため、5-10 分の再試行余地がある。
+  (WebUI でも可) の `memory.free` を確認。portal の判定はこの値を使う。
+  KSM 統合待ちの直後は数分で下がるため、5-10 分の再試行余地がある。
+- **ZFS ARC** (ZFS の RAM 上の読み取りキャッシュ) は `free` で used に
+  数えられ、portal の判定でも空きとして扱われない。eevee は上限 4 GiB で、
+  通常ほぼ上限まで埋まっている。確認:
+  `awk '/^(size|c_max|c_min) /{printf "%s %.0f MiB\n",$1,$3/1048576}' /proc/spl/kstat/zfs/arcstats`
 - 他 workload (講評 VM、開発 VM 等) が eevee で走っていないか。
 
 **復旧手順**:
 1. 明らかに 5-10 分待てば KSM で下がる状況なら、Admin Web で該当
-   Operation を **cancel** し、5-10 分後に再度 apply / start / mode
-   遷移をリクエスト。
+   Operation を **cancel** (§12「Operation cancel の一般手順」) し、
+   5-10 分後に再度 apply / start / mode 遷移をリクエスト。
 2. 他 workload が原因なら、それらを別ノード or 停止に回してから再試行。
-3. 恒久的に足りないなら quota / desiredInstanceCount を下げる
-   (Contest 設定変更 → Reconciliation Refresh → apply)。
+3. ARC が数 GiB を占めているなら、ARC 上限を一時的に下げると再起動なしに
+   空きが増える (例: 2 GiB):
+   `echo $((2*1024*1024*1024)) > /sys/module/zfs/parameters/zfs_arc_max`。
+   恒久化するなら eevee の `/etc/modprobe.d/zfs.conf` の `zfs_arc_max` を
+   変更する (host 設定の変更なので operator 判断)。
+4. 恒久的に足りないなら quota / desiredInstanceCount を下げる
+   (Contest 設定変更 → Reconciliation タブで診断 → 適用)。
+5. `return_normal_mode` が blocked の場合、devvm を当面使わないなら
+   cancel して contest mode に戻す。2026-10-01 時点で Admin Web には
+   enter_contest_mode の起動経路が無い (handler はあるが endpoint / UI が
+   未結線) ので、eevee 側で
+   `../nixos-config-private/scripts/eevee-mode.sh contest` を使う
+   (benchvm を起動し、onboot を benchvm=1 / devvm=0 に戻す)。devvm を
+   起動したいなら 3 で空きを作ってから return_normal_mode を再リクエスト
+   する。
 
 **復帰確認**: 再試行 Operation が succeeded。
 
