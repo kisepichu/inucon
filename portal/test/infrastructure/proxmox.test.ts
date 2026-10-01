@@ -1113,11 +1113,28 @@ describe("waitForVmStatus", () => {
 
 // getInfrastructureInventory: 単一呼び出しで template/devvm/benchvm/team slots/isolation/memory を返す。
 describe("getInfrastructureInventory", () => {
+  interface InventoryVm {
+    vmid: number
+    name: string
+    status: "running" | "stopped"
+    mem?: number
+    onBoot?: 0 | 1
+  }
+
+  const MODE_AUTH = "PVEAPIToken=inucon-mode@pve!portal-1=mode-secret"
+
   const inventoryClient = (opts: {
-    vms: ReadonlyArray<{ vmid: number; name: string; status: "running" | "stopped"; mem?: number; onBoot?: 0 | 1 }>
+    // mode token の qemu 一覧に見える VM(実機では /vms/9200 と /vms/9300 のみ)。
+    vms: ReadonlyArray<InventoryVm>
+    // provision token の qemu 一覧に見える VM。未指定なら mode 側と同じ
+    // (legacy 単一 credential 構成の挙動)。
+    provisionVms?: ReadonlyArray<InventoryVm>
     networks: ReadonlyArray<{ iface: string }>
+    sdnVnets?: ReadonlyArray<{ vnet: string; zone?: string }>
     benchvmBridges: ReadonlyArray<string>
-    isolationStatus: "active" | "inactive"
+    // "active"/"inactive" は 2xx 応答。数値はその HTTP status をそのまま返す
+    // (PVE 9.2.3 はカスタム unit 名に 400 を返す)。
+    isolationStatus: "active" | "inactive" | number
     memoryFreeBytes?: number
   }) =>
     HttpClient.make((request) => {
@@ -1130,9 +1147,13 @@ describe("getInfrastructureInventory", () => {
         )
       }
       if (path === "/api2/json/nodes/eevee/qemu" && request.method === "GET") {
+        // PVE は qemu 一覧を ACL でフィルタする。credential ごとに別の一覧を返す。
+        const visible = request.headers.authorization === MODE_AUTH
+          ? opts.vms
+          : opts.provisionVms ?? opts.vms
         return Effect.succeed(
           jsonResponse(request, {
-            data: opts.vms.map((v) => ({
+            data: visible.map((v) => ({
               vmid: v.vmid,
               name: v.name,
               status: v.status,
@@ -1148,6 +1169,13 @@ describe("getInfrastructureInventory", () => {
       if (path === "/api2/json/nodes/eevee/network" && request.method === "GET") {
         return Effect.succeed(
           jsonResponse(request, { data: opts.networks.map((n) => ({ iface: n.iface, type: "bridge" })) })
+        )
+      }
+      if (path === "/api2/json/cluster/sdn/vnets" && request.method === "GET") {
+        return Effect.succeed(
+          jsonResponse(request, {
+            data: (opts.sdnVnets ?? []).map((v) => ({ vnet: v.vnet, zone: v.zone ?? "inucon", type: "vnet" }))
+          })
         )
       }
       // benchvm config
@@ -1166,12 +1194,38 @@ describe("getInfrastructureInventory", () => {
         path === "/api2/json/nodes/eevee/services/inucon-team-isolation/state" &&
         request.method === "GET"
       ) {
+        if (typeof opts.isolationStatus === "number") {
+          return Effect.succeed(
+            jsonResponse(
+              request,
+              {
+                errors: {
+                  service:
+                    "value 'inucon-team-isolation' does not have a value in the enumeration " +
+                    "'chrony, corosync, cron, ksmtuned, lxcfs, postfix, proxmox-firewall, pve-cluster'"
+                }
+              },
+              opts.isolationStatus
+            )
+          )
+        }
         return Effect.succeed(
           jsonResponse(request, { data: { state: opts.isolationStatus === "active" ? "running" : "inactive" } })
         )
       }
       return Effect.succeed(jsonResponse(request, { errors: "not found" }, 404))
     })
+
+  const inventoryOf = (client: HttpClient.HttpClient) =>
+    ProxmoxPort.pipe(
+      Effect.flatMap((px) => px.getInfrastructureInventory),
+      Effect.provide(
+        ProxmoxLive.pipe(
+          Layer.provide(Layer.succeed(HttpClient.HttpClient, client)),
+          Layer.provide(splitConfigLayer)
+        )
+      )
+    )
 
   it.effect("template + devvm + benchvm + team slots + isolation + memory を単発 inventory で返す", () =>
     Effect.gen(function* () {
@@ -1186,24 +1240,17 @@ describe("getInfrastructureInventory", () => {
         isolationStatus: "active",
         memoryFreeBytes: 6_000_000_000
       })
-      const port = ProxmoxLive.pipe(
-        Layer.provide(Layer.succeed(HttpClient.HttpClient, client)),
-        Layer.provide(configLayer)
-      )
-      const inv = yield* ProxmoxPort.pipe(
-        Effect.flatMap((px) => px.getInfrastructureInventory),
-        Effect.provide(port)
-      )
-      expect(inv.templateExists).toBe(true)
-      expect(inv.devvm).toMatchObject({ vmid: 9300, status: "running", onBoot: true })
-      expect(inv.benchvm).toMatchObject({ vmid: 9200, status: "stopped", onBoot: false })
-      expect([...inv.preparedTeamNumbers].sort()).toEqual([1, 2])
-      expect(inv.isolationServiceActive).toBe(true)
-      expect(inv.nodeFreeMemBytes).toBe(6_000_000_000)
+      const inv = yield* inventoryOf(client)
+      expect(inv.templateExists).toEqual(Option.some(true))
+      expect(Option.getOrThrow(inv.devvm)).toMatchObject({ vmid: 9300, status: "running", onBoot: true })
+      expect(Option.getOrThrow(inv.benchvm)).toMatchObject({ vmid: 9200, status: "stopped", onBoot: false })
+      expect([...Option.getOrThrow(inv.preparedTeamNumbers)].sort()).toEqual([1, 2])
+      expect(inv.isolationServiceActive).toEqual(Option.some(true))
+      expect(inv.nodeFreeMemBytes).toEqual(Option.some(6_000_000_000))
     })
   )
 
-  it.effect("preparedTeamNumbers は 'node network の teamN' と 'benchvm config bridges' の積集合", () =>
+  it.effect("preparedTeamNumbers は 'node 側の teamN' と 'benchvm config bridges' の積集合", () =>
     Effect.gen(function* () {
       const client = inventoryClient({
         vms: [
@@ -1216,15 +1263,46 @@ describe("getInfrastructureInventory", () => {
         benchvmBridges: ["team1", "team2"],
         isolationStatus: "active"
       })
-      const port = ProxmoxLive.pipe(
-        Layer.provide(Layer.succeed(HttpClient.HttpClient, client)),
-        Layer.provide(configLayer)
-      )
-      const inv = yield* ProxmoxPort.pipe(
-        Effect.flatMap((px) => px.getInfrastructureInventory),
-        Effect.provide(port)
-      )
-      expect([...inv.preparedTeamNumbers].sort()).toEqual([1, 2])
+      const inv = yield* inventoryOf(client)
+      expect([...Option.getOrThrow(inv.preparedTeamNumbers)].sort()).toEqual([1, 2])
+    })
+  )
+
+  // D2 回帰: eevee の team1/team2 は SDN vnet なので /nodes/:node/network には
+  // 出ない(実測: nic0/nic1/nic2/vmbr0/wlp4s0 のみ)。/cluster/sdn/vnets を
+  // 見ないと team_slots が常に fail する。
+  it.effect("team bridge が SDN vnet にしか無くても preparedTeamNumbers に入る", () =>
+    Effect.gen(function* () {
+      const client = inventoryClient({
+        vms: [
+          { vmid: 9300, name: "devvm", status: "running" },
+          { vmid: 9200, name: "benchvm", status: "stopped" }
+        ],
+        // classic bridge 側には team が 1 件も無い(実機と同じ)
+        networks: [{ iface: "vmbr0" }, { iface: "nic0" }],
+        sdnVnets: [{ vnet: "team1" }, { vnet: "team2" }],
+        benchvmBridges: ["team1", "team2"],
+        isolationStatus: "active"
+      })
+      const inv = yield* inventoryOf(client)
+      expect([...Option.getOrThrow(inv.preparedTeamNumbers)].sort()).toEqual([1, 2])
+    })
+  )
+
+  it.effect("SDN vnet 側に team3 があっても benchvm config に無ければ intersection から落ちる", () =>
+    Effect.gen(function* () {
+      const client = inventoryClient({
+        vms: [
+          { vmid: 9300, name: "devvm", status: "running" },
+          { vmid: 9200, name: "benchvm", status: "stopped" }
+        ],
+        networks: [{ iface: "vmbr0" }],
+        sdnVnets: [{ vnet: "team1" }, { vnet: "team2" }, { vnet: "team3" }],
+        benchvmBridges: ["team1", "team2"],
+        isolationStatus: "active"
+      })
+      const inv = yield* inventoryOf(client)
+      expect([...Option.getOrThrow(inv.preparedTeamNumbers)].sort()).toEqual([1, 2])
     })
   )
 
@@ -1239,39 +1317,111 @@ describe("getInfrastructureInventory", () => {
         benchvmBridges: [],
         isolationStatus: "active"
       })
-      const port = ProxmoxLive.pipe(
-        Layer.provide(Layer.succeed(HttpClient.HttpClient, client)),
-        Layer.provide(configLayer)
-      )
-      const inv = yield* ProxmoxPort.pipe(
-        Effect.flatMap((px) => px.getInfrastructureInventory),
-        Effect.provide(port)
-      )
-      expect(inv.templateExists).toBe(false)
+      const inv = yield* inventoryOf(client)
+      expect(inv.templateExists).toEqual(Option.some(false))
     })
   )
 
-  it.effect("isolation service が inactive/未定義なら isolationServiceActive=false", () =>
+  // D3 回帰: mode token の ACL は /vms/9200 と /vms/9300 だけなので template
+  // 9100 は mode 側の qemu 一覧に出ない。provision token で確認する。
+  it.effect("template が provision credential にしか見えなくても templateExists=true", () =>
     Effect.gen(function* () {
       const client = inventoryClient({
         vms: [
-          { vmid: 9100, name: "inucon-template", status: "stopped" },
           { vmid: 9300, name: "devvm", status: "running" },
           { vmid: 9200, name: "benchvm", status: "stopped" }
         ],
+        provisionVms: [
+          { vmid: 9100, name: "inucon-template", status: "stopped" },
+          { vmid: 1101, name: "inucon-team1-1", status: "running" }
+        ],
         networks: [{ iface: "team1" }, { iface: "team2" }],
         benchvmBridges: ["team1", "team2"],
-        isolationStatus: "inactive"
+        isolationStatus: "active"
       })
-      const port = ProxmoxLive.pipe(
-        Layer.provide(Layer.succeed(HttpClient.HttpClient, client)),
-        Layer.provide(configLayer)
+      const inv = yield* inventoryOf(client)
+      expect(inv.templateExists).toEqual(Option.some(true))
+      // mode 側の一覧にしか居ない devvm/benchvm は従来どおり観測できる。
+      expect(Option.getOrThrow(inv.devvm)).toMatchObject({ vmid: 9300, name: "devvm" })
+      expect(Option.getOrThrow(inv.benchvm)).toMatchObject({ vmid: 9200, name: "benchvm" })
+    })
+  )
+
+  it.effect("isolation service が inactive/未定義(404)なら isolationServiceActive=Some(false)", () =>
+    Effect.gen(function* () {
+      const inactive = yield* inventoryOf(
+        inventoryClient({
+          vms: [
+            { vmid: 9100, name: "inucon-template", status: "stopped" },
+            { vmid: 9300, name: "devvm", status: "running" },
+            { vmid: 9200, name: "benchvm", status: "stopped" }
+          ],
+          networks: [{ iface: "team1" }, { iface: "team2" }],
+          benchvmBridges: ["team1", "team2"],
+          isolationStatus: "inactive"
+        })
       )
-      const inv = yield* ProxmoxPort.pipe(
-        Effect.flatMap((px) => px.getInfrastructureInventory),
-        Effect.provide(port)
+      expect(inactive.isolationServiceActive).toEqual(Option.some(false))
+
+      const notFound = yield* inventoryOf(
+        inventoryClient({
+          vms: [
+            { vmid: 9300, name: "devvm", status: "running" },
+            { vmid: 9200, name: "benchvm", status: "stopped" }
+          ],
+          networks: [{ iface: "team1" }, { iface: "team2" }],
+          benchvmBridges: ["team1", "team2"],
+          isolationStatus: 404
+        })
       )
-      expect(inv.isolationServiceActive).toBe(false)
+      expect(notFound.isolationServiceActive).toEqual(Option.some(false))
+    })
+  )
+
+  // D1 回帰: PVE 9.2.3 は /nodes/:node/services/:service/state の :service を
+  // 固定 enum で検証し、カスタム unit には 404 ではなく 400 を返す。この 1 本が
+  // inventory 全体を落とすと Proxmox 依存の 6 check が一律 unreadable になる。
+  it.effect("isolation service state が 400 でも inventory 全体は落ちず、他フィールドは有効値を返す", () =>
+    Effect.gen(function* () {
+      const client = inventoryClient({
+        vms: [
+          { vmid: 9300, name: "devvm", status: "running", mem: 8 * 1024 * 1024 * 1024, onBoot: 1 },
+          { vmid: 9200, name: "benchvm", status: "stopped", mem: 4 * 1024 * 1024 * 1024, onBoot: 0 }
+        ],
+        provisionVms: [{ vmid: 9100, name: "inucon-template", status: "stopped" }],
+        networks: [{ iface: "vmbr0" }],
+        sdnVnets: [{ vnet: "team1" }, { vnet: "team2" }],
+        benchvmBridges: ["team1", "team2"],
+        isolationStatus: 400,
+        memoryFreeBytes: 6_000_000_000
+      })
+      const inv = yield* inventoryOf(client)
+      // isolation だけが「取得不能」
+      expect(inv.isolationServiceActive).toEqual(Option.none())
+      // 残りはすべて有効値
+      expect(inv.templateExists).toEqual(Option.some(true))
+      expect(inv.nodeFreeMemBytes).toEqual(Option.some(6_000_000_000))
+      expect([...Option.getOrThrow(inv.preparedTeamNumbers)].sort()).toEqual([1, 2])
+      expect(Option.getOrThrow(inv.devvm)).toMatchObject({ vmid: 9300, name: "devvm" })
+      expect(Option.getOrThrow(inv.benchvm)).toMatchObject({ vmid: 9200, name: "benchvm" })
+    })
+  )
+
+  it.effect("devvm/benchvm が mode 一覧に居なくても inventory 全体は落ちず None になる", () =>
+    Effect.gen(function* () {
+      const client = inventoryClient({
+        vms: [],
+        provisionVms: [{ vmid: 9100, name: "inucon-template", status: "stopped" }],
+        networks: [],
+        sdnVnets: [{ vnet: "team1" }],
+        benchvmBridges: ["team1"],
+        isolationStatus: "active"
+      })
+      const inv = yield* inventoryOf(client)
+      expect(inv.devvm).toEqual(Option.none())
+      expect(inv.benchvm).toEqual(Option.none())
+      expect(inv.templateExists).toEqual(Option.some(true))
+      expect(inv.isolationServiceActive).toEqual(Option.some(true))
     })
   )
 })

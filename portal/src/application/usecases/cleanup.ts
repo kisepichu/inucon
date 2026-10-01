@@ -829,35 +829,46 @@ export const makeReturnNormalModeHandler: Effect.Effect<OperationHandler, never,
         // 残り step は毎回 inventory を再観測する (modeOperation.ts と同型)。
         const inv = yield* px.getInfrastructureInventory
 
+        // inventory の各フィールドは独立に観測可能/不能。devvm / benchvm が
+        // 観測できなければ identity 検証ができないので fail-closed に blocked。
+        const devvm = Option.getOrNull(inv.devvm)
+        const benchvm = Option.getOrNull(inv.benchvm)
+        if (devvm === null || benchvm === null) {
+          return blocked(
+            "devvm/benchvm are not observable in the Proxmox inventory; " +
+              "verify the mode credential ACL and /vms mapping before any power operation"
+          )
+        }
+
         // fail-closed な VMID mapping 検証(modeOperation.ts と同型)。
         // return_normal_mode は「benchvm を止めて devvm を起動」するので、
         // mapping がズレていると開発サーバを落として bench runner を起動する。
         // observed name が期待値と一致しない限り power 操作を一切発行せず
         // blocked に落とす(retry しない)。
-        const identityMismatch = modeVmIdentityMismatch(inv)
+        const identityMismatch = modeVmIdentityMismatch({ devvm, benchvm })
         if (identityMismatch !== null) return blocked(identityMismatch)
 
         switch (step.stepKey) {
           case "set_benchvm_onboot_0": {
-            if (inv.benchvm.onBoot === false) return succeeded("benchvm.onBoot already 0")
-            yield* px.setVmOnBoot(inv.benchvm.vmid, false)
+            if (benchvm.onBoot === false) return succeeded("benchvm.onBoot already 0")
+            yield* px.setVmOnBoot(benchvm.vmid, false)
             return succeeded("benchvm.onBoot set to 0")
           }
           case "shutdown_benchvm": {
-            if (inv.benchvm.status === "stopped") return succeeded("benchvm already stopped")
-            yield* px.shutdownVm(inv.benchvm.vmid)
+            if (benchvm.status === "stopped") return succeeded("benchvm already stopped")
+            yield* px.shutdownVm(benchvm.vmid)
             return succeeded("benchvm guest shutdown issued")
           }
           case "wait_benchvm_stopped": {
-            if (inv.benchvm.status === "stopped") return succeeded("benchvm already stopped")
+            if (benchvm.status === "stopped") return succeeded("benchvm already stopped")
             const result = yield* Effect.either(
-              px.waitForVmStatus(inv.benchvm.vmid, "stopped", MODE_SHUTDOWN_TIMEOUT_MILLIS)
+              px.waitForVmStatus(benchvm.vmid, "stopped", MODE_SHUTDOWN_TIMEOUT_MILLIS)
             )
             if (result._tag === "Right") return succeeded("benchvm reached stopped")
             if (result.left instanceof ModeTransitionTimeout) {
               return blocked(
                 `benchvm guest shutdown did not complete within ${MODE_SHUTDOWN_TIMEOUT_MILLIS}ms; ` +
-                  `verify guest agent then run 'qm shutdown ${inv.benchvm.vmid}' manually (do not force stop)`
+                  `verify guest agent then run 'qm shutdown ${benchvm.vmid}' manually (do not force stop)`
               )
             }
             return yield* Effect.fail(new OperationExecutionError({ cause: result.left }))
@@ -866,38 +877,42 @@ export const makeReturnNormalModeHandler: Effect.Effect<OperationHandler, never,
             // post-shutdown MemAvailable + benchvm 停止で解放される RAM が
             // devvm 起動要求 + host reserve を満たすか。既に benchvm が
             // stopped なら加算しない。
-            const benchvmReleasable = inv.benchvm.status === "running" ? inv.benchvm.memoryBytes : 0
-            const projected = inv.nodeFreeMemBytes + benchvmReleasable
-            const required = inv.devvm.memoryBytes + HOST_MEMORY_RESERVE_BYTES
+            const nodeFreeMemBytes = Option.getOrNull(inv.nodeFreeMemBytes)
+            if (nodeFreeMemBytes === null) {
+              return blocked("node free memory is not observable in the Proxmox inventory; cannot verify headroom")
+            }
+            const benchvmReleasable = benchvm.status === "running" ? benchvm.memoryBytes : 0
+            const projected = nodeFreeMemBytes + benchvmReleasable
+            const required = devvm.memoryBytes + HOST_MEMORY_RESERVE_BYTES
             return projected >= required
               ? succeeded(
-                  `post-shutdown MemAvailable ${projected}B ≥ devvm(${inv.devvm.memoryBytes}B) + reserve(${HOST_MEMORY_RESERVE_BYTES}B)`
+                  `post-shutdown MemAvailable ${projected}B ≥ devvm(${devvm.memoryBytes}B) + reserve(${HOST_MEMORY_RESERVE_BYTES}B)`
                 )
               : blocked(
-                  `post-shutdown MemAvailable ${projected}B < devvm(${inv.devvm.memoryBytes}B) + reserve(${HOST_MEMORY_RESERVE_BYTES}B); ` +
+                  `post-shutdown MemAvailable ${projected}B < devvm(${devvm.memoryBytes}B) + reserve(${HOST_MEMORY_RESERVE_BYTES}B); ` +
                     "check other workloads on the node before retrying"
                 )
           }
           case "set_devvm_onboot_1": {
-            if (inv.devvm.onBoot === true) return succeeded("devvm.onBoot already 1")
-            yield* px.setVmOnBoot(inv.devvm.vmid, true)
+            if (devvm.onBoot === true) return succeeded("devvm.onBoot already 1")
+            yield* px.setVmOnBoot(devvm.vmid, true)
             return succeeded("devvm.onBoot set to 1")
           }
           case "start_devvm": {
-            if (inv.devvm.status === "running") return succeeded("devvm already running")
-            yield* px.startVm(inv.devvm.vmid)
+            if (devvm.status === "running") return succeeded("devvm already running")
+            yield* px.startVm(devvm.vmid)
             return succeeded("devvm start issued")
           }
           case "verify_devvm_running": {
-            if (inv.devvm.status === "running") return succeeded("devvm already running")
+            if (devvm.status === "running") return succeeded("devvm already running")
             const result = yield* Effect.either(
-              px.waitForVmStatus(inv.devvm.vmid, "running", MODE_START_TIMEOUT_MILLIS)
+              px.waitForVmStatus(devvm.vmid, "running", MODE_START_TIMEOUT_MILLIS)
             )
             if (result._tag === "Right") return succeeded("devvm reached running")
             if (result.left instanceof ModeTransitionTimeout) {
               return blocked(
                 `devvm did not reach running within ${MODE_START_TIMEOUT_MILLIS}ms; ` +
-                  `verify manually with 'qm start ${inv.devvm.vmid}' and inspect boot logs`
+                  `verify manually with 'qm start ${devvm.vmid}' and inspect boot logs`
               )
             }
             return yield* Effect.fail(new OperationExecutionError({ cause: result.left }))

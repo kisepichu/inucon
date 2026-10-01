@@ -411,13 +411,23 @@ export interface VmInventoryItem {
   readonly onBoot: boolean
 }
 
+// 各フィールドは独立した Proxmox API sub-request(あるいは別 credential)から
+// 得られるため、個別に Option で包む。None = 「その sub-request が読めなかった /
+// 対象が観測できなかった」。
+//
+// 2026-10-01 本番障害の教訓: 以前は全フィールドを非 Option にして
+// getInfrastructureInventory 全体を ProxmoxError で落としていたため、
+// isolation service state の 1 本(PVE 9.2.3 はカスタム unit に HTTP 400 を返す)
+// が失敗しただけで template/team_slots/memory/benchvm/mode_vm_identity まで
+// 一律 "Proxmox inventory unreadable" に落ちた。sub-request の失敗は、それに
+// 依存する check だけに閉じ込める。
 export interface ProxmoxInfrastructureInventory {
-  readonly nodeFreeMemBytes: number
-  readonly templateExists: boolean
-  readonly devvm: VmInventoryItem
-  readonly benchvm: VmInventoryItem
-  readonly preparedTeamNumbers: ReadonlyArray<number>
-  readonly isolationServiceActive: boolean
+  readonly nodeFreeMemBytes: Option.Option<number>
+  readonly templateExists: Option.Option<boolean>
+  readonly devvm: Option.Option<VmInventoryItem>
+  readonly benchvm: Option.Option<VmInventoryItem>
+  readonly preparedTeamNumbers: Option.Option<ReadonlyArray<number>>
+  readonly isolationServiceActive: Option.Option<boolean>
 }
 
 // Proxmox VE API(https://192.0.2.10:8006/api2/json)。トークン認証。
@@ -462,18 +472,27 @@ export class ProxmoxPort extends Context.Tag("app/ProxmoxPort")<
     }>, ProxmoxError>
 
     // Task 8: readiness / enter_contest_mode 用の集約 inventory。単一呼び出しで
-    // 「readiness / mode transition が判断に必要とする現状」をすべて返す。
+    // 「readiness / mode transition が判断に必要とする現状」をすべて返す。各
+    // フィールドは独立に Option(None = その sub-request が読めなかった)。
     // - nodeFreeMemBytes: Proxmox /nodes/:node/status memory.free(reclaimable
     //   page cache を含まないため /proc/meminfo MemAvailable より保守的)。
-    // - templateExists: `templateVmid` (spec §Contest では 9100) が qemu 一覧に
-    //   template=1 で存在するか。
-    // - devvm/benchvm: 名前で解決した VM inventory item。onBoot は Proxmox の
-    //   qemu/:vmid/config の onboot(0/1)を boolean に畳んだもの。
-    // - preparedTeamNumbers: 「node network で iface=teamN として up している」
-    //   かつ「benchvm の VM config の bridge にも teamN が入っている」bridge の
-    //   N の集合(intersection)。片方だけでは実運用できないため必ず積集合を取る。
+    // - templateExists: `templateVmid` (spec §Contest では 9100) が provision
+    //   credential から見える qemu 一覧に template=1 で存在するか。template は
+    //   /pool/inucon-team-vms 所属なので mode credential の ACL では見えない。
+    // - devvm/benchvm: mode credential の qemu 一覧から名前で解決した VM
+    //   inventory item。onBoot は qemu 一覧の onboot(0/1)を boolean に畳んだもの。
+    //   一覧に居なければ None(以前は inventory 全体を失敗させていた)。
+    // - preparedTeamNumbers: 「node 側に teamN の bridge / SDN vnet が存在する」
+    //   かつ「benchvm の VM config の bridge にも teamN が入っている」N の集合
+    //   (intersection)。片方だけでは実運用できないため必ず積集合を取る。
     // - isolationServiceActive: `inucon-team-isolation` service の state が
-    //   running のときのみ true。inactive/failed/未定義はすべて false。
+    //   running のときのみ Some(true)。inactive/未定義(404)は Some(false)。
+    //   PVE 9.2.3 はカスタム unit 名を enum で弾いて HTTP 400 を返すため、
+    //   本番では None(取得不能)になる — readiness 側は warn に落とす。
+    //
+    // エラーチャネルは「provider 自体が未設定 / 無効」(stubPorts)のためだけに
+    // 残している。実クライアントは個別 sub-request の失敗を Option に畳むので
+    // この Effect 自体は失敗しない。
     readonly getInfrastructureInventory: Effect.Effect<ProxmoxInfrastructureInventory, ProxmoxError>
 
     // Task 8: enter_contest_mode / return_normal_mode 用の power / config primitive。

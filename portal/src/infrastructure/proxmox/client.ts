@@ -66,6 +66,16 @@ const NodeNetworkEntry = Schema.Struct({
 })
 const NodeNetworkResponse = Schema.Struct({ data: Schema.Array(NodeNetworkEntry) })
 
+// 2026-10-01: /nodes/:node/network は /etc/network/interfaces 由来の classic
+// bridge しか返さない。eevee の team1/team2 は Proxmox SDN の vnet
+// (zone=inucon, type=simple)なのでこちらには現れない(実測: nic0/nic1/nic2/
+// vmbr0/wlp4s0 の 5 件のみ)。vnet は /cluster/sdn/vnets に出るので両方を読む。
+const SdnVnetEntry = Schema.Struct({
+  vnet: Schema.String,
+  zone: Schema.optional(Schema.String)
+})
+const SdnVnetsResponse = Schema.Struct({ data: Schema.Array(SdnVnetEntry) })
+
 // Task 8: /nodes/:node/qemu/:vmid/config は任意のフィールドを返すため
 // necessary な項目だけ抽出する。onboot は 0/1 の integer or string。
 // name は inventory の name と一致する保証がないため config 側は無視する
@@ -431,17 +441,32 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
       requestExistsOrNotFound(HttpClientRequest.get(`${nodeUrl}/qemu/${vmid}/status/current`))
 
     // Task 8: getInfrastructureInventory は次を単発で返す集約 endpoint。
-    // - qemu list: template / devvm / benchvm の存在確認 + inventory 化。
-    // - node network: type=bridge かつ iface=teamN の N の集合。
+    // - mode qemu list: devvm / benchvm の inventory 化。
+    // - provision qemu list: template (9100) の存在確認。
+    // - node network + SDN vnets: teamN として用意済みの N の集合。
     // - benchvm config: bridge=teamN が入っている net<N> の集合。
     // - node service inucon-team-isolation の state。
     // - node status の memory.free。
     //
-    // (a) node status は mode credential でしか叩けない(least-privilege ACL:
-    //     provision は Sys.Audit を持たない)ため、readiness / mode 用の
-    //     inventory は modeClient で統一する。qemu list / network / config /
-    //     services も node 側の権限で読める(mode credential の InuconNodeAudit
-    //     + Access に VM.Audit を含む)。
+    // credential のルーティング(2026-10-01 実機 ACL 実測に合わせて修正):
+    //   /                     Administrator      terraform@pve
+    //   /nodes/eevee          InuconNodeAudit    inucon-mode@pve
+    //   /nodes/eevee          InuconNodeAudit    inucon-provision@pve
+    //   /pool/inucon-team-vms InuconProvisionVm  inucon-provision@pve
+    //   /storage/local-zfs    PVEDatastoreUser   inucon-provision@pve
+    //   /vms/9200             InuconMode         inucon-mode@pve
+    //   /vms/9300             InuconMode         inucon-mode@pve
+    // つまり node audit (Sys.Audit) は **両ユーザー** が持つ(以前のコメントの
+    // 「provision は Sys.Audit を持たない」は誤り)。一方 PVE は qemu 一覧を
+    // ACL でフィルタするため、
+    //   - mode token に見える VM  : 9200 / 9300 のみ(template 9100 は見えない)
+    //   - provision token に見える: /pool/inucon-team-vms 配下(template 9100 を含む)
+    // となる。どちらか片方の client では inventory 全体を観測できないので、
+    // 用途ごとに client を使い分ける。
+    //
+    // 各 sub-request は optionalSubRead で Option に畳む。1 本の失敗を
+    // inventory 全体の失敗に伝播させない(= その情報に依存する check だけが
+    // degrade する)。
     const parseOnBoot = (v: unknown): boolean =>
       v === 1 || v === "1" || v === true
 
@@ -454,17 +479,31 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
     const vmInventoryFromList = (
       vms: ReadonlyArray<Schema.Schema.Type<typeof VmListEntry>>,
       vmid: number
-    ): VmInventoryItem | null => {
+    ): Option.Option<VmInventoryItem> => {
       const found = vms.find((v) => v.vmid === vmid)
-      if (found === undefined || found.name === undefined) return null
-      return {
+      if (found === undefined || found.name === undefined) return Option.none()
+      return Option.some({
         vmid: found.vmid,
         name: found.name,
         status: (found.status === "running" ? "running" : "stopped") as "running" | "stopped",
         memoryBytes: parseMaxmem(found.maxmem),
         onBoot: parseOnBoot(found.onboot)
-      }
+      })
     }
+
+    // inventory の sub-request を Option に畳む。失敗は「その 1 本が読めなかった」
+    // だけの意味にし、inventory 全体は組み立て続ける。cause は describeHttpFailure
+    // 由来(method + path + 要約のみ、credential を含まない)なので warn に出せる。
+    const optionalSubRead = <A>(
+      label: string,
+      effect: Effect.Effect<A, ProxmoxError>
+    ): Effect.Effect<Option.Option<A>> =>
+      effect.pipe(
+        Effect.tapError((error) =>
+          Effect.logWarning(`Proxmox inventory sub-read '${label}' failed: ${error.cause}`)
+        ),
+        Effect.option
+      )
 
     // benchvm の VM config を single request で読み、"net<N>" のうち
     // bridge=teamK が含まれるものの K だけ集める(intersection の benchvm 側)。
@@ -485,31 +524,64 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
         })
       )
 
-    // node network の iface=teamN を集める(intersection のノード側)。
-    const readNodeTeamBridges: Effect.Effect<ReadonlyArray<number>, ProxmoxError> =
+    const teamNumbersOf = (names: ReadonlyArray<string>): ReadonlyArray<number> => {
+      const acc: Array<number> = []
+      for (const name of names) {
+        const m = name.match(/^team(\d+)$/)
+        if (m !== null) acc.push(Number(m[1]))
+      }
+      return acc
+    }
+
+    // classic bridge(/etc/network/interfaces 由来)の iface=teamN。
+    const readNodeBridgeTeamNumbers: Effect.Effect<ReadonlyArray<number>, ProxmoxError> =
       requestWith(
         modeClient,
         HttpClientRequest.get(`${nodeUrl}/network`),
         NodeNetworkResponse
-      ).pipe(
-        Effect.map((r) => {
-          const acc: Array<number> = []
-          for (const n of r.data) {
-            const m = n.iface.match(/^team(\d+)$/)
-            if (m !== null) acc.push(Number(m[1]))
-          }
-          return acc
-        })
-      )
+      ).pipe(Effect.map((r) => teamNumbersOf(r.data.map((n) => n.iface))))
 
-    // review round 3 finding 2: service state 未定義(404)だけを "inactive"
-    // 相当として畳み、authorization / schema / ネットワーク失敗は
-    // ProxmoxError のまま伝播させる。以前は Effect.catchAll(() => false)
-    // で全てを飲み込んでいたが、401/403 やスキーマ mismatch のときに
-    // 「isolation: fail」と誤診する false-positive があった(readiness の
-    // 「isolation service を start しろ」誘導が正しくは「trocken トークン権限
-    // 修正が必要」だった、というケース)。ここでは requestWith を通さず
-    // 直接 modeClient.execute し、response.status を見て 404 だけ absorb する。
+    // SDN vnet(zone=inucon)の vnet=teamN。現行 eevee の team1/team2 はこちら。
+    const readSdnVnetTeamNumbers: Effect.Effect<ReadonlyArray<number>, ProxmoxError> =
+      requestWith(
+        modeClient,
+        HttpClientRequest.get(`${apiUrl}/cluster/sdn/vnets`),
+        SdnVnetsResponse
+      ).pipe(Effect.map((r) => teamNumbersOf(r.data.map((v) => v.vnet))))
+
+    // node 側の「teamN が用意されている」観測。classic bridge と SDN vnet の
+    // 和集合を取る(どちらの形でも運用でき、将来 classic に戻る可能性もある)。
+    // 両方読めなかったときだけ None。片方だけ失敗したら読めた方を採用する。
+    const readNodeTeamNumbers: Effect.Effect<Option.Option<ReadonlyArray<number>>> = Effect.gen(
+      function* () {
+        const [bridges, vnets] = yield* Effect.all(
+          [
+            optionalSubRead("node network bridges", readNodeBridgeTeamNumbers),
+            optionalSubRead("cluster SDN vnets", readSdnVnetTeamNumbers)
+          ],
+          { concurrency: "unbounded" }
+        )
+        if (Option.isNone(bridges) && Option.isNone(vnets)) return Option.none()
+        return Option.some([
+          ...Option.getOrElse(bridges, (): ReadonlyArray<number> => []),
+          ...Option.getOrElse(vnets, (): ReadonlyArray<number> => [])
+        ])
+      }
+    )
+
+    // isolation service state。404(= unit 未定義)だけを "inactive" 相当に
+    // 畳み、それ以外の非 2xx / schema / ネットワーク失敗は ProxmoxError にする
+    // (呼び出し側の optionalSubRead が None = 取得不能に畳む)。
+    //
+    // 2026-10-01 実測: PVE 9.2.3 は :service を固定 enum で検証するため、
+    // カスタム unit には 404 ではなく HTTP 400 を返す
+    // (errors.service = "value 'inucon-team-isolation' does not have a value in
+    //  the enumeration 'chrony, corosync, cron, ...'")。unit 自体は eevee 上で
+    // enabled かつ active なので、これは「サーバ異常」ではなく「この API では
+    // 観測できない」。したがって 400 を "inactive" に畳むのは誤診(review round
+    // 3 finding 2 と同じ理由)であり、None = 取得不能として readiness 側で warn
+    // に落とす。/nodes/:node/services の一覧も同じ enum 由来の固定リストしか
+    // 返さない(PVE::API2::Services の $service_list)ため代替にならない。
     const readIsolationServiceActive: Effect.Effect<boolean, ProxmoxError> = Effect.gen(function* () {
       const req = HttpClientRequest.get(`${nodeUrl}/services/inucon-team-isolation/state`)
       return yield* modeClient.execute(req).pipe(
@@ -539,38 +611,49 @@ export const ProxmoxLive: Layer.Layer<ProxmoxPort, ConfigError, HttpClient.HttpC
     //   inventory 側の template=1 フラグと VMID の両方で識別できる。
     const TEMPLATE_VMID = 9100
 
+    // template は /pool/inucon-team-vms 所属なので provision credential の
+    // qemu 一覧にだけ現れる(mode token の ACL は /vms/9200 と /vms/9300 のみ)。
+    const readTemplateExists: Effect.Effect<boolean, ProxmoxError> =
+      requestWith(provisionClient, HttpClientRequest.get(`${nodeUrl}/qemu`), VmListResponse).pipe(
+        Effect.map((r) => r.data.some((v) => v.vmid === TEMPLATE_VMID && parseTemplate(v.template)))
+      )
+
     const getInfrastructureInventoryEffect: Effect.Effect<
       ProxmoxInfrastructureInventory,
       ProxmoxError
     > = Effect.gen(function* () {
-      const [nodeFreeMemBytes, listResp, isolationActive, benchvmBridges, nodeBridges] = yield* Effect.all(
-        [
-          readNodeFreeMemBytes,
-          requestWith(modeClient, HttpClientRequest.get(`${nodeUrl}/qemu`), VmListResponse),
-          readIsolationServiceActive,
-          readBenchvmBridges,
-          readNodeTeamBridges
-        ],
-        { concurrency: "unbounded" }
+      const [nodeFreeMemBytes, modeVms, templateExists, isolationActive, benchvmBridges, nodeTeamNumbers] =
+        yield* Effect.all(
+          [
+            optionalSubRead("node status", readNodeFreeMemBytes),
+            optionalSubRead(
+              "mode qemu list",
+              requestWith(modeClient, HttpClientRequest.get(`${nodeUrl}/qemu`), VmListResponse).pipe(
+                Effect.map((r) => r.data)
+              )
+            ),
+            optionalSubRead("provision qemu list (template)", readTemplateExists),
+            optionalSubRead("isolation service state", readIsolationServiceActive),
+            optionalSubRead("benchvm config bridges", readBenchvmBridges),
+            readNodeTeamNumbers
+          ],
+          { concurrency: "unbounded" }
+        )
+      // preparedTeamNumbers は「node 側に teamN がある」∩「benchvm が teamN に
+      // 足を持つ」。片方でも観測できなければ判定不能(None)。
+      const preparedTeamNumbers = Option.map(
+        Option.all([nodeTeamNumbers, benchvmBridges]),
+        ([nodeNumbers, benchvmNumbers]): ReadonlyArray<number> => {
+          const benchvmSet = new Set(benchvmNumbers)
+          return [...new Set(nodeNumbers.filter((n) => benchvmSet.has(n)))].sort((a, b) => a - b)
+        }
       )
-      const vms = listResp.data
-      const templateExists = vms.some((v) => v.vmid === TEMPLATE_VMID && parseTemplate(v.template))
-      const devvm = vmInventoryFromList(vms, DEVVM_VMID)
-      const benchvm = vmInventoryFromList(vms, BENCHVM_VMID)
-      if (devvm === null) {
-        return yield* Effect.fail(new ProxmoxError({ cause: `devvm (vmid ${DEVVM_VMID}) not present in inventory` }))
-      }
-      if (benchvm === null) {
-        return yield* Effect.fail(new ProxmoxError({ cause: `benchvm (vmid ${BENCHVM_VMID}) not present in inventory` }))
-      }
-      const benchvmBridgeSet = new Set(benchvmBridges)
-      const prepared = [...new Set(nodeBridges.filter((n) => benchvmBridgeSet.has(n)))].sort((a, b) => a - b)
       return {
         nodeFreeMemBytes,
         templateExists,
-        devvm,
-        benchvm,
-        preparedTeamNumbers: prepared,
+        devvm: Option.flatMap(modeVms, (vms) => vmInventoryFromList(vms, DEVVM_VMID)),
+        benchvm: Option.flatMap(modeVms, (vms) => vmInventoryFromList(vms, BENCHVM_VMID)),
+        preparedTeamNumbers,
         isolationServiceActive: isolationActive
       }
     })

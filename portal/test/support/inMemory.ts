@@ -55,7 +55,7 @@ import {
   UserRepo,
   UuidGen
 } from "../../src/application/ports.js"
-import type { ProxmoxInfrastructureInventory } from "../../src/application/ports.js"
+import type { ProxmoxInfrastructureInventory, VmInventoryItem } from "../../src/application/ports.js"
 
 // テスト専用のインメモリ port 実装。すべて Ref ベースで、ports.ts のコメントに
 // 書かれた意味論(TOCTOU 回避 / 全体 running 1 本制約)を素直に再現する。
@@ -1090,6 +1090,54 @@ export interface ManagedVmSeed {
 
 // Task 8: makeProxmoxPortTest の options を named type として export し、
 // テスト側から重複定義せず再利用できるようにする(ts-no-return-type ルール)。
+//
+// getInfrastructureInventory の各フィールドは Option(None = 観測不能)なので、
+// テストは plain な seed を書き、makeInfrastructureInventory が Option に包む。
+// 明示的に null を渡したフィールドだけが None になる。
+export interface InfrastructureInventorySeed {
+  nodeFreeMemBytes?: number | null
+  templateExists?: boolean | null
+  devvm?: VmInventoryItem | null
+  benchvm?: VmInventoryItem | null
+  preparedTeamNumbers?: ReadonlyArray<number> | null
+  isolationServiceActive?: boolean | null
+}
+
+const DEFAULT_INVENTORY_SEED: Required<InfrastructureInventorySeed> = {
+  nodeFreeMemBytes: 20_000_000_000,
+  templateExists: true,
+  devvm: {
+    vmid: 9300,
+    name: "devvm",
+    status: "running",
+    memoryBytes: 8 * 1024 * 1024 * 1024,
+    onBoot: true
+  },
+  benchvm: {
+    vmid: 9200,
+    name: "benchvm",
+    status: "stopped",
+    memoryBytes: 4 * 1024 * 1024 * 1024,
+    onBoot: false
+  },
+  preparedTeamNumbers: [1, 2],
+  isolationServiceActive: true
+}
+
+export const makeInfrastructureInventory = (
+  seed: InfrastructureInventorySeed = {}
+): ProxmoxInfrastructureInventory => {
+  const merged = { ...DEFAULT_INVENTORY_SEED, ...seed }
+  return {
+    nodeFreeMemBytes: Option.fromNullable(merged.nodeFreeMemBytes),
+    templateExists: Option.fromNullable(merged.templateExists),
+    devvm: Option.fromNullable(merged.devvm),
+    benchvm: Option.fromNullable(merged.benchvm),
+    preparedTeamNumbers: Option.fromNullable(merged.preparedTeamNumbers),
+    isolationServiceActive: Option.fromNullable(merged.isolationServiceActive)
+  }
+}
+
 export interface ProxmoxTestOptions {
   freeMemBytes?: number
   guestAgentReady?: boolean
@@ -1097,10 +1145,9 @@ export interface ProxmoxTestOptions {
   existingVmids?: ReadonlyArray<number>
   managedVms?: ReadonlyArray<ManagedVmSeed>
   // Task 8: getInfrastructureInventory の返却値を直接シードする。未指定なら
-  // 呼び出しは defect にせず、テスト用に「最低限あり得る値(template/devvm/
-  // benchvm 全部あり、preparedTeamNumbers=[1,2]、isolation active、free 6 GiB)」
-  // を返す(既存テストで新メソッドを触るところは無いはずだが安全側)。
-  infrastructureInventory?: ProxmoxInfrastructureInventory
+  // 「template/devvm/benchvm 全部あり、preparedTeamNumbers=[1,2]、isolation
+  // active、free 20 GiB」の健全な既定値。
+  infrastructureInventory?: InfrastructureInventorySeed
 }
 
 export interface ProxmoxPortTestFixture {
@@ -1111,27 +1158,7 @@ export interface ProxmoxPortTestFixture {
 export const makeProxmoxPortTest = (
   options: ProxmoxTestOptions = {}
 ): ProxmoxPortTestFixture => {
-  const DEFAULT_INVENTORY: ProxmoxInfrastructureInventory = {
-    nodeFreeMemBytes: 20_000_000_000,
-    templateExists: true,
-    devvm: {
-      vmid: 9300,
-      name: "devvm",
-      status: "running",
-      memoryBytes: 8 * 1024 * 1024 * 1024,
-      onBoot: true
-    },
-    benchvm: {
-      vmid: 9200,
-      name: "benchvm",
-      status: "stopped",
-      memoryBytes: 4 * 1024 * 1024 * 1024,
-      onBoot: false
-    },
-    preparedTeamNumbers: [1, 2],
-    isolationServiceActive: true
-  }
-  const inventory = options.infrastructureInventory ?? DEFAULT_INVENTORY
+  const inventory = makeInfrastructureInventory(options.infrastructureInventory)
   const stateRef = Ref.unsafeMake({ ...emptyProxmoxState, existingVmids: options.existingVmids ?? [] })
   const freeMemBytes = options.freeMemBytes ?? 6_000_000_000
   const guestAgentReady = options.guestAgentReady ?? true
@@ -1241,8 +1268,13 @@ export const makeProxmoxPortTest = (
       // 既定は inventory の状態と一致するかで判定する。inventory と一致しない
       // (= shutdown/start がまだ)なら ModeTransitionTimeout(テスト側で
       // shutdown/start の記録を進めれば inventory を上書きして pass にできる)。
-      const inv = inventory
-      const actual = vmid === inv.devvm.vmid ? inv.devvm.status : vmid === inv.benchvm.vmid ? inv.benchvm.status : "stopped"
+      const devvm = Option.getOrNull(inventory.devvm)
+      const benchvm = Option.getOrNull(inventory.benchvm)
+      const actual = devvm !== null && vmid === devvm.vmid
+        ? devvm.status
+        : benchvm !== null && vmid === benchvm.vmid
+          ? benchvm.status
+          : "stopped"
       return actual === expected
         ? Effect.void
         : Effect.fail(new ModeTransitionTimeout({ vmid, expected, timeoutMillis }))

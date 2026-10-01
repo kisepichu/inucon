@@ -37,8 +37,6 @@ const AccessApp = Schema.Struct({
   domain: Schema.String
 })
 
-const AccessAppsList = Schema.Array(AccessApp)
-
 // email include のみ厳格にデコードする。everyone/ip/email_domain 等の他の include
 // 種別は CF API 上多様な形を取り得るため、ここでは Schema.Unknown で受けて未知の形の
 // まま保持する(厳格な Struct にすると、既存ポリシーにそれらが混在した瞬間に decode が
@@ -73,8 +71,35 @@ const CfApiError = Schema.Struct({
 const CfEnvelope = Schema.Struct({
   success: Schema.Boolean,
   errors: Schema.optional(Schema.Array(CfApiError)),
-  result: Schema.optional(Schema.Unknown)
+  result: Schema.optional(Schema.Unknown),
+  // ページング応答にだけ付く。形は endpoint ごとに揺れる(null も返り得る)
+  // ので Unknown で受け、total_pages だけを後段で防御的に読む。
+  result_info: Schema.optional(Schema.Unknown)
 })
+
+// CF API v4 の per_page は endpoint ごとに許可値が違う。2026-10-01 実測
+// (各 3 回、完全に再現): /accounts/:id/access/apps は per_page=100/500/1000 が
+// 200、101 と 5000 は 400(12091 access.api.error.invalid_url_parameter_value)。
+// DNS 側は 5000 でも 200 が返るが、仕様外の値に依存する理由が無い。両方とも
+// 100 件ずつ引き、result_info.total_pages まで辿って全件を取り切る
+// (途中で打ち切ると reconciliation が resource を見落として誤った plan を出す)。
+const CF_PAGE_SIZE = 100
+// 暴走防止。100 件 × 1000 ページ = 10 万件で、INUCON の資源規模では到達しない。
+const CF_MAX_PAGES = 1000
+
+const readTotalPages = (resultInfo: unknown): number | null => {
+  if (typeof resultInfo !== "object" || resultInfo === null) return null
+  if (!("total_pages" in resultInfo)) return null
+  const raw = resultInfo.total_pages
+  const n = typeof raw === "string" ? Number(raw) : typeof raw === "number" ? raw : Number.NaN
+  return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : null
+}
+
+// Access app の `domain` は hostname とは限らない。実運用の同一アカウントには
+// `dawarich.kisen.one/api/v1/*` のようなパス付き app が同居しており、先頭ラベル
+// だけを見ると `inucon-team1-1.kisen.one/foo` のような app を managed hostname と
+// 誤認し得る。bare hostname(英数字 + '-' + '.')のときだけ stem を返す。
+const ACCESS_APP_HOSTNAME_PATTERN = /^[A-Za-z0-9.-]+$/
 
 // トークンを含まない(cause は method + path + エラー要約のみ)success:false の
 // 要約文字列を作る。errors が空の場合も success:false 自体を明示する。
@@ -106,11 +131,12 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
 
     // 2xx かつ success:true のときだけ result を resultSchema でデコードして返す。
     // 2xx でも success:false なら CloudflareError(errors の要約を cause に)。
-    // 2xx 以外はステータスで即 fail。
-    const request = <A, I>(
+    // 2xx 以外はステータスで即 fail。result_info.total_pages はページングを
+    // 辿るためだけに返す(非ページング応答では null)。
+    const requestPage = <A, I>(
       req: HttpClientRequest.HttpClientRequest,
       resultSchema: Schema.Schema<A, I>
-    ): Effect.Effect<A, CloudflareError> =>
+    ): Effect.Effect<{ readonly result: A; readonly totalPages: number | null }, CloudflareError> =>
       client.execute(req).pipe(
         Effect.mapError((cause) => new CloudflareError({ cause: describeHttpFailure(req, cause) })),
         Effect.flatMap((response) =>
@@ -120,6 +146,7 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
                 Effect.flatMap((envelope) =>
                   envelope.success
                     ? Schema.decodeUnknown(resultSchema)(envelope.result).pipe(
+                        Effect.map((result) => ({ result, totalPages: readTotalPages(envelope.result_info) })),
                         Effect.mapError((cause) => new CloudflareError({ cause: describeHttpFailure(req, cause) }))
                       )
                     : Effect.fail(new CloudflareError({ cause: summarizeCfErrors(req, envelope.errors) }))
@@ -131,6 +158,51 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
         ),
         Effect.scoped
       )
+
+    const request = <A, I>(
+      req: HttpClientRequest.HttpClientRequest,
+      resultSchema: Schema.Schema<A, I>
+    ): Effect.Effect<A, CloudflareError> =>
+      requestPage(req, resultSchema).pipe(Effect.map((page) => page.result))
+
+    // 一覧 endpoint を per_page=CF_PAGE_SIZE で全ページ取り切る。result_info が
+    // 無い応答(= ページングしない endpoint / fake)は 1 ページで確定する。
+    const requestAllPages = <A, I>(
+      baseReq: HttpClientRequest.HttpClientRequest,
+      itemSchema: Schema.Schema<A, I>
+    ): Effect.Effect<ReadonlyArray<A>, CloudflareError> =>
+      Effect.gen(function* () {
+        const items: Array<A> = []
+        for (let page = 1; page <= CF_MAX_PAGES; page++) {
+          const { result, totalPages } = yield* requestPage(
+            baseReq.pipe(
+              HttpClientRequest.setUrlParam("per_page", String(CF_PAGE_SIZE)),
+              HttpClientRequest.setUrlParam("page", String(page))
+            ),
+            Schema.Array(itemSchema)
+          )
+          items.push(...result)
+          // result_info が無い応答(= ページングしない endpoint)は 1 ページで確定。
+          if (totalPages === null || page >= totalPages) return items
+          // まだ後続ページがあるはずなのに 0 件 — CF 側の race / 一過性エラーの
+          // 可能性がある。黙って打ち切ると reconciliation が既存 resource を
+          // 見落として重複作成する plan を出すので、fail-closed にする。
+          if (result.length === 0) {
+            return yield* Effect.fail(
+              new CloudflareError({
+                cause:
+                  `Cloudflare API GET ${requestPath(baseReq)} → page ${page}/${totalPages} returned 0 items; ` +
+                  "refusing to truncate inventory"
+              })
+            )
+          }
+        }
+        return yield* Effect.fail(
+          new CloudflareError({
+            cause: `Cloudflare API GET ${requestPath(baseReq)} → exceeded ${CF_MAX_PAGES} pages; refusing to truncate inventory`
+          })
+        )
+      })
 
     // PUT/POST/DELETE の void 系。result の形は見ず success だけ検証する
     // (DNS 削除等で result が薄い/null なケースも通す)。
@@ -247,10 +319,13 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
         yield* putIngress(updated)
       })
 
+    // 「この hostname の app が既にあるか」。1 ページ目だけを見ると、account に
+    // 他サービスの app が多いときに既存 app を見落として重複作成するため
+    // 全ページを辿る(getInstanceInventory と同じ理由)。
     const findAccessApp = (hostname: string) =>
-      request(
+      requestAllPages(
         HttpClientRequest.get(`${CF_API_BASE}/accounts/${accountId}/access/apps`),
-        AccessAppsList
+        AccessApp
       ).pipe(Effect.map((apps) => apps.find((a) => a.domain === hostname)))
 
     const getPolicies = (appId: string) =>
@@ -405,19 +480,16 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
       // した集合の SHA-256 のみを返す(spec: "Access email 一覧を operation log /
       // response に残さない")。planner は emailSetHash で drift を検出できる。
       getInstanceInventory: Effect.gen(function* () {
-        const allDns = yield* request(
+        const allDns = yield* requestAllPages(
           HttpClientRequest.get(`${CF_API_BASE}/zones/${zoneId}/dns_records`).pipe(
-            HttpClientRequest.setUrlParam("type", "CNAME"),
-            HttpClientRequest.setUrlParam("per_page", "5000")
+            HttpClientRequest.setUrlParam("type", "CNAME")
           ),
-          DnsRecordsList
+          DnsRecord
         )
         const ingress = yield* getIngress()
-        const apps = yield* request(
-          HttpClientRequest.get(`${CF_API_BASE}/accounts/${accountId}/access/apps`).pipe(
-            HttpClientRequest.setUrlParam("per_page", "5000")
-          ),
-          AccessAppsList
+        const apps = yield* requestAllPages(
+          HttpClientRequest.get(`${CF_API_BASE}/accounts/${accountId}/access/apps`),
+          AccessApp
         )
 
         const managedDns = allDns.filter((r) => {
@@ -463,7 +535,12 @@ export const CloudflareLive: Layer.Layer<CloudflarePort, ConfigError, HttpClient
         // review #3: getPolicies を管理対象 app 数だけ直列に叩くと 50 チーム
         // 規模で 10 秒台の inventory になり、CF rate limiter 429 も踏みやすい。
         // concurrency 10 で並列化しつつ、hostname 単位の集約は決定的に行う。
-        const managed = apps.filter((app) => MANAGED_HOSTNAME_PATTERN.test(app.domain.split(".")[0]))
+        // path 付き domain(`inucon-team1-1.kisen.one/api/*` など)は hostname
+        // として扱わない。先頭ラベルだけを見ると portal 所有 app と誤認する。
+        const managed = apps.filter((app) => {
+          if (!ACCESS_APP_HOSTNAME_PATTERN.test(app.domain)) return false
+          return MANAGED_HOSTNAME_PATTERN.test(app.domain.split(".")[0])
+        })
         const fetched = yield* Effect.forEach(
           managed,
           (app) =>

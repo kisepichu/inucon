@@ -44,12 +44,19 @@ import type { ProxmoxInfrastructureInventory } from "../ports.js"
 // - rehearsal: 少なくとも 1 回 admin が rehearsal を成功させてから start する
 //   (Access + route + adapter の end-to-end 疎通が実証されていない状態で
 //   一斉開始しないためのセーフティ)。
+//
+// 2026-10-01: isolation を required から外した。isolation の実体は eevee 上の
+// iptables FORWARD DROP ルールを張る oneshot unit (infra/docs/team-isolation.md)
+// で、PVE 9.2.3 の /nodes/:node/services/:service/state はカスタム unit 名を
+// 固定 enum で弾く(HTTP 400)ため、portal の credential では状態を観測できない。
+// 観測不能な条件を required gate に残すと start が恒久的にブロックされるので、
+// 「観測できたときだけ pass/fail、観測できなければ warn + 手動確認手順」に
+// 落とす(isolationCheck 参照)。
 export const START_REQUIRED_CHECK_KEYS: ReadonlyArray<string> = [
   "portal_db",
   "previous_cleanup",
   "template",
   "team_slots",
-  "isolation",
   "memory",
   "benchvm",
   "mode_vm_identity",
@@ -87,18 +94,29 @@ const REQUIRED_TEAM_NUMBERS: ReadonlyArray<number> = [1, 2]
 // の predicate と一致させる(spec §readiness Step 4)。
 const isActiveInstanceStatus = (status: string): boolean => status !== "deleted"
 
-// 個々の provider inventory 取得を Either 化する。成功なら Some、失敗なら None
-// を返し、summary/error は呼び出し側で readiness key に畳む。生 error 詳細は
-// summary には残さない(spec §credential:「Access email 一覧を operation
-// log / response に残さない」と同型で、readiness 応答は非機密のみ)。
-const optionalInventory: Effect.Effect<
-  Option.Option<ProxmoxInfrastructureInventory>,
+// provider inventory を観測する。ProxmoxPort 自体が失敗した(= provider 未設定 /
+// 無効)場合は「全フィールド観測不能」の inventory に畳む。これで各 check は
+// 自分が依存するフィールドの Option だけを見れば良くなる(provider 全体の
+// 失敗と個別 sub-request の失敗を呼び出し側で区別する必要がない)。
+// 生 error 詳細は summary に残さない(spec §credential:「Access email 一覧を
+// operation log / response に残さない」と同型で、readiness 応答は非機密のみ)。
+const UNREADABLE_INVENTORY: ProxmoxInfrastructureInventory = {
+  nodeFreeMemBytes: Option.none(),
+  templateExists: Option.none(),
+  devvm: Option.none(),
+  benchvm: Option.none(),
+  preparedTeamNumbers: Option.none(),
+  isolationServiceActive: Option.none()
+}
+
+const observeInventory: Effect.Effect<
+  ProxmoxInfrastructureInventory,
   never,
   ProxmoxPort
 > = Effect.gen(function* () {
   const px = yield* ProxmoxPort
   const result = yield* Effect.either(px.getInfrastructureInventory)
-  return result._tag === "Right" ? Option.some(result.right) : Option.none()
+  return result._tag === "Right" ? result.right : UNREADABLE_INVENTORY
 })
 
 const cloudflareTokenCheck: Effect.Effect<ReadinessCheck, never, CloudflarePort> = Effect.gen(function* () {
@@ -150,36 +168,36 @@ const previousCleanupCheck = (
   })
 
 const templateCheck = (
-  inventory: Option.Option<ProxmoxInfrastructureInventory>
+  inventory: ProxmoxInfrastructureInventory
 ): ReadinessCheck =>
-  Option.match(inventory, {
+  Option.match(inventory.templateExists, {
     onNone: () => ({
       key: "template",
       status: "fail" as const,
-      summary: "Proxmox inventory unreadable"
+      summary: "Proxmox template inventory unreadable"
     }),
-    onSome: (inv) =>
-      inv.templateExists
+    onSome: (exists) =>
+      exists
         ? { key: "template", status: "pass" as const, summary: "template VM 9100 present" }
         : { key: "template", status: "fail" as const, summary: "template VM 9100 not found in inventory" }
   })
 
 const teamSlotsCheck = (
-  inventory: Option.Option<ProxmoxInfrastructureInventory>
+  inventory: ProxmoxInfrastructureInventory
 ): ReadinessCheck =>
-  Option.match(inventory, {
+  Option.match(inventory.preparedTeamNumbers, {
     onNone: () => ({
       key: "team_slots",
       status: "fail" as const,
-      summary: "Proxmox inventory unreadable"
+      summary: "Proxmox team slot inventory unreadable"
     }),
-    onSome: (inv) => {
-      const missing = REQUIRED_TEAM_NUMBERS.filter((n) => !inv.preparedTeamNumbers.includes(n))
+    onSome: (prepared) => {
+      const missing = REQUIRED_TEAM_NUMBERS.filter((n) => !prepared.includes(n))
       return missing.length === 0
         ? {
             key: "team_slots",
             status: "pass" as const,
-            summary: `team slots ready: ${inv.preparedTeamNumbers.slice().sort((a, b) => a - b).join(",")}`
+            summary: `team slots ready: ${prepared.slice().sort((a, b) => a - b).join(",")}`
           }
         : {
             key: "team_slots",
@@ -189,17 +207,23 @@ const teamSlotsCheck = (
     }
   })
 
+// isolation: PVE 9.2.3 の service state API はカスタム unit を観測できない
+// (HTTP 400、infrastructure/proxmox/client.ts の readIsolationServiceActive
+// 参照)。観測できたときだけ pass/fail を返し、観測不能なら warn + 手動確認の
+// 手順を summary に載せる。START_REQUIRED_CHECK_KEYS からは外してある。
 const isolationCheck = (
-  inventory: Option.Option<ProxmoxInfrastructureInventory>
+  inventory: ProxmoxInfrastructureInventory
 ): ReadinessCheck =>
-  Option.match(inventory, {
+  Option.match(inventory.isolationServiceActive, {
     onNone: () => ({
       key: "isolation",
-      status: "fail" as const,
-      summary: "Proxmox inventory unreadable"
+      status: "warn" as const,
+      summary:
+        "inucon-team-isolation state is not observable via the Proxmox API; " +
+        "verify on eevee: systemctl is-active inucon-team-isolation"
     }),
-    onSome: (inv) =>
-      inv.isolationServiceActive
+    onSome: (active) =>
+      active
         ? { key: "isolation", status: "pass" as const, summary: "inucon-team-isolation service active" }
         : {
             key: "isolation",
@@ -209,27 +233,27 @@ const isolationCheck = (
   })
 
 const memoryCheck = (
-  inventory: Option.Option<ProxmoxInfrastructureInventory>
+  inventory: ProxmoxInfrastructureInventory
 ): ReadinessCheck =>
-  Option.match(inventory, {
-    onNone: () => ({ key: "memory", status: "fail" as const, summary: "Proxmox inventory unreadable" }),
-    onSome: (inv) => {
+  Option.match(Option.all([inventory.nodeFreeMemBytes, inventory.devvm, inventory.benchvm]), {
+    onNone: () => ({ key: "memory", status: "fail" as const, summary: "Proxmox memory inventory unreadable" }),
+    onSome: ([nodeFreeMemBytes, devvm, benchvm]) => {
       // post-shutdown MemAvailable = 現在の free + devvm 停止で解放される RAM。
       // devvm が既に stopped ならその分は加算しない(実際に解放されるのは
       // running → stopped の 1 回だけ)。
-      const devvmReleasable = inv.devvm.status === "running" ? inv.devvm.memoryBytes : 0
-      const projectedAvailable = inv.nodeFreeMemBytes + devvmReleasable
-      const required = inv.benchvm.memoryBytes + HOST_MEMORY_RESERVE_BYTES
+      const devvmReleasable = devvm.status === "running" ? devvm.memoryBytes : 0
+      const projectedAvailable = nodeFreeMemBytes + devvmReleasable
+      const required = benchvm.memoryBytes + HOST_MEMORY_RESERVE_BYTES
       return projectedAvailable >= required
         ? {
             key: "memory",
             status: "pass" as const,
-            summary: `post-shutdown MemAvailable ≥ benchvm(${inv.benchvm.memoryBytes}B) + reserve(${HOST_MEMORY_RESERVE_BYTES}B)`
+            summary: `post-shutdown MemAvailable ≥ benchvm(${benchvm.memoryBytes}B) + reserve(${HOST_MEMORY_RESERVE_BYTES}B)`
           }
         : {
             key: "memory",
             status: "fail" as const,
-            summary: `post-shutdown MemAvailable ${projectedAvailable}B < benchvm(${inv.benchvm.memoryBytes}B) + reserve(${HOST_MEMORY_RESERVE_BYTES}B)`
+            summary: `post-shutdown MemAvailable ${projectedAvailable}B < benchvm(${benchvm.memoryBytes}B) + reserve(${HOST_MEMORY_RESERVE_BYTES}B)`
           }
     }
   })
@@ -238,28 +262,28 @@ const memoryCheck = (
 // post-shutdown ノード RAM をどこまで食うかの概算警告。実測は Task 9 が
 // team VM 起動時に memory_check step で個別に判定するのでここは warn 止まり。
 const capacityEstimateCheck = (
-  inventory: Option.Option<ProxmoxInfrastructureInventory>,
+  inventory: ProxmoxInfrastructureInventory,
   contest: Contest
 ): ReadinessCheck =>
-  Option.match(inventory, {
+  Option.match(Option.all([inventory.nodeFreeMemBytes, inventory.devvm, inventory.benchvm]), {
     onNone: () => ({
       key: "capacity_estimate",
       status: "warn" as const,
-      summary: "Proxmox inventory unreadable; skipping capacity estimate"
+      summary: "Proxmox memory inventory unreadable; skipping capacity estimate"
     }),
-    onSome: (inv) => {
+    onSome: ([nodeFreeMemBytes, devvm, benchvm]) => {
       // desired total = quota * ~4 GiB (per-team-VM 実測は 4 GiB、Task 9 で確定)。
       const estimatedPerVm = 4 * 1024 * 1024 * 1024
       const desiredTotal = contest.instanceQuota * estimatedPerVm
       // 「benchvm が停止中」ならこの後の memory_check 直後に benchvm が起動して
       // その分ノード free が減る前提で見積もる。benchvm が既に running なら
-      // inv.nodeFreeMemBytes は benchvm の RAM を既に控除済み(round 1 review
+      // nodeFreeMemBytes は benchvm の RAM を既に控除済み(round 1 review
       // finding 1: そこから更に benchvm.memoryBytes を引くと二重控除で常に warn
       // に振れる)。同じ推論を memoryCheck / modeOperation.memory_check にも
       // 揃えてある。
-      const devvmReleasable = inv.devvm.status === "running" ? inv.devvm.memoryBytes : 0
-      const benchvmNeededExtra = inv.benchvm.status === "running" ? 0 : inv.benchvm.memoryBytes
-      const postModeFree = inv.nodeFreeMemBytes + devvmReleasable - benchvmNeededExtra
+      const devvmReleasable = devvm.status === "running" ? devvm.memoryBytes : 0
+      const benchvmNeededExtra = benchvm.status === "running" ? 0 : benchvm.memoryBytes
+      const postModeFree = nodeFreeMemBytes + devvmReleasable - benchvmNeededExtra
       return desiredTotal <= postModeFree - HOST_MEMORY_RESERVE_BYTES
         ? {
             key: "capacity_estimate",
@@ -275,14 +299,14 @@ const capacityEstimateCheck = (
   })
 
 const benchvmCheck = (
-  inventory: Option.Option<ProxmoxInfrastructureInventory>
+  inventory: ProxmoxInfrastructureInventory
 ): ReadinessCheck =>
-  Option.match(inventory, {
-    onNone: () => ({ key: "benchvm", status: "fail" as const, summary: "Proxmox inventory unreadable" }),
-    onSome: (inv) => ({
+  Option.match(inventory.benchvm, {
+    onNone: () => ({ key: "benchvm", status: "fail" as const, summary: "benchvm not present in Proxmox inventory" }),
+    onSome: (benchvm) => ({
       key: "benchvm",
       status: "pass" as const,
-      summary: `benchvm inventory present (status=${inv.benchvm.status}, onBoot=${inv.benchvm.onBoot})`
+      summary: `benchvm inventory present (status=${benchvm.status}, onBoot=${benchvm.onBoot})`
     })
   })
 
@@ -292,21 +316,21 @@ const benchvmCheck = (
 // DEVVM_VMID / BENCHVM_VMID が逆に定義されていた)。判定材料は observed
 // name だけで、VMID から name を補完するような実装にはしない。
 const modeVmIdentityCheck = (
-  inventory: Option.Option<ProxmoxInfrastructureInventory>
+  inventory: ProxmoxInfrastructureInventory
 ): ReadinessCheck =>
-  Option.match(inventory, {
+  Option.match(Option.all([inventory.devvm, inventory.benchvm]), {
     onNone: () => ({
       key: "mode_vm_identity",
       status: "fail" as const,
-      summary: "Proxmox inventory unreadable"
+      summary: "devvm/benchvm not observable in Proxmox inventory"
     }),
-    onSome: (inv) => {
-      const mismatch = modeVmIdentityMismatch(inv)
+    onSome: ([devvm, benchvm]) => {
+      const mismatch = modeVmIdentityMismatch({ devvm, benchvm })
       return mismatch === null
         ? {
             key: "mode_vm_identity",
             status: "pass" as const,
-            summary: `observed names match expected mapping (devvm=${inv.devvm.vmid}, benchvm=${inv.benchvm.vmid})`
+            summary: `observed names match expected mapping (devvm=${devvm.vmid}, benchvm=${benchvm.vmid})`
           }
         : { key: "mode_vm_identity", status: "fail" as const, summary: mismatch }
     }
@@ -526,7 +550,7 @@ export const computeReadiness = (
     ] = yield* Effect.all(
       [
         portalDbCheck,
-        optionalInventory,
+        observeInventory,
         cloudflareTokenCheck,
         cloudflareInventoryCheck,
         Effect.either(previousCleanupCheck(all)).pipe(

@@ -743,3 +743,211 @@ describe("getInstanceInventory", () => {
     })
   )
 })
+
+// D4 回帰: CF の Access API は per_page=5000 を 400
+// (12091 access.api.error.invalid_url_parameter_value)で拒否する。2026-10-01 実機
+// 実測で per_page=100/500/1000 は 200、101/5000 は 400 だった。per_page は 100 に
+// 固定し、result_info.total_pages でページを辿って全件を取り切る。
+describe("getInstanceInventory のページネーション", () => {
+  interface PagedApp {
+    id: string
+    domain: string
+  }
+
+  const pagedCf = (opts: {
+    apps: ReadonlyArray<PagedApp>
+    dns?: ReadonlyArray<{ id: string; name: string; content: string }>
+    pageSize: number
+  }) => {
+    const requests: Array<HttpClientRequest.HttpClientRequest> = []
+    // per_page が許可値の外(実機では 101 以上)なら CF と同じ 400 を返す。
+    const rejectedPerPage = (value: string | null): boolean =>
+      value === null || Number(value) > 100
+
+    const page = <A>(items: ReadonlyArray<A>, url: URL) => {
+      const current = Number(url.searchParams.get("page") ?? "1")
+      const size = opts.pageSize
+      const slice = items.slice((current - 1) * size, current * size)
+      return {
+        success: true,
+        result: slice,
+        result_info: {
+          page: current,
+          per_page: size,
+          count: slice.length,
+          total_count: items.length,
+          total_pages: Math.max(1, Math.ceil(items.length / size))
+        }
+      }
+    }
+
+    const client = HttpClient.make((request) => {
+      requests.push(request)
+      const url = HttpClientRequest.toUrl(request).pipe(
+        (opt) => (opt._tag === "Some" ? opt.value : new URL(request.url))
+      )
+      if (url.pathname === "/client/v4/accounts/acct-1/access/apps" && request.method === "GET") {
+        if (rejectedPerPage(url.searchParams.get("per_page"))) {
+          return Effect.succeed(
+            jsonResponse(request, {
+              success: false,
+              errors: [{ code: 12091, message: "access.api.error.invalid_url_parameter_value" }]
+            }, 400)
+          )
+        }
+        return Effect.succeed(jsonResponse(request, page(opts.apps, url)))
+      }
+      if (url.pathname === "/client/v4/zones/zone-1/dns_records" && request.method === "GET") {
+        return Effect.succeed(jsonResponse(request, page(opts.dns ?? [], url)))
+      }
+      if (
+        url.pathname === "/client/v4/accounts/acct-1/cfd_tunnel/0000aaaa-tunnel/configurations" &&
+        request.method === "GET"
+      ) {
+        return Effect.succeed(
+          jsonResponse(request, {
+            success: true,
+            result: { config: { ingress: [{ hostname: undefined, service: "http_status:404" }] } }
+          })
+        )
+      }
+      const policiesMatch = url.pathname.match(
+        /^\/client\/v4\/accounts\/acct-1\/access\/apps\/(.+)\/policies$/
+      )
+      if (policiesMatch && request.method === "GET") {
+        return Effect.succeed(jsonResponse(request, { success: true, result: [] }))
+      }
+      return Effect.succeed(jsonResponse(request, { success: false, errors: [{ message: "not found" }] }, 404))
+    })
+    return { requests, layer: Layer.succeed(HttpClient.HttpClient, client) }
+  }
+
+  it.effect("Access apps が複数ページに分かれていても全件取得する", () =>
+    Effect.gen(function* () {
+      // 3 ページに跨がり、managed な app は最終ページにだけ存在する。
+      // 1 ページ目で打ち切ると reconciliation が既存 app を見落とす。
+      const apps: Array<PagedApp> = []
+      for (let i = 0; i < 5; i++) apps.push({ id: `other-${i}`, domain: `svc${i}.kisen.one` })
+      apps.push({ id: "app-team1", domain: "inucon-team1-1.kisen.one" })
+      apps.push({ id: "app-team2", domain: "inucon-team2-1.kisen.one" })
+      const fake = pagedCf({ apps, pageSize: 3 })
+
+      const inventory = yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) => cf.getInstanceInventory),
+        Effect.provide(CloudflareLive.pipe(Layer.provide(fake.layer), Layer.provide(configLayer)))
+      )
+      expect(inventory.apps.map((a) => a.hostname).sort()).toEqual([
+        "inucon-team1-1",
+        "inucon-team2-1"
+      ])
+
+      // per_page は常に 100 以下(5000 は実機で 400)。page は 1..total_pages。
+      const appListRequests = fake.requests.filter((r) => {
+        const url = HttpClientRequest.toUrl(r).pipe((o) => (o._tag === "Some" ? o.value : new URL(r.url)))
+        return url.pathname === "/client/v4/accounts/acct-1/access/apps" && r.method === "GET"
+      })
+      const perPages = appListRequests.map((r) => {
+        const url = HttpClientRequest.toUrl(r).pipe((o) => (o._tag === "Some" ? o.value : new URL(r.url)))
+        return Number(url.searchParams.get("per_page"))
+      })
+      expect(perPages.length).toBeGreaterThan(0)
+      for (const p of perPages) expect(p).toBeLessThanOrEqual(100)
+      const pages = appListRequests.map((r) => {
+        const url = HttpClientRequest.toUrl(r).pipe((o) => (o._tag === "Some" ? o.value : new URL(r.url)))
+        return Number(url.searchParams.get("page"))
+      })
+      expect(pages).toEqual([1, 2, 3])
+    })
+  )
+
+  it.effect("DNS レコードも複数ページを辿って全件取得する", () =>
+    Effect.gen(function* () {
+      const dns = [
+        { id: "dns-other", name: "portal.kisen.one", content: "tunnel.cfargotunnel.com" },
+        { id: "dns-1", name: "inucon-team1-1.kisen.one", content: "tunnel.cfargotunnel.com" },
+        { id: "dns-2", name: "inucon-team2-1.kisen.one", content: "tunnel.cfargotunnel.com" }
+      ]
+      const fake = pagedCf({ apps: [], dns, pageSize: 1 })
+      const inventory = yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) => cf.getInstanceInventory),
+        Effect.provide(CloudflareLive.pipe(Layer.provide(fake.layer), Layer.provide(configLayer)))
+      )
+      expect(inventory.routes.map((r) => r.hostname).sort()).toEqual([
+        "inucon-team1-1",
+        "inucon-team2-1"
+      ])
+    })
+  )
+
+  // 同一 account には path 付き domain の app(`dawarich.kisen.one/api/v1/*` 等)が
+  // 同居する。先頭ラベルだけ見ると managed hostname と誤認するので除外する。
+  it.effect("path 付き domain の Access app は hostname として扱わない", () =>
+    Effect.gen(function* () {
+      const fake = pagedCf({
+        apps: [
+          { id: "app-path", domain: "inucon-team1-1.kisen.one/api/v1/*" },
+          { id: "app-other-path", domain: "dawarich.kisen.one/api/v1/*" },
+          { id: "app-team2", domain: "inucon-team2-1.kisen.one" }
+        ],
+        pageSize: 100
+      })
+      const inventory = yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) => cf.getInstanceInventory),
+        Effect.provide(CloudflareLive.pipe(Layer.provide(fake.layer), Layer.provide(configLayer)))
+      )
+      expect(inventory.apps.map((a) => a.hostname)).toEqual(["inucon-team2-1"])
+      expect(inventory.apps.flatMap((a) => a.appIds)).not.toContain("app-path")
+    })
+  )
+
+  // review round 1: total_pages がまだ残っているのに 0 件が返ったら、黙って
+  // 打ち切らず CloudflareError にする。silent truncation は reconciliation に
+  // 「存在する resource が無い」と誤認させ、重複作成 plan を出させる。
+  it.effect("後続ページが残っているのに 0 件が返ったら silent truncation せず失敗する", () =>
+    Effect.gen(function* () {
+      const client = HttpClient.make((request) => {
+        const url = HttpClientRequest.toUrl(request).pipe(
+          (opt) => (opt._tag === "Some" ? opt.value : new URL(request.url))
+        )
+        if (url.pathname === "/client/v4/accounts/acct-1/access/apps" && request.method === "GET") {
+          const current = Number(url.searchParams.get("page") ?? "1")
+          // total_pages=3 を宣言しつつ page 2 で空を返す(CF 側 race の模倣)。
+          const result = current === 1 ? [{ id: "app-1", domain: "inucon-team1-1.kisen.one" }] : []
+          return Effect.succeed(
+            jsonResponse(request, {
+              success: true,
+              result,
+              result_info: { page: current, per_page: 100, count: result.length, total_count: 3, total_pages: 3 }
+            })
+          )
+        }
+        if (url.pathname === "/client/v4/zones/zone-1/dns_records" && request.method === "GET") {
+          return Effect.succeed(
+            jsonResponse(request, { success: true, result: [], result_info: { page: 1, total_pages: 1 } })
+          )
+        }
+        if (
+          url.pathname === "/client/v4/accounts/acct-1/cfd_tunnel/0000aaaa-tunnel/configurations" &&
+          request.method === "GET"
+        ) {
+          return Effect.succeed(
+            jsonResponse(request, { success: true, result: { config: { ingress: [] } } })
+          )
+        }
+        return Effect.succeed(jsonResponse(request, { success: false, errors: [{ message: "not found" }] }, 404))
+      })
+      const error = yield* CloudflarePort.pipe(
+        Effect.flatMap((cf) => cf.getInstanceInventory),
+        Effect.provide(
+          CloudflareLive.pipe(
+            Layer.provide(Layer.succeed(HttpClient.HttpClient, client)),
+            Layer.provide(configLayer)
+          )
+        ),
+        Effect.flip
+      )
+      expect(error).toBeInstanceOf(CloudflareError)
+      expect(String((error as CloudflareError).cause)).toContain("refusing to truncate inventory")
+    })
+  )
+})

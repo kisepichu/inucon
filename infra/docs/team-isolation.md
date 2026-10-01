@@ -123,6 +123,36 @@ ssh root@192.0.2.10 "iptables -C FORWARD -s 10.100.0.0/16 -d 10.100.0.0/16 -j DR
 systemctl status inucon-team-isolation.service
 ```
 
+## ポータル readiness からは観測できない(2026-10-01)
+
+PVE 9.2.3 の `GET /nodes/:node/services/:service/state` は `:service` を固定 enum
+(`chrony, corosync, cron, ksmtuned, lxcfs, postfix, proxmox-firewall, pve-cluster,
+pve-firewall, pve-ha-crm, ...`)で検証するため、カスタム unit 名には 404 ではなく
+**HTTP 400** を返す:
+
+```
+GET /api2/json/nodes/eevee/services/inucon-team-isolation/state
+→ 400 {"errors":{"service":"value 'inucon-team-isolation' does not have a value in
+   the enumeration 'chrony, corosync, cron, ...'"}}
+```
+
+`GET /nodes/:node/services` の一覧も同じ固定リスト(`PVE::API2::Services` の
+`$service_list`)しか返さないため代替にならない。また分離の実体は生の iptables
+FORWARD ルールであり、PVE Datacenter Firewall API にも現れない。
+
+したがってポータルの readiness `isolation` key は:
+
+- 観測できたとき(2xx / 404)だけ pass / fail を返す。
+- 観測不能(400 等)なら **warn** に落とし、start の必須 gate には含めない
+  (`START_REQUIRED_CHECK_KEYS`)。
+
+**開催前チェックリストでは、この 1 項目だけ手動確認する:**
+
+```
+ssh root@192.0.2.10 "systemctl is-active inucon-team-isolation && \
+  iptables -C FORWARD -s 10.100.0.0/16 -d 10.100.0.0/16 -j DROP && echo OK"
+```
+
 ## 既知の制約・今後の検討事項
 
 - 本対策はホスト eevee 上の iptables による応急対応であり、Terraform では管理していない
