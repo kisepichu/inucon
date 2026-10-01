@@ -24,6 +24,7 @@ import type {
   Operation,
   OperationId,
   OperationWithSteps,
+  PreparationPlan,
   ReadinessCheck,
   ReconciliationApplyRequest,
   ReconciliationPlan,
@@ -174,6 +175,14 @@ export const api = {
     request<Operation>(`/api/admin/contests/${contestId}/cleanup`, { method: "POST", body }),
   requestReturnNormalMode: (contestId: ContestId) =>
     request<Operation>(`/api/admin/contests/${contestId}/return-normal-mode`, { method: "POST" }),
+  // 競技モード切替 (spec §3) / インスタンス準備 (spec §4)。確認画面の影響対象
+  // (止める・起動する VM、作成する hostname / VMID) は getPreparationPlan が返す。
+  getPreparationPlan: (contestId: ContestId) =>
+    request<PreparationPlan>(`/api/admin/contests/${contestId}/preparation-plan`),
+  requestEnterContestMode: (contestId: ContestId) =>
+    request<Operation>(`/api/admin/contests/${contestId}/enter-contest-mode`, { method: "POST" }),
+  requestPrepareInstances: (contestId: ContestId) =>
+    request<Operation>(`/api/admin/contests/${contestId}/prepare-instances`, { method: "POST" }),
   requestContestArchive: (contestId: ContestId) =>
     request<Operation>(`/api/admin/contests/${contestId}/archive`, { method: "POST" }),
 
@@ -189,6 +198,9 @@ export const api = {
   // getAdminOperation は steps を含む OperationWithSteps を返す。
   getAdminOperation: (operationId: OperationId) =>
     request<OperationWithSteps>(`/api/admin/operations/${operationId}`),
+  // queued / failed / blocked の Operation を canceled にする (それ以外は 409)。
+  cancelAdminOperation: (operationId: OperationId) =>
+    request<Operation>(`/api/admin/operations/${operationId}/cancel`, { method: "POST" }),
   listContestOperations: (contestId: ContestId, limit?: number) =>
     request<Array<Operation>>(
       `/api/admin/contests/${contestId}/operations${limit === undefined ? "" : `?limit=${limit}`}`

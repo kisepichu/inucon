@@ -1,12 +1,14 @@
 import { HttpApiBuilder } from "@effect/platform"
-import { Effect, Option } from "effect"
+import { Clock, Effect, Option } from "effect"
 import {
   AmbiguousReconciliation,
   api,
+  ContestModeNotActive,
   ContestNotPreparing,
   ContestRevisionConflict,
   InstanceNotFound,
   InvalidContestTransition,
+  InvalidOperationTransition,
   NotFound,
   NothingToReconcile,
   OperationalContestConflict,
@@ -21,6 +23,8 @@ import { CurrentUser } from "shared"
 import { ContestRepo, OperationRepo } from "../../../application/ports.js"
 import { enqueueRehearsal } from "../../../application/usecases/bench.js"
 import { requestContestStart } from "../../../application/usecases/contestAdmin.js"
+import { enterContestMode } from "../../../application/usecases/modeOperation.js"
+import { getPreparationPlan, prepareContest } from "../../../application/usecases/prepare.js"
 import {
   applyReconciliation,
   planReconciliation
@@ -231,6 +235,74 @@ export const OperationsLive = HttpApiBuilder.group(api, "operations", (handlers)
         Effect.orDie
       )
     )
+    // 競技モード切替 / インスタンス準備の確認画面用。prepare の作成対象は
+    // planPrepareSlots (handler と同じ関数) から出す。
+    .handle("getPreparationPlan", ({ path }) =>
+      getPreparationPlan(path.contestId).pipe(
+        Effect.map((plan) => ({
+          contestId: plan.contestId,
+          contestMode: plan.contestMode,
+          instanceSlots: plan.instanceSlots.map((slot) => ({
+            teamNumber: slot.teamNumber,
+            teamName: slot.teamName,
+            index: slot.index,
+            hostname: slot.hostname,
+            vmid: slot.vmid,
+            instanceStatus: slot.occupant?.status ?? null,
+            instanceId: slot.occupant?.id ?? null
+          }))
+        })),
+        Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound())
+        }),
+        Effect.orDie
+      )
+    )
+    // spec §3: enter_contest_mode Operation の enqueue (return-normal-mode の対)。
+    .handle("requestEnterContestMode", ({ path }) =>
+      Effect.gen(function* () {
+        const user = yield* CurrentUser
+        return yield* enterContestMode({ contestId: path.contestId, actorUserId: user.id })
+      }).pipe(
+        Effect.map((op) => ({
+          ...op,
+          sanitizedError: Option.getOrNull(op.sanitizedError),
+          startedAt: Option.getOrNull(op.startedAt),
+          finishedAt: Option.getOrNull(op.finishedAt)
+        })),
+        Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound()),
+          InvalidContestTransition: (e: { readonly from: unknown; readonly to: unknown }) =>
+            Effect.fail(new InvalidContestTransition({ from: e.from as never, to: e.to as never })),
+          OperationInProgress: () => Effect.fail(new OperationalContestConflict())
+        }),
+        Effect.orDie
+      )
+    )
+    // spec §4: prepare Operation の enqueue。競技モードを確かめられなければ 409
+    // ContestModeNotActive、inventory 自体が読めなければ 503 (どちらも積まない)。
+    .handle("requestPrepareInstances", ({ path }) =>
+      Effect.gen(function* () {
+        const user = yield* CurrentUser
+        return yield* prepareContest({ contestId: path.contestId, actorUserId: user.id })
+      }).pipe(
+        Effect.map((op) => ({
+          ...op,
+          sanitizedError: Option.getOrNull(op.sanitizedError),
+          startedAt: Option.getOrNull(op.startedAt),
+          finishedAt: Option.getOrNull(op.finishedAt)
+        })),
+        Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound()),
+          InvalidContestTransition: (e: { readonly from: unknown; readonly to: unknown }) =>
+            Effect.fail(new InvalidContestTransition({ from: e.from as never, to: e.to as never })),
+          ContestModeNotActive: (e) => Effect.fail(new ContestModeNotActive({ reason: e.reason })),
+          ProxmoxError: () => Effect.fail(new ProviderUnavailable({ provider: "proxmox" })),
+          OperationInProgress: () => Effect.fail(new OperationalContestConflict())
+        }),
+        Effect.orDie
+      )
+    )
     // Task 13: OperationDetail 用の Operation 単体取得。Operation + steps を
     // ordinal 昇順で返す。domain の Option フィールド (retryAt / leaseExpiresAt /
     // resultSummary / sanitizedError / startedAt / finishedAt) はすべて境界で
@@ -260,6 +332,31 @@ export const OperationsLive = HttpApiBuilder.group(api, "operations", (handlers)
           }))
         }
       }).pipe(Effect.orDie)
+    )
+    // 遷移規則 (queued / failed / blocked のみ、running step があれば拒否) は
+    // OperationRepo.cancel が単一 tx で判定する。repo は不在 id を defect にする
+    // 呼び出し規約なので、先に findById で 404 を返す (retry と同じ)。
+    .handle("cancelAdminOperation", ({ path }) =>
+      Effect.gen(function* () {
+        const ops = yield* OperationRepo
+        if (Option.isNone(yield* ops.findById(path.operationId))) {
+          return yield* Effect.fail(new NotFound())
+        }
+        const now = yield* Clock.currentTimeMillis
+        return yield* ops.cancel(path.operationId, now)
+      }).pipe(
+        Effect.map((op) => ({
+          ...op,
+          sanitizedError: Option.getOrNull(op.sanitizedError),
+          startedAt: Option.getOrNull(op.startedAt),
+          finishedAt: Option.getOrNull(op.finishedAt)
+        })),
+        Effect.catchTags({
+          InvalidOperationTransition: (e) =>
+            Effect.fail(new InvalidOperationTransition({ from: e.from, to: e.to }))
+        }),
+        Effect.orDie
+      )
     )
     // Task 13: ContestAdmin の Operations タブ用一覧。limit は 20 既定 / 100 上限。
     // Contest 存在チェックはリスト応答が空 [] と区別が付かなくなるのを避けるため

@@ -71,11 +71,20 @@ export function JobDetail() {
             {job.status}
           </span>
         </dd>
+        {/* readiness の rehearsal は status=finished に加えて passed=true を要求する (score は見ない)。
+            finished でも fail の rehearsal は数えられないので、判定を status / score と別に出す。 */}
+        <dt>判定</dt>
+        {job.passed === null ? <dd className="empty-cell">-</dd> : <dd>{job.passed ? "pass" : "fail"}</dd>}
         <dt>スコア</dt>
         {job.score === null ? <dd className="empty-cell">-</dd> : <dd className="num mono">{job.score}</dd>}
         <dt>エラー</dt>
         {job.errorMessage === null ? <dd className="empty-cell">-</dd> : <dd>{job.errorMessage}</dd>}
       </dl>
+      {job.purpose === "rehearsal" && (
+        <p className="hint">
+          finished かつ判定 pass の rehearsal だけが readiness の rehearsal (開始の必須項目) に数えられます。score は問いません。
+        </p>
+      )}
       <div className="log-header">
         <h2>ログ</h2>
         {isPolling && <span className="live-indicator">live</span>}

@@ -1,13 +1,15 @@
-import { render, screen, waitFor } from "@testing-library/react"
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent, { type UserEvent } from "@testing-library/user-event"
 import { MemoryRouter, Route, Routes } from "react-router-dom"
 import type { MockInstance } from "vitest"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type {
   Artifact,
+  BenchJob,
   Contest,
   ContestId,
   Operation,
+  PreparationPlan,
   ReadinessCheck,
   ReconciliationPlan,
   ReconciliationPlanRequest,
@@ -145,6 +147,37 @@ const artifactFixture: Artifact = {
   createdAt: 100
 } as unknown as Artifact
 
+// VMID は実機の 9300 (devvm) / 9200 (benchvm) と意図的に変えてある: Overview が
+// server の返した値を表示していて、web 側に VMID 定数を持っていないことを確かめる。
+const preparationPlanFixture: PreparationPlan = {
+  contestId: contestFixture.id,
+  contestMode: {
+    shutdownVm: { vmid: 9391, name: "devvm" },
+    startVm: { vmid: 9291, name: "benchvm" }
+  },
+  instanceSlots: [
+    { teamNumber: 1, teamName: "team1", index: 1, hostname: "inucon-team1-1", vmid: 1101, instanceStatus: "running", instanceId: "i-1-1" },
+    { teamNumber: 1, teamName: "team1", index: 2, hostname: "inucon-team1-2", vmid: 1102, instanceStatus: null, instanceId: null },
+    { teamNumber: 1, teamName: "team1", index: 3, hostname: "inucon-team1-3", vmid: 1103, instanceStatus: null, instanceId: null }
+  ]
+} as unknown as PreparationPlan
+
+const rehearsalJobFixture: BenchJob = {
+  id: "job-r1",
+  contestId: contestFixture.id,
+  teamId: "team1",
+  targetIp: "10.100.1.12",
+  targetPort: 80,
+  status: "queued",
+  purpose: "rehearsal",
+  score: null,
+  passed: null,
+  errorMessage: null,
+  enqueuedAt: 100,
+  startedAt: null,
+  finishedAt: null
+} as unknown as BenchJob
+
 let contestSpy: MockInstance
 let teamsSpy: MockInstance
 let readinessSpy: MockInstance
@@ -155,6 +188,10 @@ let opsListSpy: MockInstance
 let artifactsSpy: MockInstance
 let startSpy: MockInstance
 let finalizeSpy: MockInstance
+let preparationPlanSpy: MockInstance<typeof api.getPreparationPlan>
+let enterModeSpy: MockInstance<typeof api.requestEnterContestMode>
+let prepareInstancesSpy: MockInstance<typeof api.requestPrepareInstances>
+let rehearsalSpy: MockInstance<typeof api.enqueueRehearsal>
 
 beforeEach(() => {
   contestSpy = vi.spyOn(api, "getAdminContest").mockResolvedValue(contestFixture) as unknown as MockInstance
@@ -167,6 +204,10 @@ beforeEach(() => {
   artifactsSpy = vi.spyOn(api, "listAdminContestArtifacts").mockResolvedValue([artifactFixture]) as unknown as MockInstance
   startSpy = vi.spyOn(api, "requestContestStart").mockResolvedValue(operationFixture) as unknown as MockInstance
   finalizeSpy = vi.spyOn(api, "requestContestFinalize").mockResolvedValue(operationFixture) as unknown as MockInstance
+  preparationPlanSpy = vi.spyOn(api, "getPreparationPlan").mockResolvedValue(preparationPlanFixture)
+  enterModeSpy = vi.spyOn(api, "requestEnterContestMode").mockResolvedValue({ ...operationFixture, kind: "enter_contest_mode" })
+  prepareInstancesSpy = vi.spyOn(api, "requestPrepareInstances").mockResolvedValue({ ...operationFixture, kind: "prepare" })
+  rehearsalSpy = vi.spyOn(api, "enqueueRehearsal").mockResolvedValue(rehearsalJobFixture)
 })
 
 afterEach(() => {
@@ -218,15 +259,186 @@ describe("ContestAdmin", () => {
     const user = userEvent.setup()
     renderPage()
     await screen.findByText(/準備中/)
-    const startBtn = await screen.findByRole("button", { name: /開始/ })
+    const lifecycle = await screen.findByRole("region", { name: "ライフサイクル操作" })
+    const startBtn = within(lifecycle).getByRole("button", { name: /開始/ })
     expect(startBtn).toBeDisabled()
-    const confirmCheck = await screen.findByLabelText(/影響を確認しました/)
-    await user.click(confirmCheck)
+    await user.click(within(lifecycle).getByLabelText(/影響を確認しました/))
     expect(startBtn).not.toBeDisabled()
     await user.click(startBtn)
     await waitFor(() => expect(startSpy).toHaveBeenCalledTimes(1))
     // 送るのは expectedRevision のみ (free-form 文字列は無い)
     expect(startSpy).toHaveBeenCalledWith(contestFixture.id, { expectedRevision: contestFixture.revision })
+  })
+
+  describe("Overview の 競技モード切替 / インスタンス準備", () => {
+    it("spec の流れ通り 競技モード切替 → インスタンス準備 → rehearsal → 開始 の順に並ぶ", async () => {
+      renderPage()
+      await screen.findByRole("region", { name: "rehearsal" })
+      const flow = ["競技モード切替", "インスタンス準備", "rehearsal 実行", "開始"]
+      const order = screen
+        .getAllByRole("button")
+        .map((b) => b.textContent ?? "")
+        .filter((label) => flow.includes(label))
+      expect(order).toEqual(flow)
+    })
+
+    it("競技モード切替: server が返した VM を表示し、確認するまで押せず、押すと enter-contest-mode を呼ぶ", async () => {
+      const user = userEvent.setup()
+      renderPage()
+      const region = await screen.findByRole("region", { name: "競技モード切替" })
+      expect(within(region).getByTestId("mode-shutdown").textContent).toMatch(/devvm.*9391/)
+      expect(within(region).getByTestId("mode-start").textContent).toMatch(/benchvm.*9291/)
+      // web 側に VMID 定数を持たない (plan の値だけを表示する)。
+      expect(document.body.textContent).not.toMatch(/9300|9200/)
+      const button = within(region).getByRole("button", { name: "競技モード切替" })
+      expect(button).toBeDisabled()
+      await user.click(within(region).getByRole("checkbox"))
+      expect(button).not.toBeDisabled()
+      await user.click(button)
+      await waitFor(() => expect(enterModeSpy).toHaveBeenCalledTimes(1))
+      expect(enterModeSpy).toHaveBeenCalledWith(contestFixture.id)
+      expect(prepareInstancesSpy).not.toHaveBeenCalled()
+    })
+
+    it("インスタンス準備: 作成予定と既存 Instance を分けて表示し、確認するまで押せず、押すと prepare-instances を呼ぶ", async () => {
+      const user = userEvent.setup()
+      renderPage()
+      const region = await screen.findByRole("region", { name: "インスタンス準備" })
+      expect(within(region).getByText(/作成予定 2 台/)).toBeInTheDocument()
+      expect(within(region).getAllByTestId("prepare-create").map((li) => li.textContent)).toEqual([
+        expect.stringMatching(/inucon-team1-2.*1102/),
+        expect.stringMatching(/inucon-team1-3.*1103/)
+      ])
+      expect(within(region).getAllByTestId("prepare-existing").map((li) => li.textContent)).toEqual([
+        expect.stringMatching(/inucon-team1-1.*1101.*running/)
+      ])
+      const button = within(region).getByRole("button", { name: "インスタンス準備" })
+      expect(button).toBeDisabled()
+      await user.click(within(region).getByRole("checkbox"))
+      expect(button).not.toBeDisabled()
+      await user.click(button)
+      await waitFor(() => expect(prepareInstancesSpy).toHaveBeenCalledTimes(1))
+      expect(prepareInstancesSpy).toHaveBeenCalledWith(contestFixture.id)
+      expect(enterModeSpy).not.toHaveBeenCalled()
+    })
+
+    it("作成予定が 0 台なら確認しても押せない", async () => {
+      preparationPlanSpy.mockResolvedValue({
+        ...preparationPlanFixture,
+        instanceSlots: preparationPlanFixture.instanceSlots.map((s) => ({ ...s, instanceStatus: "running" as const }))
+      })
+      const user = userEvent.setup()
+      renderPage()
+      const region = await screen.findByRole("region", { name: "インスタンス準備" })
+      await user.click(within(region).getByRole("checkbox"))
+      expect(within(region).getByRole("button", { name: "インスタンス準備" })).toBeDisabled()
+    })
+
+    it("競技モードでないと拒否されたら先に競技モード切替するよう示す", async () => {
+      prepareInstancesSpy.mockRejectedValue(new ApiError("ContestModeNotActive", 409, { reason: "devvm_not_stopped" }))
+      const user = userEvent.setup()
+      renderPage()
+      const region = await screen.findByRole("region", { name: "インスタンス準備" })
+      await user.click(within(region).getByRole("checkbox"))
+      await user.click(within(region).getByRole("button", { name: "インスタンス準備" }))
+      expect(await screen.findByRole("alert")).toHaveTextContent(/競技モード切替/)
+    })
+
+    it("影響対象を取得できなければ 競技モード切替 / インスタンス準備 のボタンを出さない", async () => {
+      preparationPlanSpy.mockRejectedValue(new ApiError("ProviderUnavailable", 503))
+      renderPage()
+      expect(await screen.findByRole("alert")).toBeInTheDocument()
+      expect(screen.queryByRole("button", { name: "競技モード切替" })).not.toBeInTheDocument()
+      expect(screen.queryByRole("button", { name: "インスタンス準備" })).not.toBeInTheDocument()
+    })
+
+    it.each(["draft", "running", "finalizing", "finished", "canceled"] as const)(
+      "%s では 競技モード切替 / インスタンス準備 / rehearsal を出さない",
+      async (status) => {
+        contestSpy.mockResolvedValue({ ...contestFixture, status })
+        renderPage()
+        await screen.findByRole("heading", { level: 1 })
+        expect(screen.queryByRole("button", { name: "競技モード切替" })).not.toBeInTheDocument()
+        expect(screen.queryByRole("button", { name: "インスタンス準備" })).not.toBeInTheDocument()
+        expect(screen.queryByRole("button", { name: "rehearsal 実行" })).not.toBeInTheDocument()
+        expect(preparationPlanSpy).not.toHaveBeenCalled()
+      }
+    )
+  })
+
+  describe("Overview の rehearsal", () => {
+    // team1-1 / team1-3 が running、team1-2 は creating (rehearsal の対象外)。
+    const twoRunningPlan = {
+      ...preparationPlanFixture,
+      instanceSlots: [
+        { teamNumber: 1, teamName: "team1", index: 1, hostname: "inucon-team1-1", vmid: 1101, instanceStatus: "running", instanceId: "i-1-1" },
+        { teamNumber: 1, teamName: "team1", index: 2, hostname: "inucon-team1-2", vmid: 1102, instanceStatus: "creating", instanceId: "i-1-2" },
+        { teamNumber: 1, teamName: "team1", index: 3, hostname: "inucon-team1-3", vmid: 1103, instanceStatus: "running", instanceId: "i-1-3" }
+      ]
+    } as unknown as PreparationPlan
+
+    it("running の Instance だけを選ばせ、確認するまで押せず、押すと選んだ instanceId で enqueueRehearsal を呼んで job へ誘導する", async () => {
+      preparationPlanSpy.mockResolvedValue(twoRunningPlan)
+      const user = userEvent.setup()
+      renderPage()
+      const region = await screen.findByRole("region", { name: "rehearsal" })
+      const select = within(region).getByLabelText("対象 Instance")
+      expect(within(select).getAllByRole("option").map((o) => o.textContent)).toEqual([
+        expect.stringMatching(/inucon-team1-1.*1101/),
+        expect.stringMatching(/inucon-team1-3.*1103/)
+      ])
+      await user.selectOptions(select, "i-1-3")
+      const button = within(region).getByRole("button", { name: "rehearsal 実行" })
+      expect(button).toBeDisabled()
+      await user.click(within(region).getByRole("checkbox"))
+      expect(button).toBeEnabled()
+      await user.click(button)
+      await waitFor(() => expect(rehearsalSpy).toHaveBeenCalledTimes(1))
+      expect(rehearsalSpy).toHaveBeenCalledWith(contestFixture.id, { instanceId: "i-1-3" })
+      expect(within(region).getByRole("link", { name: "job-r1" })).toHaveAttribute("href", "/jobs/job-r1")
+      // 次の実行 (= 次の負荷) にはもう一度確認を要求する。
+      expect(button).toBeDisabled()
+    })
+
+    it("確認後に対象を変えたら確認し直すまで押せない", async () => {
+      preparationPlanSpy.mockResolvedValue(twoRunningPlan)
+      const user = userEvent.setup()
+      renderPage()
+      const region = await screen.findByRole("region", { name: "rehearsal" })
+      await user.click(within(region).getByRole("checkbox"))
+      const button = within(region).getByRole("button", { name: "rehearsal 実行" })
+      expect(button).toBeEnabled()
+      fireEvent.change(within(region).getByLabelText("対象 Instance"), { target: { value: "i-1-3" } })
+      expect(button).toBeDisabled()
+      expect(within(region).getByRole("checkbox")).not.toBeChecked()
+    })
+
+    it("running の Instance が無ければ確認しても押せず、理由を示す", async () => {
+      preparationPlanSpy.mockResolvedValue({
+        ...preparationPlanFixture,
+        instanceSlots: preparationPlanFixture.instanceSlots.map((s) => ({ ...s, instanceStatus: null, instanceId: null }))
+      })
+      const user = userEvent.setup()
+      renderPage()
+      const region = await screen.findByRole("region", { name: "rehearsal" })
+      await user.click(within(region).getByRole("checkbox"))
+      expect(within(region).getByRole("button", { name: "rehearsal 実行" })).toBeDisabled()
+      expect(within(region).getByText(/running の Instance がありません/)).toBeInTheDocument()
+      expect(rehearsalSpy).not.toHaveBeenCalled()
+    })
+
+    it.each([
+      { tag: "RehearsalInstanceNotRunning", message: /running ではありません/ },
+      { tag: "TeamJobAlreadyQueued", message: /既に queued \/ running/ }
+    ])("$tag で拒否されたらそれと分かる文言を出す", async ({ tag, message }) => {
+      rehearsalSpy.mockRejectedValue(new ApiError(tag, 409))
+      const user = userEvent.setup()
+      renderPage()
+      const region = await screen.findByRole("region", { name: "rehearsal" })
+      await user.click(within(region).getByRole("checkbox"))
+      await user.click(within(region).getByRole("button", { name: "rehearsal 実行" }))
+      expect(await within(region).findByRole("alert")).toHaveTextContent(message)
+    })
   })
 
   it("Readiness タブは fail を先に、summary をそのまま表示する", async () => {

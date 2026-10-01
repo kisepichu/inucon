@@ -602,3 +602,41 @@ export const OperationWithSteps = Schema.Struct({
   steps: Schema.Array(OperationStep)
 })
 export type OperationWithSteps = typeof OperationWithSteps.Type
+
+// GET /api/admin/contests/:contestId/preparation-plan: Admin Web が「競技モード切替」
+// 「インスタンス準備」の確認 checkbox の前に出す影響対象。VMID 定数
+// (portal/src/domain/modeVmIds.ts) や hostname / VMID の導出 (prepare の
+// planPrepareSlots) を web 側に複製しないため server が組み立てて返す。
+// - contestMode: enter_contest_mode が guest shutdown + onboot=0 にする VM と、
+//   onboot=1 + 起動する VM。
+// - instanceSlots: prepare が収束させる desired 枠 ((teamNumber, index) 昇順 =
+//   作成順)。instanceStatus=null は prepare が新規作成する枠、それ以外は既存
+//   Instance が占有していて作り直さない枠 (vmid は既存 Instance のもの)。
+//   instanceId は占有 Instance の id (無ければ null)。Overview の rehearsal が
+//   running の枠を対象に選んで enqueueRehearsal に渡す。
+export const ModeVmTarget = Schema.Struct({
+  vmid: Schema.Int,
+  name: Schema.String
+})
+export type ModeVmTarget = typeof ModeVmTarget.Type
+
+export const PrepareInstanceSlot = Schema.Struct({
+  teamNumber: Schema.Int,
+  teamName: Schema.String,
+  index: Schema.Int,
+  hostname: Schema.String,
+  vmid: Schema.Int,
+  instanceStatus: Schema.NullOr(InstanceStatus),
+  instanceId: Schema.NullOr(InstanceId)
+})
+export type PrepareInstanceSlot = typeof PrepareInstanceSlot.Type
+
+export const PreparationPlan = Schema.Struct({
+  contestId: ContestId,
+  contestMode: Schema.Struct({
+    shutdownVm: ModeVmTarget,
+    startVm: ModeVmTarget
+  }),
+  instanceSlots: Schema.Array(PrepareInstanceSlot)
+})
+export type PreparationPlan = typeof PreparationPlan.Type

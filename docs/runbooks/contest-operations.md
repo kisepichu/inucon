@@ -92,9 +92,44 @@ scoreboard は開催回ごとに分離される。手順の全体像:
 2. ContestAdmin → **Reconciliation** タブで **診断** → adopt 対象 hostname を
    個別にチェック → **adopt を反映した plan を取得** (action が `adopt_cleanup`
    に変わることを確認) → **適用**。差分ゼロを確認。
-3. ContestAdmin → **Readiness** タブで runner heartbeat / backup /
-   rehearsal 実績 / Cloudflare write proven がすべて pass になるまで
-   Instance 払い出し・招待・リハーサルを実施。
+3. ContestAdmin → **Overview** で開催準備を進める。Overview の操作はこの順に
+   並び、それぞれ対象の Contest 状態でだけ表示される:
+   - 3-1. **「準備開始」**(draft → preparing)。状態を変えるだけで外部リソースは
+     触らない。前回開催の Instance が残っている (`previous_cleanup`) / 未完了
+     Operation がある / 遷移中 Instance がある場合は
+     `ContestNotReadyForPreparation` (409) で拒否される。
+   - 3-2. **「競技モード切替」**(spec §3、`enter_contest_mode` Operation)。確認欄に
+     出る VM / VMID (devvm 9300 を onboot=0 → guest shutdown、空きメモリ確認後に
+     benchvm 9200 を onboot=1 → 起動) を確認して「影響を確認しました」→ 実行。
+     VMID は portal が `portal/src/domain/modeVmIds.ts` から返した値。遷移先の
+     Operation 詳細で全 step が succeeded になるのを待つ。既に競技モードなら全 step
+     が何も変更せず succeeded で終わる。shutdown が timeout して blocked になったら
+     `contest-recovery.md` §5 (force stop はしない)。
+   - 3-3. **「インスタンス準備」**(spec §4、`prepare` Operation)。確認欄に作成予定の
+     hostname / VMID と台数、既に Instance がある枠 (作り直さない) が出るので確認して
+     実行。全 team を desiredInstanceCount まで **1 台ずつ** 作り、running が 1 台でも
+     あれば空きメモリが閾値に戻るまで KSM 統合を最大 10 分待つ。競技モードでない
+     (devvm が停止していない / benchvm が起動していない / 観測できない) と
+     `ContestModeNotActive` (409) で拒否されるので、先に 3-2 を完了させる。blocked
+     の summary が `ksm_settle_timeout:*` なら `contest-recovery.md` §6、
+     `all_slots_consumed_*` なら failed の Instance が枠を占有している。
+   - 3-4. 招待 (Admin ページの招待フォーム) と **「rehearsal 実行」**。インスタンス準備の下の
+     rehearsal 欄で対象 Instance (running の枠だけが hostname / VMID / team 付きで選べる) を
+     選び、「影響を確認しました」→ **rehearsal 実行**。選んだ Instance に本番と同じ
+     ベンチマーカーが 1 回走り、**実際に負荷がかかる** (対象を変えると確認し直しになる)。
+     running の Instance が無いと押せない (先に 3-3 を完了させる)。投入後に出る job の
+     リンク先 (job 詳細) で queued → running → finished / failed、判定 (pass / fail)、
+     score、ログを確認する。readiness の rehearsal は **finished かつ判定 pass** の
+     rehearsal が 1 件以上あると pass になる (score は問わない。finished でも判定 fail は
+     数えない)。job へのリンクは投入した画面にしか出ないので、離れた後は Readiness タブの
+     rehearsal で成功件数を見る。queued のまま進まないときは Readiness タブの runner
+     (heartbeat / benchReady) を確認する。拒否されたとき:
+     - `RehearsalInstanceNotRunning`: 選んだ Instance が running でない。ページを再読み込み
+       して Instance の状態 (3-3 の完了) を確認する。
+     - `TeamJobAlreadyQueued`: そのチームに queued / running の rehearsal が既にある。
+       finished / failed になってから再実行する。
+   - 3-5. **Readiness** タブで runner heartbeat / backup / rehearsal 実績 /
+     Cloudflare write proven がすべて pass になることを確認。
 4. Readiness all-pass 後に **「開始」(preparing → running)**。
 5. 終了は **scheduledEndAt 到達で worker が自動 finalize**。急ぐ場合のみ
    Admin Web の即時 finalize (`POST /api/admin/contests/:id/finalize`) を
@@ -113,13 +148,32 @@ scoreboard は開催回ごとに分離される。手順の全体像:
    | --- | --- | --- | --- |
    | 7-1 | **Reconciliation** タブ → **診断** → 未 adopt の orphan があれば adopt をチェック → **adopt を反映した plan を取得** → **適用** | — | Cleanup が押せない (blocked の理由を表示)。Cleanup は常に `adoptHostnames: []` で plan を取り直すため、**Cleanup 側から orphan を adopt する経路は無い** |
    | 7-2 | **Cleanup** Operation (managed 外部 resource の撤収 + Instance を `deleted` に遷移)。7-1 の Operation 完了後に **Reconciliation** タブ → **診断** → Cleanup 欄の対象 hostname / VMID を確認 → 「影響を確認しました」→ **cleanup 実行**。対象 0 件なら「既に clean」と表示される | blocked entry が 0 件 | Return normal mode が `ResidualManagedResource` (409) で拒否される。また Instance が `deleted` に落ちないため、次回開催の readiness `previous_cleanup` が fail し続け **draft から `preparing` に上がれない** |
-   | 7-3 | **Return normal mode** (benchvm 停止 → devvm 復帰) | managed VM が Proxmox に残っていない | handler の `verify_no_managed_vms` で blocked |
+   | 7-3 | **Return normal mode** (benchvm 停止 → devvm 復帰)。**devvm を開発用途で使う期間に入るときだけ実施** (下記) | managed VM が Proxmox に残っていない | handler の `verify_no_managed_vms` で blocked |
 
    7-1 で adopt を要求されるのは「命名規約に合致する hostname の
    Cloudflare resource があるが、DB 側に対応する Instance / binding が
    無い」場合 (`unmanaged_orphan`)。portal が作ったものではない可能性が
    あるため、**明示 adopt なしには絶対に消さない**設計になっている。
    adopt する前に対象 hostname が本当に過去開催の残骸かを確認する。
+
+   **7-3 は次回開催に必須ではない**。次回開催を `preparing` に上げる gate
+   は readiness `previous_cleanup` (7-2 で満たされる) だけで、mode は
+   見ない。devvm を当面使わないなら contest mode のまま置いておくのが
+   手間が少ない。enter contest mode は contest mode からは 7 step すべてが
+   「already」で何も変更せず通る。7-3 を実施した後に contest mode へ戻すのは、
+   次回開催を preparing に上げてから Overview の **「競技モード切替」**
+   (手順 3-2) で行う。finished / canceled の Contest からは起動できないので、
+   それより前に戻すなら eevee 側で
+   `../nixos-config-private/scripts/eevee-mode.sh contest` を使う。
+
+   7-3 の memory_check は benchvm を停止した**後**に「node free ≥ devvm
+   の割当 + reserve 1 GiB」を要求し、ZFS ARC (eevee では上限 4 GiB) を
+   空きとして数えない。足りなければ blocked になり、その時点で benchvm
+   は停止・onboot 0、devvm も停止・onboot 0 のまま止まる (8 step 中
+   5 番目)。復旧は `docs/runbooks/contest-recovery.md` §6 (Insufficient
+   RAM) に従う。devvm が既に running (通常モード中の押し直し) なら
+   memory_check は空きを要求せずに通り、8 step すべてが何も変更せず
+   succeeded で終わる (devvm の RAM は node free から既に引かれている)。
 
 **古い制約 (第1回時点) は撤廃済み**: 「同じ DB で次回を開催するには pod を
 止めて `portal.db` を消して seed し直す」「contest 行の status を SQL で

@@ -57,3 +57,32 @@ export const modeVmIdentityMismatch = (observed: {
   readonly benchvm: ObservedModeVm
 }): string | null =>
   nameMismatch(observed.devvm, DEVVM_VM_NAME) ?? nameMismatch(observed.benchvm, BENCHVM_VM_NAME)
+
+// 競技モード = devvm (開発サーバ) が停止し、benchvm (bench runner / CF tunnel) が
+// 起動している状態。prepare (team VM の払い出し) はこの状態を前提にする:
+// normal mode のまま走らせると devvm が RAM を握ったままなので、prepare handler
+// が KSM 統合待ちの末に ksm_settle_timeout で blocked になるだけで理由が読めない。
+// 判定できない (VM が観測できない / 名前が期待と違う) ときも「競技モードではない」
+// 側に倒す(fail closed)。
+export type ContestModeBlocker =
+  | "mode_vms_unobservable"
+  | "mode_vm_identity_mismatch"
+  | "devvm_not_stopped"
+  | "benchvm_not_running"
+
+export interface ObservedModeVmPower extends ObservedModeVm {
+  readonly status: "running" | "stopped"
+}
+
+// 競技モードなら null、そうでなければ最初に見つかった理由を返す。
+export const contestModeBlocker = (observed: {
+  readonly devvm: ObservedModeVmPower | null
+  readonly benchvm: ObservedModeVmPower | null
+}): ContestModeBlocker | null => {
+  const { devvm, benchvm } = observed
+  if (devvm === null || benchvm === null) return "mode_vms_unobservable"
+  if (modeVmIdentityMismatch({ devvm, benchvm }) !== null) return "mode_vm_identity_mismatch"
+  if (devvm.status !== "stopped") return "devvm_not_stopped"
+  if (benchvm.status !== "running") return "benchvm_not_running"
+  return null
+}

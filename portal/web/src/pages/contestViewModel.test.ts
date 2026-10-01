@@ -93,6 +93,16 @@ describe("computeContestActions", () => {
     expect(a.rearchive).toBe(false)
     expect(a.startContest).toBe(false)
   })
+
+  // spec §3 → §4: 競技モード切替とインスタンス準備は preparing の間だけ。draft は
+  // readiness gate 前、running 以降は benchvm 経由の参加者経路を前提にしている。
+  it.each(["draft", "preparing", "running", "finalizing", "finished", "canceled"] as const)(
+    "%s: enterContestMode / prepareInstances は preparing のときだけ有効",
+    (status) => {
+      const a = computeContestActions({ ...baseContest, status } as Contest)
+      expect([a.enterContestMode, a.prepareInstances]).toEqual([status === "preparing", status === "preparing"])
+    }
+  )
 })
 
 describe("groupReadinessByStatus", () => {

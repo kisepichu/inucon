@@ -863,6 +863,15 @@ export const makeReturnNormalModeHandler: Effect.Effect<OperationHandler, never,
             return yield* Effect.fail(new OperationExecutionError({ cause: result.left }))
           }
           case "memory_check": {
+            // devvm が既に running なら起動用の空きは要らない (通常モード中の押し直し)。
+            // nodeFree は devvm の RAM を既に控除済みなので、ここで devvm 分を要求すると
+            // 二重控除で blocked になり、global lock を握ったまま次回開催の「準備開始」を
+            // 止める (enter_contest_mode の memory_check と対称)。
+            // 短絡は安全: step は ordinal 順に厳密に直列実行され (PR #86)、この後に残るのは
+            // set_devvm_onboot_1 (VM config の書き込みのみ) / start_devvm /
+            // verify_devvm_running だけ。後 2 つは毎 step 再観測した devvm が running なら
+            // 何も発行しないので、新たにメモリを確保する step は無い。
+            if (devvm.status === "running") return succeeded("devvm already running")
             // post-shutdown MemAvailable + benchvm 停止で解放される RAM が
             // devvm 起動要求 + host reserve を満たすか。既に benchvm が
             // stopped なら加算しない。

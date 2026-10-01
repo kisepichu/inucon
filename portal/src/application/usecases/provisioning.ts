@@ -22,8 +22,9 @@ import {
 } from "../ports.js"
 
 // hostname stem(canonical key)= FQDN の先頭ラベル `inucon-teamN-M`。
-// ResourceBinding.canonicalKey は reconciliation の stem と揃える契約。
-const hostnameStemFor = (teamNumber: number, index: number): string =>
+// ResourceBinding.canonicalKey は reconciliation の stem と揃える契約。clone する
+// VM の name もこの stem。prepare の作成予定表示 (planPrepareSlots) も同じ関数を使う。
+export const hostnameStemFor = (teamNumber: number, index: number): string =>
   `inucon-team${teamNumber}-${index}`
 
 // tpl-private-isu(スペック §前提: Phase 1 で構築済みのテンプレート VM)。
@@ -280,7 +281,7 @@ export const runProvisioning = (
           yield* proxmox.cloneVm({
             templateVmid: TEMPLATE_VMID,
             newVmid: instance.vmid,
-            name: `inucon-team${team.teamNumber}-${instance.index}`
+            name: hostnameStemFor(team.teamNumber, instance.index)
           })
         }
         // review round 3 finding 1: persistStep(clone_done) より "前" に VM

@@ -10,10 +10,13 @@ runbook / verification (Task 15 Step 1-3) の完了、および人手フェー�
 
 **状態 (2026-10-01):** Step 6 (merge / image import / manifest apply)、
 Step 7 (benchvm 起動 / agenix 切替 / 旧 token revoke)、Step 8 (突合 +
-archive Operation) が完了。**Step 4 / Step 5 は実施できなかった**
-(§B-1 / §B-2 — 値を埋めず「実施せず」として確定)。Step 9 / 10 / 11 は
-未実施。未実施項目には実行コマンドと期待結果を書いてあり、
-`TBD: <human>` は**人手でまだ実施していない値にのみ**残す。
+archive Operation + off-host verified 化)、Step 9 (reconciliation
+apply)、Step 10 (cleanup + 再監査) が完了し、readiness
+`previous_cleanup` が pass した。**Step 4 / Step 5 は実施できなかった**
+(§B-1 / §B-2 — 値を埋めず「実施せず」として確定)。Step 11 (edition2
+draft) は実開催日程が決まるまで未実施。未実施項目には実行コマンドと期待
+結果を書いてあり、`TBD: <human>` は**人手でまだ実施していない値にのみ**
+残す。
 
 **値の扱い:** 本 report の実測値は 2026-09-22 / 09-23 / 10-01 に実機
 (apphost `192.0.2.20` / eevee `192.0.2.10` / 公開 API
@@ -213,6 +216,11 @@ operator が実施した結果の記録。
 | 6 | 欠陥 (修復済) | claude-review CI が両 repo で機能していなかった | §C-2 |
 | 7 | 欠陥 (修復済) | readiness 6 件が一律 fail — provider inventory の sub-request 1 件の失敗が全体を道連れにしていた (他 3 原因と併せ PR #74) | §B-12 |
 | 8 | 欠陥 (未発火・修復済) | Task 14 の role 分割で `SDN.Use` / `VM.Config.CDROM` が欠落し、edition2 の team VM 作成が失敗する状態だった | §B-13 |
+| 9 | 欠陥 (修復済) | cleanup Operation が「実体の無い running Instance」を拾えず、Instance が `deleted` に落ちる経路が UI から存在しなかった。`previous_cleanup` が永久 fail し、次回開催が draft から上がれない状態だった (PR #77) | §B-14 |
+| 10 | 欠陥 (修復済) | Archive タブが公開 list を呼んでおり DB snapshot を列挙できず、off-host verify と admin download が UI から到達不能だった (PR #78) | §B-15 |
+| 11 | 欠陥 (修復済) | adopt が必要な reconcile apply が Admin Web から必ず `StaleReconciliationPlan` (409) になっていた (PR #82) | §B-16 |
+| 12 | 欠陥 (修復済) | Cleanup Operation を起動するボタンが Admin Web に存在しなかった (PR #82) | §B-16 |
+| 13 | 欠陥 (未発火・修復済) | Proxmox inventory の onBoot が実値によらず常に false と観測され、portal 経由の mode 遷移が onboot を片側しか切り替えない状態だった (PR #81) | §B-17 |
 
 逸脱 1・2 は同一原因 (§B-1) で、**値を後から埋めることは原理的に不可能**。
 `TBD: <human>` を残さず「実施せず」と確定させる。
@@ -510,31 +518,74 @@ ssh kise@192.0.2.20 'kubectl -n inucon exec deploy/inucon-portal -- ls -l /backu
   (再実施するなら Admin Web の Operations タブから同じ smoke を
   回して Operation ID を残す)。
 
-#### B-4-2. 未実施
+#### B-4-2. benchvm 側と旧資格情報の retire → **実施済 (2026-09-27 / 10-01)**
 
-| # | 作業 | 実行コマンド | 期待結果 |
+| # | 作業 | 実施日 | 結果 |
 | --- | --- | --- | --- |
-| 1 | benchvm 起動 | `cd ~/repos/nixos-config-private && ./scripts/eevee-mode.sh contest` | devvm graceful shutdown → benchvm start。PR #36 以降は環境変数なしで LAN 直結 |
-| 2 | benchvm `nixos-rebuild` | benchvm 上で `sudo nixos-rebuild switch --flake .#benchvm` | runner / cloudflared が agenix 経由の env に切替 |
-| 3 | benchvm 上の旧平文 EnvironmentFile 削除 | `rm /root/.inucon-tunnel-env /home/kise/.inucon/runner-env` | 両ファイルが存在しないこと |
-| 4 | 旧 Proxmox token revoke | `ssh root@192.0.2.10 'pveum user token remove portal@pve inucon'` 後に `pveum acl delete / --user portal@pve --role InuconPortal` | `pveum user token list portal@pve` が空、ACL から `portal@pve` 行が消える |
+| 1 | benchvm 起動 | 2026-09-27 | `eevee-mode.sh contest` は onboot を devvm=0 / benchvm=1 に切り替えた後、`qm start 9200` で失敗した (下記)。SDN を復元して起動 |
+| 2 | benchvm `nixos-rebuild` | 2026-10-01 | workstation から `--target-host` で switch。runner / cloudflared が agenix の EnvironmentFile に切替 |
+| 3 | 旧平文 EnvironmentFile 削除 | 2026-10-01 | `/root/.inucon-tunnel-env` と `/home/kise/.inucon/runner-env` (退避した `.bak` 含む 4 ファイル) が存在しない |
+| 4 | 旧 Proxmox token revoke | 2026-10-01 | `portal@pve!inucon` を削除し、`/` の `InuconPortal` ACL も削除 |
 
-**#1 は devvm (12288 MB) の graceful shutdown を伴う。** eevee の
-`MemAvailable` 実測は 1277-1985 MiB (2026-09-23 時点で 1985568 kB)
-であり、benchvm の必要量 (4096 + 1024 MiB host reserve = 5120 MiB) に
-届かない。したがって **devvm 停止は省略できない**。
-`eevee-mode.sh` はこの memory guard を実装しており、不足時は起動しない。
+##### #1 の障害: SDN 設定が空だった
 
-**#4 は #1-#3 の smoke 完了後に行う。** 先に revoke すると旧 image への
-rollback 経路が消える。
+`qm start 9200` が `cannot lookup undefined type` / `QEMU exited with code 1`
+で失敗した。benchvm の `net1=team1` / `net2=team2` は Proxmox SDN の vnet
+だが、`/etc/pve/sdn/zones.cfg` / `vnets.cfg` / `subnets.cfg` が 3 つとも
+0 バイト (mtime 2026-07-21) だった。一方 `.running-config` には最後に
+適用した定義が残っていたので、それをそのまま再作成した:
 
-- `/etc/pve/user.cfg` snapshot 保存先 (mode 0700 off-host): `TBD: <human>`
-  (#4 の直前に `ssh root@192.0.2.10 'cat /etc/pve/user.cfg'` を
-  `/home/kise/backups/inucon/` 配下へ保存する)
+- zone `inucon` (type simple, nodes eevee)
+- vnet `team1` / `team2` (zone inucon)
+- subnet `10.100.1.0/24` (gateway `10.100.1.1`, snat) / `10.100.2.0/24`
+  (gateway `10.100.2.1`, snat)
+
+適用前の状態は `eevee:/root/sdn-backup-20260927T133518Z/` に退避。適用は
+SSH が切れても止まらないよう `systemd-run` で切り離して実行
+(`pvesh set /cluster/sdn`、rc=0)。適用後も apphost は無影響
+(portal pod 1/1 Running、`inucon.kisen.one` HTTP 200)。benchvm は起動し、
+guest agent から `ens18 192.0.2.118` (LAN) / `ens19 10.100.1.2` (team1) /
+`ens20 10.100.2.2` (team2) を確認した。
+
+##### #2: runner の起動条件を git 非依存に変更
+
+旧 unit は ExecStart で `git -C /home/kise/inucon rev-parse HEAD` を要求して
+いたが、benchvm の配置は rsync で `.git` が無いため switch すると runner が
+起動を拒否する状態だった。`nixos-config-private` PR #41 で REVISION ファイル
+経由に変更し、配置手順は inucon PR #73 (`deploy/README.md` §6) に反映。
+
+2026-10-01 の再導出:
+
+| 項目 | 実測 |
+| --- | --- |
+| `/run/current-system` | `/nix/store/19mnb0pfxwqaha6sbgcqv4pfg7r1g0y4-nixos-system-benchvm-25.11.20260526.25f5383` |
+| `inucon-runner` | active、EnvironmentFile `/run/agenix/runner-env`、起動 2026-10-01 13:08:17 JST |
+| `cloudflared-inucon` | active、EnvironmentFile `/run/agenix/inucon-tunnel-token`、起動 2026-10-01 13:08:17 JST |
+| `/home/kise/inucon/REVISION` | `a2c6b6b803a6d9d33f95169885d37f33e5b927ca` |
+| portal 側 `runner_agents` | `benchvm` / revision 上記と一致 / `bench_ready=1`。`last_seen_at` が 20 秒間隔で前進することを 2 点観測で確認 |
+
+##### #4 の監査証跡
+
+revoke の直前に `eevee:/root/token-revoke-20261001T043451Z/` (mode 0700) へ
+`acl-before.txt` / `perm-portal-before.txt` / `token-portal-before.txt` /
+`user.cfg` を保存した。`user.cfg` は off-host にも写してある:
+
+- `/home/kise/backups/inucon/pve-user.cfg-before-token-revoke-20261001T043451Z`
+  (mode 0600、ディレクトリ mode 0700)。SHA-256
+  `7e74297abdfffa39f1b1edba01a776a61c95d40599c770334ebce11c0778d29a`
+  (eevee 側と一致)
+
+revoke 前に、portal が新しい split credential だけで動いていることを
+確認した。k8s Secret に旧 `PROXMOX_TOKEN_ID` / `PROXMOX_TOKEN_SECRET` が
+無いこと、両リポジトリに `portal@pve!inucon` を実際に参照している箇所が
+無いこと、の 2 点。revoke 後も `/api/health` は ok、pod は restart 0。
+
+2026-10-01 の再導出: `pveum user token list portal@pve` は空、
+`pveum acl list` に `portal@pve` の行は 0 件。
 
 ### B-5. Step 8 — Edition1 の突合と archive
 
-**状態: 突合は完了、archive Operation は未実施。**
+**状態: 突合・archive Operation・off-host verified 化まで完了 (2026-10-01)。**
 
 #### B-5-1. edition1 metadata (2026-09-23 実測)
 
@@ -700,11 +751,19 @@ CSV の列順は `teamId,teamName,bestScore,latestScore,latestAt`。
 | Cloudflare tunnel ingress | 3 件 (team1-1 / team2-1 / catch-all 404) | 同一 |
 | Cloudflare DNS | 32 件 (うち `inucon-team*` 2) | 同一 |
 
-##### 未了 (人手)
+##### off-host verified 化 (2026-10-01 17:30:41 JST)
 
-snapshot artifact の `off_host_status` は `pending`。Archive タブで
-SHA-256 を再入力して verified 化する。scoreboard 2 件は
-`not_applicable` (公開経路のため off-host 検証の対象外) で操作不要。
+当初 Archive タブに snapshot 行が表示されず実施できなかった (§B-15)。
+PR #78 を含む image (main `8394240`) のデプロイ後に Archive タブで
+snapshot の SHA-256 を再入力し verified 化した。
+
+| kind | off_host_status | verified_at (UTC) |
+| --- | --- | --- |
+| scoreboard | `not_applicable` | — |
+| scoreboard_csv | `not_applicable` | — |
+| snapshot | `verified` | `2026-10-01T08:30:41.492Z` |
+
+scoreboard 2 件は公開経路のため off-host 検証の対象外で、操作不要。
 
 再導出:
 ```sh
@@ -730,12 +789,15 @@ curl -sS http://192.0.2.20:30080/api/contest      # 互換 endpoint
 python3 -c "import sqlite3;d=sqlite3.connect('file:/home/kise/backups/inucon/portal-post-migration-0007-20260922T134215Z.db?immutable=1',uri=True);print(d.execute('PRAGMA integrity_check').fetchall())"
 ```
 
-### B-6. Step 9 — 初回 reconciliation apply → **未実施**
+### B-6. Step 9 — 初回 reconciliation apply → **実施済 (2026-10-01)**
 
 `inucon-team*` の実体 (Proxmox VM / Cloudflare DNS) に触る唯一の
 step であり、§B-4-2 #1-#3 (benchvm 起動 + agenix 切替) が前提。
 
-- 実行方法: Admin Web → Reconciliation → Refresh → plan 確認 → Apply
+- 実行方法: Admin Web → Reconciliation → **診断** → adopt 対象を個別に
+  チェック → **adopt を反映した plan を取得** → **適用**
+  (PR #82 以降の UI。PR #82 より前の UI では adopt 付き apply が必ず
+  409 になっていた — §B-16)
 
 #### B-6-1. 事前登録した期待 plan (2026-10-01)
 
@@ -774,36 +836,104 @@ route / ingress / app がいずれも 1 なので `duplicated` 判定
 
 #### B-6-2. 実測
 
-- 実測 plan (entry 一覧): `TBD: <human>`
+**「診断」の plan は §B-6-1 の事前登録と完全に一致した**:
+
+| hostname | classification | action | Proxmox VMID | CF DNS | CF ingress | CF app | reason |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `inucon-team1-1` | `missing` | `cleanup` | — | 1 | 1 | 1 | `vm_missing` |
+| `inucon-team2-1` | `unmanaged_orphan` | `blocked` | — | 1 | 1 | 1 | `requires_adopt_confirmation` |
+
+entry はこの 2 件だけで、catch-all / portal / 無関係リソースの行は無し。
+この時点の Cleanup 欄は対象 `inucon-team1-1 — VMID なし` を表示し、
+team2-1 の blocked を理由に押せない状態だった (PR #82 の設計どおり)。
+
 - 選択した adopt: `inucon-team2-1` (stem)。UI の `requiredAdopt` は plan の
   entry から導出されるため、operator が hostname 文字列を入力する余地は
   無い (FQDN を渡す経路が存在しない)
-- apply Operation ID: `TBD: <human>`
-- step 遷移: `TBD: <human>` (queued → running → succeeded の時刻)
-- apply Operation 最終 status: `TBD: <human>` (期待: succeeded)
+- apply Operation ID: `879203f2-5d6c-4004-8f3c-4da3e0c0d1ad`
+  (plan digest `43deb44a07687f10d485bfeec992562ab77657b7ef7398073c5b808ce2c03b74`、
+  contest revision 1、actor admin)
+- 作成 → 開始 → 終了 (JST): 18:58:21 → 18:58:22 → 18:58:27
+- step (2 件とも attempt 1、retry 無し):
+  - `reconcile:inucon-team1-1` 18:58:22 succeeded (`reconciled:inucon-team1-1`)
+  - `reconcile:inucon-team2-1` 18:58:27 succeeded (`reconciled:inucon-team2-1`)
+- apply Operation 最終 status: `succeeded`
 
-**apply 前に必ず確認する**: 上表の 2 件以外に entry が出ていないこと。
-1 件でも増えていたら apply せず
-`docs/runbooks/contest-recovery.md` §1 (stale plan) に従う。
+apply 前後の provider 状態 (`inucon-team*` 以外に触れていないことの突合):
 
-### B-7. Step 10 — Post-cleanup 状態 → **未実施**
+| 項目 | apply 前 (09:56:37Z) | apply 後 (09:59:58Z) |
+| --- | --- | --- |
+| CF Access apps | 10 (うち `inucon-team*` 2) | 8 (`inucon-team*` 0)。miniflux / dawarich ×3 / devvm / rss / apphost / ssh は残存 |
+| CF tunnel ingress | 3 (team1-1 / team2-1 / catch-all 404) | 1 (catch-all 404 のみ) |
+| CF DNS | 32 (うち `inucon-team*` 2) | 30 (`inucon-team*` 0)。`inucon.kisen.one` は残存 |
+| Proxmox VM | 100 / 9000 / 9100 / 9200 / 9300 | 同一 |
+| ResourceBinding | 0 | 0 (adopt 時に張った binding も CF 削除後に削除) |
+| Instance (`vmid=1101`) | `running` | `running` (Instance を進めるのは cleanup) |
 
-§B-6 の後に実施する再監査。
+#### B-6-3. Cleanup Operation (Step 9 から Step 10 への橋渡し)
+
+apply 後に再度「診断」し、Cleanup 欄の対象が `inucon-team1-1 — VMID なし`
+で blocked 表示が消えたことを確認してから「cleanup 実行」。
+
+- Operation ID: `bb39201b-5752-484a-be70-270e7664b72c`
+  (plan digest `4f7edf27ae28b40c11598510f7fd579a9d16699edd72a40eb69400cb21551ac8`)
+- 作成 → 開始 → 終了 (JST): 19:02:38 → 19:02:38 → 19:02:40
+- step:
+  - `cleanup:inucon-team1-1` 19:02:38 succeeded (`cleaned inucon-team1-1`、continueOnError=yes)
+  - `cleanup:mark_completed` 19:02:40 succeeded (`cleanup_completed`)
+- 最終 status: `succeeded`。Instance `vmid=1101` は `deleted` になり、
+  contest は `cleanup_completed_at` が刻まれて revision 1 → 2。
+
+これが §B-14 で「UI から存在しない」と証明した経路で、PR #77 + #82 の
+修正後に初めて本番で通った。
+
+### B-7. Step 10 — Post-cleanup 状態 → **実施済 (2026-10-01)**
+
+§B-6 の後に実施する再監査。実測は 2026-10-01T10:05:37Z。
 
 | 項目 | 確認方法 | 期待 | 実測 |
 | --- | --- | --- | --- |
-| 再 reconciliation plan | Admin Web → Refresh | 差分なし | `TBD: <human>` |
-| edition1 active Instance 数 | Admin Web / DB `instances` | 0 | `TBD: <human>` |
-| Proxmox `inucon-team*` VM 数 | `ssh root@192.0.2.10 'qm list'` | 0 | `TBD: <human>` |
-| Cloudflare `inucon-team*` DNS 数 | Admin Web inventory | 0 | `TBD: <human>` |
-| Cloudflare `inucon-team*` tunnel ingress 数 | 同上 | 0 | `TBD: <human>` |
-| Cloudflare `inucon-team*` Access app 数 | 同上 | 0 | `TBD: <human>` |
-| catch-all record 残存 | 同上 | 残っている | `TBD: <human>` |
-| edition1 score 不変 | `curl .../api/scoreboard` | 1077 / 910 | `TBD: <human>` |
-| portal `/api/health` | `curl -o /dev/null -w '%{http_code}' https://inucon.kisen.one/api/health` | 200 | `TBD: <human>` |
+| 再 reconciliation plan | Admin Web → 診断 (contest revision 2) | 差分なし | **差分なし**。entry は `inucon-team1-1` = `in_sync` / `noop` / `managed_orphan_clean` (VMID なし、CF 0 / 0 / 0) の 1 件のみ。Cleanup 欄は「cleanup 対象はありません (既に clean)」。plan digest `c8fe6e5118f6…` |
+| edition1 active Instance 数 | DB `instances` (`status != 'deleted'`) | 0 | **0** (`vmid=1101` は `deleted`) |
+| Proxmox `inucon-team*` VM 数 | `ssh root@192.0.2.10 'qm list'` | 0 | **0** |
+| Cloudflare `inucon-team*` DNS 数 | CF API (portal pod から) | 0 | **0** (DNS 総数 30) |
+| Cloudflare `inucon-team*` tunnel ingress 数 | 同上 | 0 | **0** (ingress 総数 1) |
+| Cloudflare `inucon-team*` Access app 数 | 同上 | 0 | **0** (app 総数 8) |
+| catch-all record 残存 | 同上 | 残っている | **残存** (`(catch-all) -> http_status:404`) |
+| edition1 score 不変 | `curl .../api/scoreboard` | 1077 / 910 | **1077 / 910** |
+| portal `/api/health` | `curl -o /dev/null -w '%{http_code}' https://inucon.kisen.one/api/health` | 200 | **200** |
 
-現状の baseline (cleanup 前、2026-09-23 実測): active Instance **1**
+readiness (同時刻、Admin Web): **`previous_cleanup` が pass**
+(`no residual instances from prior editions`)。次回開催を `preparing` に
+上げる唯一の前提 gate が満たされた。`benchvm` は
+`onBoot=true` と実値どおりに出るようになった (§B-17 の修正が本番で
+有効)。`cloudflare_inventory` は `0 route(s), 0 app(s)`。
+
+cleanup 前の baseline (2026-09-23 実測): active Instance **1**
 (`vmid=1101`, `running`)、edition1 score 1077 / 910、`/api/health` 200。
+
+#### B-7-1. return normal mode は今回実施しない
+
+runbook §7-3 の return normal mode (benchvm 停止 → devvm 起動) は
+**実施していない**。eevee は contest mode のまま (benchvm running /
+onboot=1、devvm stopped / onboot=0)。
+
+- 次回開催に必須ではない。次回開催を `preparing` に上げる gate は
+  `previous_cleanup` だけで、mode は見ない。enter_contest_mode の handler は
+  contest mode からは 7 step すべてが冪等で、「already」で何も変更せず
+  通る設計。ただし portal にはその Operation を起動する経路がまだ無い
+  (§C-3 #14)。
+- 現時点では memory_check でほぼ確実に blocked になる `[INFERENCE]`。
+  memory_check は benchvm 停止**後**に「node free ≥ devvm 12288 MiB +
+  reserve 1024 MiB = 13312 MiB」を要求する。2026-10-01 の node free は約
+  9468 MiB で、benchvm の RSS 3734 MiB (うち apphost と KSM 共有している
+  分は解放されない) を足しても約 12.5〜13.2 GiB。ZFS ARC (上限 4096 MiB、
+  実測 3948 MiB) は空きとして数えられない。memory_check は 8 step 中 5
+  番目で、blocked になると benchvm は停止・onboot 0、devvm は停止・
+  onboot 0 のまま Operation が止まり cancel が要る。
+- operator 判断 (2026-10-01): devvm は第 2 回以降を数回開催するまで
+  開発用途で起動する必要が無いので contest mode を維持する。メモリ設定
+  (ARC 上限など) も現状のまま。
 
 ### B-8. Step 11 — Edition2 draft → **未実施**
 
@@ -1162,6 +1292,38 @@ inventory 全体は落ちず…` が fail / D2: SDN vnet 読み取りを空配�
 `team bridge が SDN vnet にしか無くても…` が fail / D4:
 `CF_PAGE_SIZE` を 5000 に戻す → ページネーション 3 件が fail)。
 
+#### 本番での効果 (2026-10-01、main `8394240` デプロイ後、§B-13 の ACL 変更込み)
+
+Admin Web の Readiness タブ (edition1) の実測。修正前の 7 件 fail
+(Proxmox 系 6 件 + `cloudflare_inventory`) はすべて解消し、残る fail は
+事前に予測した 2 件だけになった:
+
+| status | key | summary (実測) |
+| --- | --- | --- |
+| fail | `previous_cleanup` | 1 residual instance(s) still hold vmid/IP from a prior edition |
+| fail | `rehearsal` | no successful rehearsal recorded for this contest yet |
+| warn | `isolation` | inucon-team-isolation state is not observable via the Proxmox API; verify on eevee: systemctl is-active inucon-team-isolation |
+| warn | `capacity_estimate` | estimated 12884901888B team-VM RAM exceeds post-mode free 9959845888B (linked-clone KSM recovery may make room; Task 9 will re-check per instance) |
+| warn | `cloudflare_write_proven` | Cloudflare write path has not been exercised for this Contest yet |
+| pass | `portal_db` | portal DB reachable |
+| pass | `template` | template VM 9100 present |
+| pass | `team_slots` | team slots ready: 1,2 |
+| pass | `memory` | post-shutdown MemAvailable ≥ benchvm(4294967296B) + reserve(1073741824B) |
+| pass | `benchvm` | benchvm inventory present (status=running, onBoot=false) |
+| pass | `mode_vm_identity` | observed names match expected mapping (devvm=9300, benchvm=9200) |
+| pass | `cloudflare_token` | Cloudflare API token verify: active |
+| pass | `cloudflare_inventory` | Cloudflare inventory readable (2 route(s), 2 app(s)) |
+| pass | `runner` | runner benchvm rev a2c6b6b803a6d9d33f95169885d37f33e5b927ca healthy (age=255ms) |
+| pass | `backup` | backup canary create/fsync/delete succeeded |
+
+- `previous_cleanup` は edition1 の Instance 1 件 (`vmid=1101`) が残っている
+  ため。Step 9 / 10 の reconcile + cleanup で解消する想定 (§B-6、§B-14)。
+- `rehearsal` は edition1 に rehearsal job が無いため構造的に pass しない。
+  start gate は edition2 で評価する。
+- `team_slots: 1,2` は §B-12 D2 (SDN vnet の和集合) と §B-13 (SDN.Audit)
+  の**両方**が効いた結果。
+- `benchvm` の `onBoot=false` は**誤観測**。実値は `onboot: 1`。§B-17 で扱う。
+
 ### B-13. Proxmox role 分割時の priv 欠落 (2026-10-01、修復済・未発火)
 
 §B-12 D2 の修正は**コードだけでは効かなかった**。PVE の
@@ -1219,24 +1381,213 @@ pveum role modify InuconProvisionVm --privs "VM.Allocate,VM.Audit,VM.Clone,VM.Co
 `/nodes/eevee/network` は変更後も token では 4 件 (`vmbr0` が見えない)
 ままだが、§B-12 D2 の和集合により `team_slots` の判定には影響しない。
 
+### B-14. cleanup の到達性欠陥 (2026-10-01、修復済)
+
+手順 6 (Step 9 reconciliation apply) を押す前に、apply 後に
+`previous_cleanup` を pass させる経路があるかを確認したところ、**存在しな
+かった**。押していたら CF resource だけが消え、Instance 行が `running` の
+まま残って次回開催が永久にブロックされていた。
+
+#### 再現 (本番 edition1 の状態をそのまま in-memory port に載せた 4 test)
+
+| # | 操作 | 修正前の結果 |
+| --- | --- | --- |
+| 1 | `planReconciliation({ adoptHostnames: [] })` | `inucon-team1-1` = `missing`/`cleanup`/`vm_missing`、`inucon-team2-1` = `unmanaged_orphan`/`blocked` (§B-6-1 の事前登録と一致) |
+| 2 | cleanup を先に実行 | `AmbiguousReconciliation` — cleanup は常に `adoptHostnames: []` で plan を取り直すので team2-1 の blocked を解除できない |
+| 3 | reconcile apply (adopt=`inucon-team2-1`) | 2 step を enqueue。handler は `InstanceRepo` に依存しないので Instance は `running` のまま。CF 削除後に binding も `deleteById` する |
+| 4 | CF clean 後に cleanup | plan は `inucon-team1-1` = `missing`/`noop`/`missing_clean_pending_db` の 1 件のみ → 対象 0 件で `NothingToReconcile` |
+
+どちらの順序でも Instance を `deleted` に落とせない。
+
+#### 根本原因
+
+`cleanup.ts` の対象選択が `action ∈ {cleanup, adopt_cleanup}` または
+`in_sync && (binding あり || VM 観測あり)` しか拾わず、
+`missing`/`noop`/`missing_clean_pending_db` を落としていた。一方
+`domain/reconciliation.ts` の当該分岐は「Instance を deleted へ進めるのは
+Task 12 の役目」と、**cleanup Operation が引き取る前提**で書かれていた。
+同じ選択コードが `cleanupContestResources` と `scheduleContestCleanup`
+(開催終了後に scheduler が呼ぶ経路) に**コピーされていた**ため、edition2
+の自動 cleanup でも同じ事象が起き得た。
+
+#### 修正 (PR #77 → develop `74ea0f6` → main `8394240`)
+
+選択を `needsCleanupOperation` として `classifyHostname` と同じ module に
+抽出し (分岐順の不変条件 — `instanceDeleted` を `missing` より先に評価する —
+と一緒に目に入る必要があるため)、2 コピーを統合。
+`classification === "missing" && Option.isSome(instanceId)` を対象に追加。
+`blocked` は fail-closed で常に除外。
+
+副次的に `drifted_awaiting_reprovision` (VM 残存 + CF 全消し) も対象に
+入る。旧条件はこれも漏らしており、`returnNormalMode` の
+`verify_no_managed_vms` を永続 blocked にし得た。
+
+#### 検証
+
+| 巻き戻し | 落ちるテスト |
+| --- | --- |
+| `missing && instanceId` 節を削除 | `needsCleanupOperation` / admin 経路 / scheduler 経路 / 収束 の 4 件 |
+| `missing` ガードを外す (deleted Instance も拾う) | 空 Operation 無限生成の防止 2 件 + 収束 1 件 |
+| `blocked` の fail-closed を外す | 未 adopt orphan に触らない 1 件 |
+
+上の再現 test 4 (デッドロックを主張する assertion) は修正後に**落ちる**
+(= cleanup が成功に転じる) ことを確認した。
+
+運用手順は `docs/runbooks/contest-operations.md` §7 に順序表として明記
+(PR #80): Reconciliation apply (adopt) → Cleanup → Return normal mode。
+
+### B-15. Archive タブの snapshot 列挙欠陥 (2026-10-01、修復済)
+
+§B-5-6 の verified 化を Admin Web で行おうとしたところ、Archive タブに
+scoreboard / scoreboard_csv の 2 行しか表示されず、`snapshot` 行
+(`off_host_status=pending`) が無かった。
+
+原因: `ArchivePanel` が**公開** list endpoint
+(`/api/contests/:id/artifacts`) を呼んでおり、そちらは意図的に
+`kind !== "snapshot"` で filter している。admin 用の list endpoint が
+存在しなかった。verify が必要な kind は `snapshot` だけなので
+`verifyArtifactChecksum` と `downloadAdminArtifact` が UI から到達不能で、
+plan L1195 (「Archive lists kind/size/checksum/download/off-host status
+and lets an admin confirm an off-host DB copy by re-entering the displayed
+checksum」) と Task 15 Step 8 の off-host 検証を満たしていなかった。
+
+修正 (PR #78 → develop `8a1527c` → main `8394240`): AdminOnly の
+`listAdminContestArtifacts` を追加して ArchivePanel をそちらへ。download
+は全 kind を admin 経路に統一。verify 入力は `pending` 行にのみ表示。
+**公開 list の snapshot filter は維持**し回帰テストで固定した。
+
+| 巻き戻し | 落ちるテスト |
+| --- | --- |
+| 公開 list の snapshot filter を外す | 情報漏洩回帰 1 件 |
+| ArchivePanel を公開 list に戻す | Archive タブ 2 件 |
+
+AdminOnly 境界は未認証 401 / 非 admin 403 (body に `snapshot` を含まない)
+/ admin 200 をテストで固定。
+
+### B-16. Reconciliation / Cleanup の Admin Web 導線欠陥 (2026-10-01、修復済)
+
+§B-14 の修正をデプロイした後、手順 6 / 7 を押す前に UI の経路を
+読み合わせたところ、2 件の欠陥が見つかった。どちらも押していれば
+手順が進まなかった。
+
+#### (A) adopt 付き apply が必ず stale になる
+
+`ReconciliationPanel` は「診断」で `adoptHostnames: []` の plan を取り
+(digest D0)、adopt チェック後に plan を取り直さず D0 と
+`adoptHostnames: [inucon-team2-1]` を送っていた。server は adopt 付きで
+plan を再計算して digest を照合する。`computePlanDigest` は
+`adoptHostnames` と各 entry の `action` を含み、adopt すると
+unmanaged_orphan の action が `blocked` → `adopt_cleanup` に変わるので
+D1 ≠ D0 → **必ず 409**。「診断」を押し直すと adopt チェックが消えて
+adopt=[] に戻るため、UI からは何度やっても apply できない。
+
+実コードの usecase テストで確定させた: adopt=[] の digest を adopt 付き
+apply に渡すと `StaleReconciliationPlan`、adopt 付きで再 plan した digest
+なら通る。既存の web テストは `api.applyReconciliation` を mock して
+いたため、digest の不一致を原理的に検出できなかった。
+
+#### (B) Cleanup ボタンが無い
+
+`OverviewPanel` の dangerous-actions は表示条件に `actions.cleanup`
+(finished / canceled で true) を含んでいたが、cleanup のボタンを描画する
+分岐が無かった。`api.requestContestCleanup` は定義されているだけで
+呼び出し元ゼロ。edition1 は `cleanupAt` が null なので scheduler の自動
+cleanup も走らない。plan L1129 (「Explicit admin apply … creates one
+cleanup Operation」) と L1199 (cleanup で影響 hostname / VMID を表示し
+confirmation checkbox を要求) を満たしていなかった。
+
+#### 修正 (PR #82 → develop `d23ee27` → main `486dca8`)
+
+- (A): adopt を全件確認すると「adopt を反映した plan を取得」が押せる
+  ようになり、adopt 付きで plan を取り直して表示する。「適用」はその
+  plan の digest と adoptHostnames で送る。adopt チェックを変えると
+  取り直した plan は破棄される。
+- (B): Reconciliation タブに Cleanup 欄を追加。対象と digest は常に
+  adopt=[] の plan から取り、対象 hostname / VMID を表示して確認
+  checkbox を要求する。blocked がある間は押せない。`NothingToReconcile`
+  は「既に clean」と表示する。
+- 対象判定は server の `needsCleanupOperation` が計算し、plan response の
+  `cleanupTarget` として返す。web 側に述語を再実装しない (§B-14 の原因が
+  述語の 2 コピーだったため)。plan の `cleanupTarget` が cleanup
+  Operation の step と一致することを契約テストで固定。
+
+| 巻き戻し | 落ちるテスト |
+| --- | --- |
+| apply の digest を adopt=[] の plan から取る | 1 件 (spy で digest を照合) |
+| apply の adoptHostnames を空にする | 1 件 |
+| apply 前の再 plan を外す (修正前の挙動) | 4 件 |
+| web で cleanup 対象を action で選ぶ (§B-14 と同じ型) | 2 件 |
+
+### B-17. onBoot の誤観測 (2026-10-01、修復済・未発火)
+
+§B-12 の readiness 実測で `benchvm … onBoot=false` と出たが、
+`qm config 9200` は `onboot: 1`。portal の mode token で実測すると:
+
+```
+qemu list (GET /nodes/eevee/qemu): 200
+  vmid=9200 name=benchvm has_onboot_field=false onboot=undefined
+  vmid=9300 name=devvm has_onboot_field=false onboot=undefined
+config 9200 (GET /nodes/eevee/qemu/9200/config): HTTP 200 name=benchvm onboot=1
+config 9300 (GET /nodes/eevee/qemu/9300/config): HTTP 200 name=devvm onboot=0
+```
+
+PVE 9.2.3 の qemu 一覧は onboot フィールドを返さない。adapter は Task 8
+以来「qemu 一覧に onboot が含まれることがある」前提で一覧から読んでおり、
+`parseOnBoot(undefined)` が false になっていた。
+
+mode 遷移の冪等ショートカットのうち「既に 0 ならスキップ」側が常に
+発火する:
+
+| 操作 | 判定 | 結果 |
+| --- | --- | --- |
+| enter_contest_mode | `devvm.onBoot === false` → already 0 | devvm の onboot を 0 にしない |
+| return_normal_mode | `benchvm.onBoot === false` → already 0 | benchvm の onboot を 0 にしない |
+
+portal 経由の mode 遷移は onboot を片側しか切り替えず、eevee 再起動時に
+devvm (12288 MiB) と benchvm (4096 MiB) が両方自動起動しうる状態だった。
+onboot 管理は memory guard の前提 (常にどちらか一方だけ onboot=1) なので、
+その不変条件が壊れていた。現時点の本番の onboot (benchvm=1 / devvm=0)
+は `scripts/eevee-mode.sh contest` が設定したもので、contest mode として
+正しい。portal の mode 遷移はまだ一度も本番で実行していないため未発火。
+
+#### 修正 (PR #81 → develop `3493175` → main `486dca8`)
+
+- onBoot は `/nodes/:node/qemu/:vmid/config` の onboot から読む (benchvm は
+  bridge 読み取りと同じ response を使う。追加 request は devvm の 1 本)。
+- `VmInventoryItem.onBoot` を `Option<boolean>` にし、config が読めない
+  ときは None。config に onboot キーが無いのは PVE 既定値 0 なので
+  `Some(false)`。「一覧に無い」と「config に無い」を区別する。
+- ショートカットは `Option.contains(x.onBoot, target)` で、観測が確定して
+  いるときだけスキップ。未観測なら目標値を書く。
+
+| 巻き戻し | 落ちるテスト |
+| --- | --- |
+| onBoot を qemu 一覧から取る形に戻す | 6 件 |
+| config が読めないとき `Some(false)` に畳む | 2 件 |
+| onboot キー無しを未観測扱いにする | 1 件 |
+| 未観測でもショートカットする (4 箇所) | 4 件 |
+| return_normal_mode で未観測を「既に 0」とみなす (独立検証) | 1 件 |
+
 ---
 
 ## Section C: 残っている human check / 未解決事項
 
 ### C-1. 残っている human check
 
-| 項目 | 誰が | 期日 | 状態 (2026-09-23) |
+| 項目 | 誰が | 期日 | 状態 (2026-10-01) |
 | --- | --- | --- | --- |
-| benchvm 起動 (`eevee-mode.sh contest`) | operator (kisepichu) | 次の作業単位の先頭 | 未実施 (§B-4-2 #1) |
-| benchvm `nixos-rebuild switch --flake .#benchvm` | operator | benchvm 起動直後 | 未実施 (§B-4-2 #2) |
-| benchvm 上の旧平文 `/root/.inucon-tunnel-env` / `/home/kise/.inucon/runner-env` 削除 | operator | Step 7 完了直後 | 未実施 (§B-4-2 #3) |
-| 旧 `portal@pve!inucon` token revoke + ACL 削除 | operator | Step 7 smoke 完了直後 | 未実施 (§B-4-2 #4) |
-| edition1 の archive Operation | operator | readiness 全 pass 後 | 未実施 (§B-5-6) |
-| 初回 reconciliation apply | operator | archive 後 | 未実施 (§B-6) |
-| cleanup 後の再監査 | operator | reconciliation 後 | 未実施 (§B-7) |
+| benchvm 起動 (`eevee-mode.sh contest`) | operator (kisepichu) | 次の作業単位の先頭 | **実施済** 2026-09-27 (SDN 復元を伴う、§B-4-2 #1) |
+| benchvm `nixos-rebuild switch --flake .#benchvm` | operator | benchvm 起動直後 | **実施済** 2026-10-01 (§B-4-2 #2) |
+| benchvm 上の旧平文 `/root/.inucon-tunnel-env` / `/home/kise/.inucon/runner-env` 削除 | operator | Step 7 完了直後 | **実施済** 2026-10-01 (§B-4-2 #3) |
+| 旧 `portal@pve!inucon` token revoke + ACL 削除 | operator | Step 7 smoke 完了直後 | **実施済** 2026-10-01 (§B-4-2 #4) |
+| edition1 の archive Operation | operator | readiness 全 pass 後 | **実施済** 2026-10-01、off-host verified 化まで (§B-5-6) |
+| 初回 reconciliation apply | operator | archive 後 | **実施済** 2026-10-01 (§B-6) |
+| cleanup 後の再監査 | operator | reconciliation 後 | **実施済** 2026-10-01、`previous_cleanup` pass (§B-7) |
+| enter contest mode / prepare の起動経路の追加とデプロイ | 実装 → operator (image import) | edition2 の rehearsal 前 | 未実施 (§C-3 #14) |
 | edition2 draft 作成 | operator | 実開催日程の決定後 | 未実施 (§B-8) |
+| edition2 rehearsal で 3 台目の払い出しが memory 判定を通るかの実測 | operator | edition2 preparing 中 | 未実施 (§C-3 #13) |
 | 参加者ブラウザでの実 Access 認証 | operator | edition2 preparing → running の直前 | 未実施 |
-| off-host snapshot の 3 世代保管 | operator | rollout 完了後継続 | 1 世代のみ保持 (§B-3-6) |
+| off-host snapshot の 3 世代保管 | operator | rollout 完了後継続 | 2 世代 (2026-09-22 post-migration / 2026-10-01 archive snapshot) |
 | plan の Task checkbox を最終確定 | operator | 本 report の全 TBD 埋め後 | 未実施 |
 
 ### C-2. claude-review CI の修理 (rollout の副産物)
@@ -1410,6 +1761,9 @@ read-only な `Bash(...)` 群 / `--disallowedTools "Edit,Write,Agent"`。
 | 9 | off-host snapshot が 1 世代のみ | §B-3-6 / §C-1 | 3 世代ローテーションを運用に入れる |
 | 10 | `getInstanceInventory` が managed app 1 件ごとに `getPolicies` を呼ぶが、得られる `policyShape` / `emailSetHash` は**どの判定にも表示にも使われていない** (`classifyHostname` は受け取らない。client.ts の「planner は emailSetHash で drift を検出できる」は未実装の願望)。plan refresh ごとに team 数の CF API call を無駄に払っており、CF は 429 を踏みやすい | 2026-10-01 のコード走査 (`policyShape` / `emailSetHash` を `portal/src` `portal/web` `shared/src` から検索し、消費箇所がゼロ) | drift 検出を実装するか、inventory から policy 取得を外す。どちらかに決める |
 | 11 | Proxmox role / ACL が repo 外 (eevee のローカル状態) にしか無く、Task 14 の分割時に旧 `InuconPortal` から `SDN.Use` / `VM.Config.CDROM` が落ちたことが**どの検証にも引っかからなかった** | §B-13 | `pveum role list` / `pveum acl list` の期待値を `nixos-config-private` 側に置き、`eevee-ops-test.sh` 相当で突合する |
+| 12 | readiness `capacity_estimate` が「team ごとの `instanceQuota` × 4 GiB」で計算しており**チーム数を掛けていない**。複数チームの開催では必要 RAM を過小に見積もる。warn 専用で、実際の安全判定は Task 9 の 1 台ごとの判定 (`PROVISION_MIN_FREE_MEM_BYTES`、既定 5,000,000,000 B) なので過剰に詰め込む害は無い | `readiness.ts` の `capacityEstimateCheck` (`desiredTotal = contest.instanceQuota * estimatedPerVm`)、`domain/contest.ts` の「チームごとのインスタンス上限」 | Σ team の `desiredInstanceCount` × template の割当 RAM で見積もる |
+| 13 | メモリ判定が ZFS ARC (上限 4096 MiB、2026-10-01 実測 3948 MiB) を空きとして数えない。return normal mode の memory_check (node free ≥ 13312 MiB) は現状ほぼ確実に blocked。edition2 計画 (1 チーム × 3 台) の 3 台目も clone 直前の空き 4768 MiB を満たすかが KSM による共有量次第。物理的には 3 台入る | §B-7-1、2026-10-01 の `free -m` / `arcstats` / `pvesh get /nodes/eevee/status` | edition2 の rehearsal で 3 台目が通るかを実測する。通らなければ ARC 上限を下げる (`/sys/module/zfs/parameters/zfs_arc_max`、再起動不要) か `PROVISION_MIN_FREE_MEM_BYTES` を見直す |
+| 14 | enter_contest_mode (Task 8) と prepare (Task 9) の Operation を**起動する経路が無い**。handler・step・テストは実装済みで、OperationHandlerRegistry にも登録されているが、HTTP endpoint・UI・scheduler のどこからも enqueue されない (enqueue される kind は backup / cleanup / finish / return_normal_mode / revoke_access / reconcile / start の 7 つだけ)。edition2 の rehearsal 前に prepare が必須。spec L262 と plan L1199 は mode 切替を operator が確認付きで起動する操作として要求している。あわせて readiness.ts の `PREPARATION_REQUIRED_CHECK_KEYS` / `PREPARATION_BLOCK_KEYS` も参照ゼロ (gate 自体は `beginContestPreparation` が同じトランザクション内で直接判定しているので安全上の穴ではない) | 2026-10-01 のコード走査 (usecase の export のうちコメントを除いたコードで参照が定義行だけのもの: `buildEnterContestModeSteps` / `prepareContest` / 上記 2 定数) | AdminOnly endpoint と Overview のボタン (影響 VMID / hostname 表示 + 確認 checkbox) を追加する。修正は別 PR で進行中 |
 
 ---
 

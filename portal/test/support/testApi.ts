@@ -32,7 +32,7 @@ import { UuidGenLive } from "../../src/infrastructure/sql/uuid.js"
 import { TransactionRunnerLive } from "../../src/infrastructure/sql/transactionRunner.js"
 import type { StubGithubUser } from "./githubOAuthStub.js"
 import { makeGithubOAuthStub } from "./githubOAuthStub.js"
-import type { CloudflareInventorySeed, ManagedVmSeed } from "./inMemory.js"
+import type { CloudflareInventorySeed, InfrastructureInventorySeed, ManagedVmSeed, ProxmoxTestOptions } from "./inMemory.js"
 import {
   makeBackupPortTest,
   makeCloudflarePortTest,
@@ -110,16 +110,22 @@ const RunnerConfigTestLive = Layer.succeed(RunnerConfig, {
 import type { CloudflareOperation } from "./inMemory.js"
 import type { CloudflareError } from "../../src/application/ports.js"
 
-const makeInstancePortsTestLive = (
-  githubKeysByLogin: Record<string, ReadonlyArray<string>> = {},
-  cloudflareInventory?: CloudflareInventorySeed,
-  proxmoxManagedVms?: ReadonlyArray<ManagedVmSeed>,
-  cloudflareFailWith?: Partial<Record<CloudflareOperation, CloudflareError>>
-) =>
+const makeInstancePortsTestLive = (options: {
+  readonly githubKeysByLogin?: Record<string, ReadonlyArray<string>>
+  readonly cloudflareInventory?: CloudflareInventorySeed
+  readonly proxmoxManagedVms?: ReadonlyArray<ManagedVmSeed>
+  readonly proxmoxInfrastructureInventory?: InfrastructureInventorySeed
+  readonly proxmoxFailWith?: ProxmoxTestOptions["failWith"]
+  readonly cloudflareFailWith?: Partial<Record<CloudflareOperation, CloudflareError>>
+}) =>
   Layer.mergeAll(
-    makeProxmoxPortTest({ managedVms: proxmoxManagedVms }).layer,
-    makeCloudflarePortTest({ inventory: cloudflareInventory, failWith: cloudflareFailWith }).layer,
-    makeGithubKeysPortTest(githubKeysByLogin)
+    makeProxmoxPortTest({
+      managedVms: options.proxmoxManagedVms,
+      infrastructureInventory: options.proxmoxInfrastructureInventory,
+      failWith: options.proxmoxFailWith
+    }).layer,
+    makeCloudflarePortTest({ inventory: options.cloudflareInventory, failWith: options.cloudflareFailWith }).layer,
+    makeGithubKeysPortTest(options.githubKeysByLogin ?? {})
   )
 
 // 本物の api(shared)を GithubOAuthPort だけスタブして起動するテスト Layer。
@@ -139,6 +145,10 @@ export const makeAppTestLayer = (options?: {
   readonly proxmoxManagedVms?: ReadonlyArray<ManagedVmSeed>
   // Task 7 review round 3 #1: provider 呼び出しを強制失敗させる(503 マッピング検証)。
   readonly cloudflareFailWith?: Partial<Record<CloudflareOperation, CloudflareError>>
+  // prepare-instances の競技モード前提 (devvm / benchvm の観測) と、inventory
+  // 取得失敗の 503 マッピングを検証するテスト用。未指定なら normal mode の既定値。
+  readonly proxmoxInfrastructureInventory?: InfrastructureInventorySeed
+  readonly proxmoxFailWith?: ProxmoxTestOptions["failWith"]
 }) =>
   HttpApiBuilder.serve().pipe(
     Layer.provideMerge(
@@ -168,7 +178,7 @@ export const makeAppTestLayer = (options?: {
         Layer.provide(
           Layer.succeed(AuthConfig, { adminGithubLogins: options?.adminGithubLogins ?? [] })
         ),
-        Layer.provide(makeInstancePortsTestLive(options?.githubKeysByLogin, options?.cloudflareInventory, options?.proxmoxManagedVms, options?.cloudflareFailWith)),
+        Layer.provide(makeInstancePortsTestLive(options ?? {})),
         // createTeamInstance(自チーム追加ボタン)ハンドラが RAM ガード閾値を
         // 要求するため、http テスト全般が壊れないよう既定値を配線する
         // (makeInstancePortsTestLive と同じ理由)。

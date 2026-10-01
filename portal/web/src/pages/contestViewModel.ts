@@ -51,6 +51,11 @@ export const operationStatusLabel: Record<OperationStatus, string> = {
 // draft/preparing/running/finalizing/finished/canceled の各状態で:
 //  - editDraft:    draft のみ (schedule/quota は preparing 以降は immutable)
 //  - beginPrepare: draft のみ (draft → preparing)
+//  - enterContestMode: preparing のみ (devvm 停止 → benchvm 起動、spec §3)
+//  - prepareInstances: preparing のみ (desired 台数の VM / 経路を準備、spec §4)
+//  - rehearsal:    preparing のみ (running の Instance 1 台にベンチ。readiness
+//                  `rehearsal` は start の必須項目。backend も preparing 以外は
+//                  ContestNotPreparing で拒否する)
 //  - startContest: preparing のみ (preparing → running)
 //  - immediateFinish: running のみ (running → finalizing、scheduler と同経路)
 //  - cancelDraft:  draft or preparing のみ (Task 1 の遷移 fig)
@@ -62,6 +67,9 @@ export const operationStatusLabel: Record<OperationStatus, string> = {
 export interface ContestActionEnablement {
   readonly editDraft: boolean
   readonly beginPrepare: boolean
+  readonly enterContestMode: boolean
+  readonly prepareInstances: boolean
+  readonly rehearsal: boolean
   readonly startContest: boolean
   readonly immediateFinish: boolean
   readonly cancelDraft: boolean
@@ -76,6 +84,9 @@ export const computeContestActions = (contest: Contest): ContestActionEnablement
   return {
     editDraft: s === "draft",
     beginPrepare: s === "draft",
+    enterContestMode: s === "preparing",
+    prepareInstances: s === "preparing",
+    rehearsal: s === "preparing",
     startContest: s === "preparing",
     immediateFinish: s === "running",
     cancelDraft: s === "draft" || s === "preparing",
@@ -174,8 +185,14 @@ export const ERROR_MESSAGES: Record<string, string> = {
   NothingToReconcile: "変更対象がありません",
   ProviderUnavailable: "外部プロバイダが一時的に利用できません",
   ResidualManagedResource: "先に cleanup を完了させてください",
+  ContestModeNotActive: "競技モードではありません。先に競技モード切替を完了させてください",
   ArtifactChecksumMismatch: "SHA-256 が一致しません",
-  InvalidArchiveState: "この状態では archive を再生成できません"
+  InvalidArchiveState: "この状態では archive を再生成できません",
+  RehearsalInstanceNotRunning: "対象 Instance が running ではありません。ページを再読み込みして Instance の状態を確認してください",
+  TeamJobAlreadyQueued:
+    "このチームには既に queued / running の rehearsal job があります。終わる (finished / failed になる) のを待ってから再実行してください",
+  InstanceNotFound: "対象 Instance が見つかりません (この開催回のものではないか、削除済みです)",
+  TargetIpOutOfSubnet: "Instance の IP がチームのサブネット外です"
 }
 
 export const messageForErrorTag = (tag: string): string => ERROR_MESSAGES[tag] ?? tag

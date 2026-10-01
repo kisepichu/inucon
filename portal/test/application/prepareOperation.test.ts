@@ -6,6 +6,7 @@ import { ipFor, vmidFor } from "../../src/domain/instance.js"
 import type { Instance } from "../../src/domain/instance.js"
 import { OperationStep } from "../../src/domain/operation.js"
 import type { Contest } from "../../src/domain/contest.js"
+import type { Team } from "../../src/domain/team.js"
 import { InstanceRepo, OperationInProgress, OperationRepo, ProxmoxError } from "../../src/application/ports.js"
 import type { StepOutcome } from "../../src/application/usecases/operations.js"
 import {
@@ -16,8 +17,10 @@ import {
   PrepareConfig,
   PrepareConfigDefault,
   makePrepareHandler,
+  planPrepareSlots,
   prepareContest
 } from "../../src/application/usecases/prepare.js"
+import type { InfrastructureInventorySeed, ProxmoxTestOptions } from "../support/inMemory.js"
 import {
   makeCloudflarePortTest,
   makeContestRepoTest,
@@ -140,16 +143,22 @@ const stepForContest = (args: {
 
 const stepLayer = (args: {
   readonly contests?: ReadonlyArray<Contest>
-  readonly teams?: ReadonlyArray<import("../../src/domain/team.js").Team>
+  readonly teams?: ReadonlyArray<Team>
   readonly instances?: ReadonlyArray<Instance>
   readonly freeMemBytes?: number
   readonly minFreeMemBytes?: number
+  readonly infrastructureInventory?: InfrastructureInventorySeed
+  readonly proxmoxFailWith?: ProxmoxTestOptions["failWith"]
 }) =>
   Layer.mergeAll(
     makeContestRepoTest(args.contests ?? [preparingContest]),
     makeTeamRepoTest({ teams: args.teams ?? [team1, team2], memberships: [] }),
     makeInstanceRepoTest(args.instances ?? []),
-    makeProxmoxPortTest({ freeMemBytes: args.freeMemBytes }).layer,
+    makeProxmoxPortTest({
+      freeMemBytes: args.freeMemBytes,
+      infrastructureInventory: args.infrastructureInventory,
+      failWith: args.proxmoxFailWith
+    }).layer,
     makeCloudflarePortTest().layer,
     makeOperationRepoTest().layer,
     UuidGenTest,
@@ -157,6 +166,15 @@ const stepLayer = (args: {
     PrepareConfigDefault,
     makeResourceBindingRepoTest([])
   )
+
+// 競技モード = devvm (開発サーバ) が停止し benchvm (bench runner / CF tunnel) が
+// 起動している状態。enter_contest_mode Operation が収束した後の inventory。
+const DEVVM_SEED = { vmid: 9300, name: "devvm", memoryBytes: 12 * 1024 * 1024 * 1024 } as const
+const BENCHVM_SEED = { vmid: 9200, name: "benchvm", memoryBytes: 4 * 1024 * 1024 * 1024 } as const
+const CONTEST_MODE_INVENTORY: InfrastructureInventorySeed = {
+  devvm: { ...DEVVM_SEED, status: "stopped", onBoot: false },
+  benchvm: { ...BENCHVM_SEED, status: "running", onBoot: true }
+}
 
 // -----------------------------------------------------------------------------
 // prepareContest (Operation enqueue) の契約
@@ -173,7 +191,7 @@ describe("prepareContest (enqueue)", () => {
       const steps = yield* ops.listSteps(op.id)
       expect(steps).toHaveLength(1)
       expect(steps[0].stepKey).toBe(PREPARE_STEP_KEY)
-    }).pipe(Effect.provide(stepLayer({})))
+    }).pipe(Effect.provide(stepLayer({ infrastructureInventory: CONTEST_MODE_INVENTORY })))
   )
 
   it.effect("preparing 以外の Contest では InvalidContestTransition で失敗する", () =>
@@ -182,7 +200,9 @@ describe("prepareContest (enqueue)", () => {
         Effect.flip
       )
       expect(error._tag).toBe("InvalidContestTransition")
-    }).pipe(Effect.provide(stepLayer({ contests: [runningContest] })))
+    }).pipe(
+      Effect.provide(stepLayer({ contests: [runningContest], infrastructureInventory: CONTEST_MODE_INVENTORY }))
+    )
   )
 
   it.effect("unfinished Operation があると OperationInProgress で失敗する", () =>
@@ -194,7 +214,59 @@ describe("prepareContest (enqueue)", () => {
         actorUserId: ADMIN_USER_ID
       }).pipe(Effect.flip)
       expect(error).toBeInstanceOf(OperationInProgress)
-    }).pipe(Effect.provide(stepLayer({})))
+    }).pipe(Effect.provide(stepLayer({ infrastructureInventory: CONTEST_MODE_INVENTORY })))
+  )
+
+  // prepare handler は devvm / benchvm を見ず node free memory だけで KSM 待ちを
+  // するので、normal mode (devvm 12 GiB が起動中) のまま走らせると 10 分待った
+  // 後に ksm_settle_timeout で blocked になるだけで理由が読めない。enqueue 時点で
+  // 競技モードかを inventory で確かめ、確かめられなければ fail-closed で拒否する。
+  it.effect.each([
+    { name: "normal mode (devvm running / benchvm stopped)", inventory: {}, reason: "devvm_not_stopped" },
+    {
+      name: "devvm running (benchvm は running)",
+      inventory: { ...CONTEST_MODE_INVENTORY, devvm: { ...DEVVM_SEED, status: "running", onBoot: false } },
+      reason: "devvm_not_stopped"
+    },
+    {
+      name: "benchvm stopped (devvm は stopped)",
+      inventory: { ...CONTEST_MODE_INVENTORY, benchvm: { ...BENCHVM_SEED, status: "stopped", onBoot: true } },
+      reason: "benchvm_not_running"
+    },
+    { name: "devvm が観測できない", inventory: { ...CONTEST_MODE_INVENTORY, devvm: null }, reason: "mode_vms_unobservable" },
+    { name: "benchvm が観測できない", inventory: { ...CONTEST_MODE_INVENTORY, benchvm: null }, reason: "mode_vms_unobservable" },
+    {
+      // VMID と名前の対応がズレていると power state を信用できない (2 VM の名前入れ替わり)。
+      name: "observed name が期待と違う",
+      inventory: {
+        devvm: { ...DEVVM_SEED, name: "benchvm", status: "stopped", onBoot: false },
+        benchvm: { ...BENCHVM_SEED, name: "devvm", status: "running", onBoot: true }
+      },
+      reason: "mode_vm_identity_mismatch"
+    }
+  ] satisfies ReadonlyArray<{ name: string; inventory: InfrastructureInventorySeed; reason: string }>)(
+    "競技モードでなければ ContestModeNotActive で拒否し Operation を積まない: $name",
+    ({ inventory, reason }) =>
+      Effect.gen(function* () {
+        const error = yield* prepareContest({ contestId: CONTEST_ID, actorUserId: ADMIN_USER_ID }).pipe(Effect.flip)
+        expect(error).toMatchObject({ _tag: "ContestModeNotActive", reason })
+        expect(yield* (yield* OperationRepo).hasUnfinished).toBe(false)
+      }).pipe(Effect.provide(stepLayer({ infrastructureInventory: inventory })))
+  )
+
+  it.effect("Proxmox inventory 自体が読めなければ ProxmoxError で拒否し Operation を積まない", () =>
+    Effect.gen(function* () {
+      const error = yield* prepareContest({ contestId: CONTEST_ID, actorUserId: ADMIN_USER_ID }).pipe(Effect.flip)
+      expect(error).toBeInstanceOf(ProxmoxError)
+      expect(yield* (yield* OperationRepo).hasUnfinished).toBe(false)
+    }).pipe(
+      Effect.provide(
+        stepLayer({
+          infrastructureInventory: CONTEST_MODE_INVENTORY,
+          proxmoxFailWith: { getInfrastructureInventory: new ProxmoxError({ cause: "simulated outage" }) }
+        })
+      )
+    )
   )
 })
 
@@ -395,6 +467,73 @@ describe("prepare Operation の step ハンドラ", () => {
           })
         )
       )
+  )
+})
+
+// -----------------------------------------------------------------------------
+// planPrepareSlots: Admin Web の確認画面に出す「作成される hostname / VMID」
+// -----------------------------------------------------------------------------
+
+// Admin Web は prepare の確認 checkbox の前に作成予定の hostname / VMID を出すが、
+// その導出を web 側に複製しない (PR #77 は判定ロジックが 2 箇所にあったことが原因)。
+// server の planPrepareSlots が handler の作成順・作成対象と一致することを、handler を
+// 収束するまで回して固定する。
+describe("planPrepareSlots", () => {
+  const deletedInstance = makeInstance({
+    id: InstanceId.make("d-1-2"),
+    contestId: CONTEST_ID,
+    teamId: TEAM1_ID,
+    index: 2,
+    vmid: vmidFor(1, 2),
+    privateIp: ipFor(1, 2),
+    status: "deleted",
+    progress: []
+  })
+  // team1: index1 running / index2 は deleted で空き / index3 なし。
+  // team2 (desired 2): index1 failed / index2 なし。
+  const seededInstances = [
+    runningInstance({ id: "r-1-1", teamId: TEAM1_ID, teamNumber: 1, index: 1 }),
+    deletedInstance,
+    failedInstance({ id: "f-2-1", teamId: TEAM2_ID, teamNumber: 2, index: 1 })
+  ]
+  const seededTeams = [team1, makeTeam({ ...team2, desiredInstanceCount: 2 })]
+
+  it("team 番号・index 順に desired 枠を並べ、deleted 以外の Instance が居る枠だけ既存として扱う", () => {
+    const slots = planPrepareSlots({ teams: seededTeams, instances: seededInstances })
+    expect(slots.map((s) => [s.hostname, s.vmid, s.occupant?.status ?? null])).toEqual([
+      ["inucon-team1-1", 1101, "running"],
+      ["inucon-team1-2", 1102, null],
+      ["inucon-team1-3", 1103, null],
+      ["inucon-team2-1", 1201, "failed"],
+      ["inucon-team2-2", 1202, null]
+    ])
+  })
+
+  it.effect("occupant の無い枠は handler が収束までに作る Instance と作成順・(team, index, vmid) まで一致する", () =>
+    Effect.gen(function* () {
+      const planned = planPrepareSlots({ teams: seededTeams, instances: seededInstances })
+        .filter((s) => s.occupant === null)
+        .map((s) => [s.teamNumber, s.index, s.vmid])
+
+      const handler = yield* makePrepareHandler
+      const instances = yield* InstanceRepo
+      const teamNumberById = new Map(seededTeams.map((t) => [t.id, t.teamNumber]))
+      const step = stepForContest({ operationId: "op-plan", stepId: "step-plan" })
+      const created: Array<ReadonlyArray<number | undefined>> = []
+      let outcome: StepOutcome = { status: "retry", retryAt: 0, summary: "start" }
+      for (let tick = 0; tick < 20 && outcome.status === "retry"; tick++) {
+        outcome = yield* handler.run(step).pipe(Effect.orDie)
+        // saga を模す: 作られた creating を記録して running に進め、次の 1 台を許す。
+        for (const inst of yield* instances.listByContest(CONTEST_ID)) {
+          if (inst.status !== "creating") continue
+          created.push([teamNumberById.get(inst.teamId), inst.index, inst.vmid])
+          yield* instances.update(makeInstance({ ...inst, status: "running" }))
+        }
+      }
+      // team2-1 が failed で枠を消費しているので収束はせず blocked で止まる。
+      expect(outcome.status).toBe("blocked")
+      expect(created).toEqual(planned)
+    }).pipe(Effect.provide(stepLayer({ teams: seededTeams, instances: seededInstances })))
   )
 })
 
