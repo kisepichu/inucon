@@ -72,7 +72,9 @@ export interface ReconciliationEntry {
   readonly action: ReconciliationAction
   // 呼び出し元 UI / 監査ログ用の非機密 reason 文字列。email / token 等は含めない。
   readonly reason: string
-  readonly proxmoxVmObserved: boolean
+  // 観測された Proxmox VM の VMID。cleanup はこの VM を destroy するので、
+  // Admin Web は確認画面にこの値をそのまま出す。
+  readonly proxmoxVmid: Option.Option<number>
   readonly cloudflareRouteCount: number
   readonly cloudflareIngressCount: number
   readonly cloudflareAppCount: number
@@ -109,7 +111,7 @@ export const classifyHostname = (args: {
   const allBindingIds: ReadonlyArray<ResourceBindingId> = [...cfBindingIds, ...proxmoxBindingIds]
   const base = {
     hostname: observation.hostname,
-    proxmoxVmObserved,
+    proxmoxVmid: Option.map(observation.proxmoxVm, (vm) => vm.vmid),
     cloudflareRouteCount: observation.cloudflareRouteCount,
     cloudflareIngressCount: observation.cloudflareIngressCount,
     cloudflareAppCount: observation.cloudflareAppCount,
@@ -285,7 +287,7 @@ export const needsCleanupOperation = (entry: ReconciliationEntry): boolean => {
   // fail-closed にして「blocked を黙って撤収する」経路を作らない。
   if (entry.action === "blocked") return false
   return (
-    entry.proxmoxVmObserved ||
+    Option.isSome(entry.proxmoxVmid) ||
     entry.cloudflareRouteCount > 0 ||
     entry.cloudflareIngressCount > 0 ||
     entry.cloudflareAppCount > 0 ||
@@ -312,8 +314,10 @@ export const computePlanDigest = (input: ComputePlanDigestInput): string => {
       hostname: e.hostname,
       classification: e.classification,
       action: e.action,
-      // observation counts は digest に含める(inventory 差分の検出用)。
-      proxmoxVmObserved: e.proxmoxVmObserved,
+      // observation counts は digest に含める(inventory 差分の検出用)。VMID も
+      // 含める: Admin Web は確認画面に VMID を出すので、同 hostname の VM が別
+      // VMID で作り直されたら operator が確認したものと別物として stale にする。
+      proxmoxVmid: Option.getOrNull(e.proxmoxVmid),
       cloudflareRouteCount: e.cloudflareRouteCount,
       cloudflareIngressCount: e.cloudflareIngressCount,
       cloudflareAppCount: e.cloudflareAppCount

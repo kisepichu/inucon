@@ -44,7 +44,7 @@ export const operationStatusLabel: Record<OperationStatus, string> = {
 
 // ---- Action enablement ----------------------------------------------------
 
-// Overview タブの各アクションボタンの有効/無効を Contest.status から一元的に
+// ContestAdmin の各アクションボタンの有効/無効を Contest.status から一元的に
 // 決める。UI はここの真偽値を disabled にそのまま流し込む (別の場所で判定を
 // 分散させない = readiness やタブ切替に伴う不整合を避ける)。
 //
@@ -55,7 +55,8 @@ export const operationStatusLabel: Record<OperationStatus, string> = {
 //  - immediateFinish: running のみ (running → finalizing、scheduler と同経路)
 //  - cancelDraft:  draft or preparing のみ (Task 1 の遷移 fig)
 //  - reconcile:    preparing / running / finalizing / finished 全般
-//  - cleanup:      finished / canceled のみ (running 中は cleanup を打たない)
+//  - cleanup:      finished / canceled のみ (running 中は cleanup を打たない。ボタンは
+//                  plan / digest / 対象一覧がある Reconciliation タブに置く)
 //  - returnNormal: finished / canceled のみ (cleanup 後に benchvm→devvm)
 //  - rearchive:    finished のみ (legacy contest の archive 再生成)
 export interface ContestActionEnablement {
@@ -121,6 +122,18 @@ export const adoptRequiredHostnames = (plan: ReconciliationPlan): ReadonlyArray<
 export const actionableEntries = (
   plan: ReconciliationPlan
 ): ReadonlyArray<ReconciliationEntry> => plan.entries.filter((e) => e.action !== "noop")
+
+// cleanup Operation が step を作る entry。対象選択は server の
+// needsCleanupOperation が cleanupTarget として返すので、ここで述語を再実装しない
+// (対象選択が 2 箇所にあったことが PR #77 のデッドロックの原因)。
+export const cleanupTargetEntries = (
+  plan: ReconciliationPlan
+): ReadonlyArray<ReconciliationEntry> => plan.entries.filter((e) => e.cleanupTarget)
+
+// server の cleanup / apply は blocked entry が 1 件でもあると
+// AmbiguousReconciliation で止まる。押せない理由を UI が先に示すために使う。
+export const blockedHostnames = (plan: ReconciliationPlan): ReadonlyArray<string> =>
+  plan.entries.filter((e) => e.action === "blocked").map((e) => e.hostname)
 
 // ---- Operation polling ----------------------------------------------------
 

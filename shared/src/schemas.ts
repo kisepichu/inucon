@@ -404,7 +404,7 @@ export type ScoreboardEntry = typeof ScoreboardEntry.Type
 
 // Task 7: reconciliation plan の wire 表現。domain/reconciliation.ts と同型で、
 // 生 email / bearer / provider ID は含まない(hostname / classification /
-// action / 観測件数 / sanitized reason のみ)。
+// action / VMID / 観測件数 / sanitized reason のみ)。
 export const ReconciliationClass = Schema.Literal(
   "in_sync",
   "missing",
@@ -423,12 +423,18 @@ export const ReconciliationEntry = Schema.Struct({
   classification: ReconciliationClass,
   action: ReconciliationAction,
   reason: Schema.String,
-  proxmoxVmObserved: Schema.Boolean,
+  // 観測された Proxmox VM の VMID (無ければ null)。cleanup が destroy する VM。
+  proxmoxVmid: Schema.NullOr(Schema.Int),
   cloudflareRouteCount: Schema.Int,
   cloudflareIngressCount: Schema.Int,
   cloudflareAppCount: Schema.Int,
   bindingIds: Schema.Array(ResourceBindingId),
-  instanceId: Schema.NullOr(InstanceId)
+  instanceId: Schema.NullOr(InstanceId),
+  // cleanup Operation (POST /cleanup) がこの hostname に step を作るか。server 側の
+  // needsCleanupOperation の結果で、Admin Web は対象選択を再実装せずこれを表示する。
+  // cleanup は adoptHostnames=[] で plan を取り直すため、意味を持つのは
+  // adoptHostnames=[] で取った plan の値だけ。
+  cleanupTarget: Schema.Boolean
 })
 export type ReconciliationEntry = typeof ReconciliationEntry.Type
 

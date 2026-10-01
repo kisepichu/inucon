@@ -132,36 +132,39 @@ describe("adoptRequiredHostnames / actionableEntries", () => {
         classification: "in_sync",
         action: "noop",
         reason: "same",
-        proxmoxVmObserved: true,
+        proxmoxVmid: 1101,
         cloudflareRouteCount: 1,
         cloudflareIngressCount: 1,
         cloudflareAppCount: 1,
         bindingIds: [],
-        instanceId: null
+        instanceId: null,
+        cleanupTarget: true
       },
       {
         hostname: "inucon-team1-2",
         classification: "unmanaged_orphan",
         action: "blocked",
         reason: "no binding",
-        proxmoxVmObserved: false,
+        proxmoxVmid: null,
         cloudflareRouteCount: 1,
         cloudflareIngressCount: 0,
         cloudflareAppCount: 1,
         bindingIds: [],
-        instanceId: null
+        instanceId: null,
+        cleanupTarget: false
       },
       {
         hostname: "inucon-team2-1",
         classification: "managed_orphan",
         action: "cleanup",
         reason: "portal-owned",
-        proxmoxVmObserved: true,
+        proxmoxVmid: 2101,
         cloudflareRouteCount: 0,
         cloudflareIngressCount: 0,
         cloudflareAppCount: 0,
         bindingIds: [],
-        instanceId: null
+        instanceId: null,
+        cleanupTarget: true
       }
     ]
   } as unknown as ReconciliationPlan

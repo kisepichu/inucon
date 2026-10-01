@@ -408,7 +408,18 @@ export interface VmInventoryItem {
   readonly name: string
   readonly status: "running" | "stopped"
   readonly memoryBytes: number
-  readonly onBoot: boolean
+  // VM config(GET /nodes/:node/qemu/:vmid/config)の onboot。None = config が
+  // 読めなかった(403 / 500 / 想定外値)。config に onboot キーが無いのは PVE 既定
+  // 0 なので Some(false)。
+  //
+  // vmid/name/status/memoryBytes は qemu 一覧、onBoot は VM ごとの config という
+  // 別 sub-request 由来で失敗も独立する。ProxmoxInfrastructureInventory と同じく
+  // 「読めなかった」を Option で表し、VM item ごと None にはしない(一覧は読めて
+  // いるので identity 検証や power step は続けられる)。boolean のままにすると
+  // 「読めなかった」が false に畳まれ、2026-10-01 本番障害(PVE 9.2.3 の qemu 一覧
+  // には onboot が無く、一覧から読んでいた onBoot が実値によらず常に false)と
+  // 同じ形になる。mode handler の冪等ショートカットは Some のときだけ効かせる。
+  readonly onBoot: Option.Option<boolean>
 }
 
 // 各フィールドは独立した Proxmox API sub-request(あるいは別 credential)から
@@ -480,8 +491,8 @@ export class ProxmoxPort extends Context.Tag("app/ProxmoxPort")<
     //   credential から見える qemu 一覧に template=1 で存在するか。template は
     //   /pool/inucon-team-vms 所属なので mode credential の ACL では見えない。
     // - devvm/benchvm: mode credential の qemu 一覧から名前で解決した VM
-    //   inventory item。onBoot は qemu 一覧の onboot(0/1)を boolean に畳んだもの。
-    //   一覧に居なければ None(以前は inventory 全体を失敗させていた)。
+    //   inventory item。一覧に居なければ None(以前は inventory 全体を失敗させて
+    //   いた)。onBoot は VM config の onboot(VmInventoryItem 参照)。
     // - preparedTeamNumbers: 「node 側に teamN の bridge / SDN vnet が存在する」
     //   かつ「benchvm の VM config の bridge にも teamN が入っている」N の集合
     //   (intersection)。片方だけでは実運用できないため必ず積集合を取る。

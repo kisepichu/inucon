@@ -849,4 +849,59 @@ describe("returnNormalMode", () => {
       expect(state.forceStopRequests).toEqual([])
     })
   )
+
+  // 2026-10-01 本番障害: onBoot が実値によらず false に畳まれていたため、
+  // set_benchvm_onboot_0 が「already 0」とスキップし benchvm の onboot=1 が残った。
+  // ショートカットは観測が確定している(Some)ときだけ。null = VM config が
+  // 読めなかった(None)なら目標値を書く。
+  describe("handler: onboot step は観測が確定しているときだけスキップする", () => {
+    const contestModeInventory = {
+      nodeFreeMemBytes: 20 * 1024 * 1024 * 1024,
+      templateExists: true,
+      devvm: { vmid: 9300, name: "devvm", status: "stopped" as const, memoryBytes: 8 * 1024 * 1024 * 1024, onBoot: false },
+      benchvm: { vmid: 9200, name: "benchvm", status: "running" as const, memoryBytes: 4 * 1024 * 1024 * 1024, onBoot: true },
+      preparedTeamNumbers: [1, 2],
+      isolationServiceActive: false
+    }
+
+    it.effect.each([
+      { observed: true, summary: "benchvm.onBoot set to 0", written: { 9200: false } },
+      { observed: null, summary: "benchvm.onBoot set to 0", written: { 9200: false } },
+      { observed: false, summary: "benchvm.onBoot already 0", written: {} }
+    ])("set_benchvm_onboot_0: benchvm.onBoot=$observed → $summary", ({ observed, summary, written }) =>
+      Effect.gen(function* () {
+        const proxmox = makeProxmoxPortTest({
+          managedVms: [],
+          infrastructureInventory: {
+            ...contestModeInventory,
+            benchvm: { ...contestModeInventory.benchvm, onBoot: observed }
+          }
+        })
+        const registry = yield* makeReturnNormalModeHandler.pipe(Effect.provide(proxmox.layer))
+        const outcome = yield* registry.run(stepOf("set_benchvm_onboot_0", { contestId: CONTEST_ID }))
+        expect(outcome).toEqual({ status: "succeeded", summary })
+        expect((yield* proxmox.getState).onBootByVmid).toEqual(written)
+      })
+    )
+
+    it.effect.each([
+      { observed: false, summary: "devvm.onBoot set to 1", written: { 9300: true } },
+      { observed: null, summary: "devvm.onBoot set to 1", written: { 9300: true } },
+      { observed: true, summary: "devvm.onBoot already 1", written: {} }
+    ])("set_devvm_onboot_1: devvm.onBoot=$observed → $summary", ({ observed, summary, written }) =>
+      Effect.gen(function* () {
+        const proxmox = makeProxmoxPortTest({
+          managedVms: [],
+          infrastructureInventory: {
+            ...contestModeInventory,
+            devvm: { ...contestModeInventory.devvm, onBoot: observed }
+          }
+        })
+        const registry = yield* makeReturnNormalModeHandler.pipe(Effect.provide(proxmox.layer))
+        const outcome = yield* registry.run(stepOf("set_devvm_onboot_1", { contestId: CONTEST_ID }))
+        expect(outcome).toEqual({ status: "succeeded", summary })
+        expect((yield* proxmox.getState).onBootByVmid).toEqual(written)
+      })
+    )
+  })
 })

@@ -1,9 +1,10 @@
 import { HttpBody, HttpClient } from "@effect/platform"
 import { it } from "@effect/vitest"
-import { Effect, Option } from "effect"
+import { Effect, Option, Schema } from "effect"
+import { Operation, ReconciliationPlan } from "shared/schemas"
 import { describe, expect } from "vitest"
 import { CloudflareError, ContestRepo, InstanceRepo, OperationRepo, ResourceBindingRepo, TeamRepo } from "../../src/application/ports.js"
-import { ContestId, InstanceId, ResourceBindingId, TeamId } from "../../src/domain/ids.js"
+import { ContestId, InstanceId, OperationId, ResourceBindingId, TeamId } from "../../src/domain/ids.js"
 import { Instance } from "../../src/domain/instance.js"
 import { ResourceBinding } from "../../src/domain/resourceBinding.js"
 import { login } from "../support/login.js"
@@ -510,6 +511,86 @@ describe("POST /api/admin/contests/:contestId/cleanup (Task 12)", () => {
       expect(body._tag).toBe("AmbiguousReconciliation")
       expect(body.hostnames).toContain("inucon-team2-1")
     }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  // Admin Web は cleanup の確認画面に「影響を受ける hostname / VMID」を出すが、
+  // 対象選択の述語 (needsCleanupOperation) を web 側に複製しない — 述語が 2 箇所に
+  // あったのが PR #77 のデッドロックの原因。plan response の cleanupTarget が
+  // cleanup Operation の実際の step 対象と一致することをここで固定する。
+  // action=noop でも cleanup の仕事が残る entry (VM 残存 / Instance 遷移待ち) を
+  // 含めて、action ベースの選択では一致しないことも同時に確かめる。
+  it.effect("plan の cleanupTarget / proxmoxVmid は cleanup Operation が step を作る hostname / 撤収する VM と一致する", () =>
+    Effect.gen(function* () {
+      yield* seedLegacy
+      const instances = yield* InstanceRepo
+      // team1-2: Instance deleted + 実体なし → clean (cleanup 対象外)
+      // team1-3: 実体は全部消えたが Instance が running → Instance 遷移だけ残る
+      for (const [index, status] of [[2, "deleted"], [3, "running"]] as const) {
+        yield* instances.create(
+          new Instance({
+            id: InstanceId.make(`i-1-${index}`),
+            contestId: CONTEST_ID,
+            teamId: TEAM1_ID,
+            index,
+            vmid: 1100 + index,
+            privateIp: `10.100.1.${10 + index}`,
+            status,
+            progress: [],
+            errorMessage: Option.none(),
+            createdAt: 1000,
+            updatedAt: 1000
+          })
+        )
+      }
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const planRes = yield* postJson(
+        cookie,
+        `/api/admin/contests/${CONTEST_ID}/reconciliation/plan`,
+        { adoptHostnames: [] }
+      )
+      expect(planRes.status).toBe(200)
+      const plan = Schema.decodeUnknownSync(ReconciliationPlan)(JSON.parse(yield* planRes.text))
+      expect(plan.entries.map((e) => [e.hostname, e.action, e.cleanupTarget, e.proxmoxVmid]).sort()).toEqual([
+        ["inucon-team1-1", "noop", true, 1101],
+        ["inucon-team1-2", "noop", false, null],
+        ["inucon-team1-3", "noop", true, null]
+      ])
+
+      const res = yield* postJson(cookie, `/api/admin/contests/${CONTEST_ID}/cleanup`, {
+        planDigest: plan.planDigest
+      })
+      expect(res.status).toBe(200)
+      const op = Schema.decodeUnknownSync(Operation)(JSON.parse(yield* res.text))
+      expect(op.kind).toBe("cleanup")
+      const steps = yield* (yield* OperationRepo).listSteps(OperationId.make(op.id))
+      const stepHostnames = steps
+        .map((s): unknown => JSON.parse(s.inputSummary))
+        .flatMap((summary) =>
+          typeof summary === "object" && summary !== null && "hostname" in summary &&
+            typeof summary.hostname === "string"
+            ? [summary.hostname]
+            : []
+        )
+        .sort()
+      expect(stepHostnames).toEqual(
+        plan.entries.filter((e) => e.cleanupTarget).map((e) => e.hostname).sort()
+      )
+    }).pipe(
+      Effect.provide(
+        makeAppTestLayer({
+          adminGithubLogins: ["admin-login"],
+          cloudflareInventory: {
+            routes: [
+              { hostname: "inucon-team1-1", dnsRecordIds: ["dns-1"], ingressServices: ["ssh://10.100.1.11:22"] }
+            ],
+            apps: [{ hostname: "inucon-team1-1", appIds: ["app-1"], policyShape: "owned_exact", emailSetHash: "h1" }]
+          },
+          proxmoxManagedVms: [
+            { vmid: 1101, name: "inucon-team1-1", status: "running", memoryBytes: 4 * 1024 * 1024 * 1024 }
+          ]
+        })
+      )
+    )
   )
 })
 

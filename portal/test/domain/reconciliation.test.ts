@@ -46,7 +46,7 @@ describe("classifyHostname", () => {
     expect(entry.classification).toBe("missing")
     expect(entry.action).toBe("cleanup")
     expect(entry.hostname).toBe("inucon-team1-1")
-    expect(entry.proxmoxVmObserved).toBe(false)
+    expect(entry.proxmoxVmid).toEqual(Option.none())
     expect(entry.cloudflareRouteCount).toBe(1)
     expect(entry.cloudflareAppCount).toBe(1)
     // reason は sanitize 済み(email/token/host detail を含まない)
@@ -331,7 +331,7 @@ describe("computePlanDigest", () => {
     classification: "missing",
     action: "cleanup",
     reason: "vm_missing",
-    proxmoxVmObserved: false,
+    proxmoxVmid: Option.none(),
     cloudflareRouteCount: 1,
     cloudflareIngressCount: 1,
     cloudflareAppCount: 1,
@@ -394,5 +394,25 @@ describe("computePlanDigest", () => {
       adoptHostnames: []
     })
     expect(r2).not.toBe(r3)
+  })
+
+  // UI は cleanup の確認画面に entry の VMID を出す (plan 2026-08-13 Step 5:
+  // "show exact affected hostnames/VMIDs")。同 hostname の VM が別 VMID で
+  // 作り直されたら、operator が確認した VMID と apply 時の VMID が食い違う
+  // ので stale として弾く必要がある。
+  it("同 hostname でも Proxmox VMID が違えば digest が変わる", () => {
+    const vm1101 = computePlanDigest({
+      contestId: CONTEST,
+      contestRevision: 2,
+      entries: [{ ...baseEntry, proxmoxVmid: Option.some(1101) }],
+      adoptHostnames: []
+    })
+    const vm1105 = computePlanDigest({
+      contestId: CONTEST,
+      contestRevision: 2,
+      entries: [{ ...baseEntry, proxmoxVmid: Option.some(1105) }],
+      adoptHostnames: []
+    })
+    expect(vm1101).not.toBe(vm1105)
   })
 })

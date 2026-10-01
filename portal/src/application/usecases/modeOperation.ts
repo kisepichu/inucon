@@ -89,8 +89,13 @@ export const makeEnterContestModeHandler: Effect.Effect<OperationHandler, never,
         if (identityMismatch !== null) return blocked(identityMismatch)
 
         switch (step.stepKey) {
+          // onboot の冪等ショートカットは観測が確定している(Some)ときだけ。None
+          // (VM config が読めなかった)を「already」とみなしてスキップすると、
+          // devvm の onboot=1 が残ったまま benchvm も onboot=1 になり、eevee
+          // 再起動で両方が自動起動しうる(2026-10-01 本番障害と同じ結果)。
+          // 未観測なら目標値を書く(setVmOnBoot は冪等な config 更新)。
           case "set_devvm_onboot_0": {
-            if (devvm.onBoot === false) {
+            if (Option.contains(devvm.onBoot, false)) {
               return succeeded("devvm.onBoot already 0")
             }
             yield* px.setVmOnBoot(devvm.vmid, false)
@@ -138,7 +143,7 @@ export const makeEnterContestModeHandler: Effect.Effect<OperationHandler, never,
                 )
           }
           case "set_benchvm_onboot_1": {
-            if (benchvm.onBoot === true) {
+            if (Option.contains(benchvm.onBoot, true)) {
               return succeeded("benchvm.onBoot already 1")
             }
             yield* px.setVmOnBoot(benchvm.vmid, true)

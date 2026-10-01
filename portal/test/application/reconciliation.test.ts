@@ -464,4 +464,25 @@ describe("applyReconciliation", () => {
       expect(exit).toStrictEqual(Exit.fail(new StaleReconciliationPlan()))
     }).pipe(Effect.provide(makeFixture().layer))
   )
+
+  // 上の逆方向。adopt すると unmanaged_orphan の action が blocked →
+  // adopt_cleanup に変わり adoptHostnames も digest 材料なので、adopt=[] で
+  // 取った digest は adopt 付き apply では必ず stale になる。Admin Web は
+  // adopt 確認後に adopt 付きで plan を取り直し、その digest を送る必要がある
+  // (取り直した digest で通ることは上の「plan と一致する digest+revision+adopt」
+  // が固定している)。
+  it.effect("adopt=[] で取った digest を adopt 付き apply に渡すと stale として拒否", () =>
+    Effect.gen(function* () {
+      const plan = yield* planReconciliation({ contestId: CONTEST_ID, adoptHostnames: [] })
+      const exit = yield* Effect.exit(
+        applyReconciliation({
+          contestId: CONTEST_ID,
+          planDigest: plan.planDigest,
+          adoptHostnames: ["inucon-team2-1"],
+          actorUserId: ADMIN_USER
+        })
+      )
+      expect(exit).toStrictEqual(Exit.fail(new StaleReconciliationPlan()))
+    }).pipe(Effect.provide(makeFixture().layer))
+  )
 })

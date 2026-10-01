@@ -56,8 +56,11 @@ runbook 更新に貼らない。値は agenix (`../nixos-config-private/secrets/
 - Contest 側の `revision` / Team / Instance を更新した直後ではないか。
 
 **復旧手順**: **Admin Web → Contest → Reconciliation タブで
-「Refresh」を押す** だけ。新しい plan と digest が算出され、
-再度 review → adopt hostname 指定 → apply。
+「診断」を押す** だけ。新しい plan と digest が算出され、
+再度 review → adopt hostname をチェック → 「adopt を反映した plan を取得」
+→ apply。adopt 付き apply は adopt を反映して取り直した plan の digest で
+しか通らない (digest は adoptHostnames と各 entry の action を含むので、
+adopt なしの plan の digest は adopt 付き apply では必ず stale)。
 
 **復帰確認**: apply Operation が enqueued 後 running → succeeded に
 なること。Reconciliation タブが「差分なし」になること。
@@ -78,8 +81,9 @@ unmanaged_orphan の adopt 未確認、または CF Access policy が INUCON 用
 
 **復旧手順**:
 1. hostname が **確かに INUCON 所有** と特定できるなら、Reconciliation
-   タブで対象 hostname に **adopt** を明示チェックしてから apply。
-   これで `adopt_cleanup` action が走り、ResourceBinding を張ってから
+   タブで対象 hostname に **adopt** を明示チェックし、「adopt を反映した
+   plan を取得」で action が `adopt_cleanup` に変わったことを確認してから
+   apply。これで `adopt_cleanup` action が走り、ResourceBinding を張ってから
    cleanup する。
 2. hostname が INUCON 所有ではない (catch-all / 他サービス) なら、
    plan 側が `noop` になるはず。もし blocked のままなら Cloudflare 側で
@@ -92,6 +96,15 @@ unmanaged_orphan の adopt 未確認、または CF Access policy が INUCON 用
    `hostname_adopted_concurrently` blocked (usecases/reconciliation.ts
    478 行) の場合は **リロードして plan 再取得** で解決する。競合状態が
    仕様通り検知された結果なので upgrade path は不要。
+
+**Cleanup Operation も同じ 422 を出す**。こちらは
+`cleanupContestResources` / `scheduleContestCleanup` が常に
+`adoptHostnames: []` で plan を取り直すため、**Cleanup 側から adopt する
+経路は存在しない**。未 adopt の orphan がある間は Reconciliation タブの
+Cleanup 欄の「cleanup 実行」は押せない (blocked の hostname を表示する) ので、
+先に上記 1 の手順で Reconciliation タブから adopt +
+apply を済ませる。順序は
+`docs/runbooks/contest-operations.md` の「次回開催を作る」§7 の表に従う。
 
 **復帰確認**: Reconciliation タブで対象 hostname が一覧から消える。
 apply Operation が succeeded。Cloudflare 側 dashboard で app / DNS が
@@ -317,9 +330,9 @@ enqueue し `finished` まで通ることを Team ページで確認。
 
 ## 9. Failed cleanup (cleanup Operation が failed / blocked)
 
-**症状**: `scheduleContestCleanup` から enqueue された cleanup
-Operation が terminal で `failed` または `blocked`。Reconciliation
-タブで差分が残る。
+**症状**: `scheduleContestCleanup` または Admin Web (Reconciliation タブの
+Cleanup 欄) から enqueue された cleanup Operation が terminal で `failed`
+または `blocked`。Reconciliation タブで差分が残る。
 
 **前提の確認**:
 - Admin Web → OperationDetail で失敗 step / sanitizedError を確認。
@@ -333,14 +346,15 @@ Operation が terminal で `failed` または `blocked`。Reconciliation
 2. **`blocked` (operator 判断待ち)**:
    - adopt 未確認 → §2 「Ambiguous Cloudflare policy」に従い adopt 指定
      を追加。cleanup Operation は cancel してから Reconciliation を
-     再 apply。
+     再 apply し、完了後に「診断」→ Cleanup 欄から cleanup を再実行。
    - `hostname_adopted_concurrently` → plan 再取得。
    - shutdown timeout → §5。
-3. **`failed`**: 一度 cancel し、Reconciliation Refresh → 差分を確認
-   してから apply し直す (idempotent。DB 側の ResourceBinding は残る
-   ので二重 apply しても外部側の作業は増えない)。
+3. **`failed`**: 一度 cancel し、Reconciliation タブで「診断」→ 差分と
+   Cleanup 欄の対象 hostname / VMID を確認してから「cleanup 実行」で
+   投入し直す (idempotent。DB 側の ResourceBinding は残るので二重実行
+   しても外部側の作業は増えない)。
 
-**復帰確認**: 再 apply Operation が succeeded、Reconciliation 差分が
+**復帰確認**: 再投入した Operation が succeeded、Reconciliation 差分が
 消える。§10 「Post-cleanup 状態の検証」を実施 (rollout Step 10 相当)。
 
 ---
