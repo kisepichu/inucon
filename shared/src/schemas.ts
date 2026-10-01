@@ -612,6 +612,8 @@ export type OperationWithSteps = typeof OperationWithSteps.Type
 // - instanceSlots: prepare が収束させる desired 枠 ((teamNumber, index) 昇順 =
 //   作成順)。instanceStatus=null は prepare が新規作成する枠、それ以外は既存
 //   Instance が占有していて作り直さない枠 (vmid は既存 Instance のもの)。
+//   instanceId は占有 Instance の id (無ければ null)。Overview の rehearsal が
+//   running の枠を対象に選んで enqueueRehearsal に渡す。
 export const ModeVmTarget = Schema.Struct({
   vmid: Schema.Int,
   name: Schema.String
@@ -624,7 +626,8 @@ export const PrepareInstanceSlot = Schema.Struct({
   index: Schema.Int,
   hostname: Schema.String,
   vmid: Schema.Int,
-  instanceStatus: Schema.NullOr(InstanceStatus)
+  instanceStatus: Schema.NullOr(InstanceStatus),
+  instanceId: Schema.NullOr(InstanceId)
 })
 export type PrepareInstanceSlot = typeof PrepareInstanceSlot.Type
 

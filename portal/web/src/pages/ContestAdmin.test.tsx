@@ -1,10 +1,11 @@
-import { render, screen, waitFor, within } from "@testing-library/react"
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent, { type UserEvent } from "@testing-library/user-event"
 import { MemoryRouter, Route, Routes } from "react-router-dom"
 import type { MockInstance } from "vitest"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type {
   Artifact,
+  BenchJob,
   Contest,
   ContestId,
   Operation,
@@ -155,11 +156,27 @@ const preparationPlanFixture: PreparationPlan = {
     startVm: { vmid: 9291, name: "benchvm" }
   },
   instanceSlots: [
-    { teamNumber: 1, teamName: "team1", index: 1, hostname: "inucon-team1-1", vmid: 1101, instanceStatus: "running" },
-    { teamNumber: 1, teamName: "team1", index: 2, hostname: "inucon-team1-2", vmid: 1102, instanceStatus: null },
-    { teamNumber: 1, teamName: "team1", index: 3, hostname: "inucon-team1-3", vmid: 1103, instanceStatus: null }
+    { teamNumber: 1, teamName: "team1", index: 1, hostname: "inucon-team1-1", vmid: 1101, instanceStatus: "running", instanceId: "i-1-1" },
+    { teamNumber: 1, teamName: "team1", index: 2, hostname: "inucon-team1-2", vmid: 1102, instanceStatus: null, instanceId: null },
+    { teamNumber: 1, teamName: "team1", index: 3, hostname: "inucon-team1-3", vmid: 1103, instanceStatus: null, instanceId: null }
   ]
-}
+} as unknown as PreparationPlan
+
+const rehearsalJobFixture: BenchJob = {
+  id: "job-r1",
+  contestId: contestFixture.id,
+  teamId: "team1",
+  targetIp: "10.100.1.12",
+  targetPort: 80,
+  status: "queued",
+  purpose: "rehearsal",
+  score: null,
+  passed: null,
+  errorMessage: null,
+  enqueuedAt: 100,
+  startedAt: null,
+  finishedAt: null
+} as unknown as BenchJob
 
 let contestSpy: MockInstance
 let teamsSpy: MockInstance
@@ -174,6 +191,7 @@ let finalizeSpy: MockInstance
 let preparationPlanSpy: MockInstance<typeof api.getPreparationPlan>
 let enterModeSpy: MockInstance<typeof api.requestEnterContestMode>
 let prepareInstancesSpy: MockInstance<typeof api.requestPrepareInstances>
+let rehearsalSpy: MockInstance<typeof api.enqueueRehearsal>
 
 beforeEach(() => {
   contestSpy = vi.spyOn(api, "getAdminContest").mockResolvedValue(contestFixture) as unknown as MockInstance
@@ -189,6 +207,7 @@ beforeEach(() => {
   preparationPlanSpy = vi.spyOn(api, "getPreparationPlan").mockResolvedValue(preparationPlanFixture)
   enterModeSpy = vi.spyOn(api, "requestEnterContestMode").mockResolvedValue({ ...operationFixture, kind: "enter_contest_mode" })
   prepareInstancesSpy = vi.spyOn(api, "requestPrepareInstances").mockResolvedValue({ ...operationFixture, kind: "prepare" })
+  rehearsalSpy = vi.spyOn(api, "enqueueRehearsal").mockResolvedValue(rehearsalJobFixture)
 })
 
 afterEach(() => {
@@ -252,10 +271,10 @@ describe("ContestAdmin", () => {
   })
 
   describe("Overview の 競技モード切替 / インスタンス準備", () => {
-    it("spec の流れ通り 競技モード切替 → インスタンス準備 → 開始 の順に並ぶ", async () => {
+    it("spec の流れ通り 競技モード切替 → インスタンス準備 → rehearsal → 開始 の順に並ぶ", async () => {
       renderPage()
-      await screen.findByRole("region", { name: "インスタンス準備" })
-      const flow = ["競技モード切替", "インスタンス準備", "開始"]
+      await screen.findByRole("region", { name: "rehearsal" })
+      const flow = ["競技モード切替", "インスタンス準備", "rehearsal 実行", "開始"]
       const order = screen
         .getAllByRole("button")
         .map((b) => b.textContent ?? "")
@@ -334,16 +353,92 @@ describe("ContestAdmin", () => {
     })
 
     it.each(["draft", "running", "finalizing", "finished", "canceled"] as const)(
-      "%s では 競技モード切替 / インスタンス準備 を出さない",
+      "%s では 競技モード切替 / インスタンス準備 / rehearsal を出さない",
       async (status) => {
         contestSpy.mockResolvedValue({ ...contestFixture, status })
         renderPage()
         await screen.findByRole("heading", { level: 1 })
         expect(screen.queryByRole("button", { name: "競技モード切替" })).not.toBeInTheDocument()
         expect(screen.queryByRole("button", { name: "インスタンス準備" })).not.toBeInTheDocument()
+        expect(screen.queryByRole("button", { name: "rehearsal 実行" })).not.toBeInTheDocument()
         expect(preparationPlanSpy).not.toHaveBeenCalled()
       }
     )
+  })
+
+  describe("Overview の rehearsal", () => {
+    // team1-1 / team1-3 が running、team1-2 は creating (rehearsal の対象外)。
+    const twoRunningPlan = {
+      ...preparationPlanFixture,
+      instanceSlots: [
+        { teamNumber: 1, teamName: "team1", index: 1, hostname: "inucon-team1-1", vmid: 1101, instanceStatus: "running", instanceId: "i-1-1" },
+        { teamNumber: 1, teamName: "team1", index: 2, hostname: "inucon-team1-2", vmid: 1102, instanceStatus: "creating", instanceId: "i-1-2" },
+        { teamNumber: 1, teamName: "team1", index: 3, hostname: "inucon-team1-3", vmid: 1103, instanceStatus: "running", instanceId: "i-1-3" }
+      ]
+    } as unknown as PreparationPlan
+
+    it("running の Instance だけを選ばせ、確認するまで押せず、押すと選んだ instanceId で enqueueRehearsal を呼んで job へ誘導する", async () => {
+      preparationPlanSpy.mockResolvedValue(twoRunningPlan)
+      const user = userEvent.setup()
+      renderPage()
+      const region = await screen.findByRole("region", { name: "rehearsal" })
+      const select = within(region).getByLabelText("対象 Instance")
+      expect(within(select).getAllByRole("option").map((o) => o.textContent)).toEqual([
+        expect.stringMatching(/inucon-team1-1.*1101/),
+        expect.stringMatching(/inucon-team1-3.*1103/)
+      ])
+      await user.selectOptions(select, "i-1-3")
+      const button = within(region).getByRole("button", { name: "rehearsal 実行" })
+      expect(button).toBeDisabled()
+      await user.click(within(region).getByRole("checkbox"))
+      expect(button).toBeEnabled()
+      await user.click(button)
+      await waitFor(() => expect(rehearsalSpy).toHaveBeenCalledTimes(1))
+      expect(rehearsalSpy).toHaveBeenCalledWith(contestFixture.id, { instanceId: "i-1-3" })
+      expect(within(region).getByRole("link", { name: "job-r1" })).toHaveAttribute("href", "/jobs/job-r1")
+      // 次の実行 (= 次の負荷) にはもう一度確認を要求する。
+      expect(button).toBeDisabled()
+    })
+
+    it("確認後に対象を変えたら確認し直すまで押せない", async () => {
+      preparationPlanSpy.mockResolvedValue(twoRunningPlan)
+      const user = userEvent.setup()
+      renderPage()
+      const region = await screen.findByRole("region", { name: "rehearsal" })
+      await user.click(within(region).getByRole("checkbox"))
+      const button = within(region).getByRole("button", { name: "rehearsal 実行" })
+      expect(button).toBeEnabled()
+      fireEvent.change(within(region).getByLabelText("対象 Instance"), { target: { value: "i-1-3" } })
+      expect(button).toBeDisabled()
+      expect(within(region).getByRole("checkbox")).not.toBeChecked()
+    })
+
+    it("running の Instance が無ければ確認しても押せず、理由を示す", async () => {
+      preparationPlanSpy.mockResolvedValue({
+        ...preparationPlanFixture,
+        instanceSlots: preparationPlanFixture.instanceSlots.map((s) => ({ ...s, instanceStatus: null, instanceId: null }))
+      })
+      const user = userEvent.setup()
+      renderPage()
+      const region = await screen.findByRole("region", { name: "rehearsal" })
+      await user.click(within(region).getByRole("checkbox"))
+      expect(within(region).getByRole("button", { name: "rehearsal 実行" })).toBeDisabled()
+      expect(within(region).getByText(/running の Instance がありません/)).toBeInTheDocument()
+      expect(rehearsalSpy).not.toHaveBeenCalled()
+    })
+
+    it.each([
+      { tag: "RehearsalInstanceNotRunning", message: /running ではありません/ },
+      { tag: "TeamJobAlreadyQueued", message: /既に queued \/ running/ }
+    ])("$tag で拒否されたらそれと分かる文言を出す", async ({ tag, message }) => {
+      rehearsalSpy.mockRejectedValue(new ApiError(tag, 409))
+      const user = userEvent.setup()
+      renderPage()
+      const region = await screen.findByRole("region", { name: "rehearsal" })
+      await user.click(within(region).getByRole("checkbox"))
+      await user.click(within(region).getByRole("button", { name: "rehearsal 実行" }))
+      expect(await within(region).findByRole("alert")).toHaveTextContent(message)
+    })
   })
 
   it("Readiness タブは fail を先に、summary をそのまま表示する", async () => {

@@ -248,7 +248,8 @@ export const OperationsLive = HttpApiBuilder.group(api, "operations", (handlers)
             index: slot.index,
             hostname: slot.hostname,
             vmid: slot.vmid,
-            instanceStatus: slot.occupant?.status ?? null
+            instanceStatus: slot.occupant?.status ?? null,
+            instanceId: slot.occupant?.id ?? null
           }))
         })),
         Effect.catchTags({

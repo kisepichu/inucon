@@ -762,6 +762,64 @@ describe("returnNormalMode", () => {
     })
   )
 
+  // 通常モード中 (devvm が既に running で RAM を使っている) に「通常モード復帰」が押し
+  // 直されても、devvm を起動する分の空きを要求して blocked にしない。nodeFree は devvm の
+  // RAM を既に控除済みなので、そこから更に devvm.memoryBytes を要求すると二重控除になる。
+  // blocked は global lock を握ったままになり、次回開催の「準備開始」を止める。
+  it.effect("handler: 通常モード中に押し直しても空きメモリによらず全 step が何も変更せず succeeded", () =>
+    Effect.gen(function* () {
+      const proxmox = makeProxmoxPortTest({
+        managedVms: [],
+        infrastructureInventory: {
+          nodeFreeMemBytes: 1 * 1024 * 1024 * 1024,
+          templateExists: true,
+          devvm: { vmid: 9300, name: "devvm", status: "running", memoryBytes: 8 * 1024 * 1024 * 1024, onBoot: true },
+          benchvm: { vmid: 9200, name: "benchvm", status: "stopped", memoryBytes: 4 * 1024 * 1024 * 1024, onBoot: false },
+          preparedTeamNumbers: [],
+          isolationServiceActive: false
+        }
+      })
+      const registry = yield* makeReturnNormalModeHandler.pipe(Effect.provide(proxmox.layer))
+      for (const key of RETURN_NORMAL_MODE_STEP_KEYS) {
+        expect(yield* registry.run(stepOf(key, { contestId: CONTEST_ID }))).toMatchObject({ status: "succeeded" })
+      }
+      expect(yield* registry.run(stepOf("memory_check", { contestId: CONTEST_ID }))).toEqual({
+        status: "succeeded",
+        summary: "devvm already running"
+      })
+      const state = yield* proxmox.getState
+      expect([state.shutdownRequests, state.startedVmids, state.onBootByVmid]).toEqual([[], [], {}])
+    })
+  )
+
+  // devvm が stopped なら短絡せず、post-shutdown MemAvailable (free + 停止する benchvm の
+  // RAM) で devvm 要求 + reserve を判定する。benchvm が既に stopped なら加算しない。
+  it.effect.each([
+    { benchvmStatus: "running" as const, freeGiB: 5, status: "succeeded" },
+    { benchvmStatus: "stopped" as const, freeGiB: 8, status: "blocked" },
+    { benchvmStatus: "stopped" as const, freeGiB: 9, status: "succeeded" }
+  ])(
+    "handler: devvm stopped・benchvm $benchvmStatus・free $freeGiB GiB の memory_check は $status",
+    ({ benchvmStatus, freeGiB, status }) =>
+      Effect.gen(function* () {
+        const proxmox = makeProxmoxPortTest({
+          managedVms: [],
+          infrastructureInventory: {
+            nodeFreeMemBytes: freeGiB * 1024 * 1024 * 1024,
+            templateExists: true,
+            devvm: { vmid: 9300, name: "devvm", status: "stopped", memoryBytes: 8 * 1024 * 1024 * 1024, onBoot: false },
+            benchvm: { vmid: 9200, name: "benchvm", status: benchvmStatus, memoryBytes: 4 * 1024 * 1024 * 1024, onBoot: false },
+            preparedTeamNumbers: [],
+            isolationServiceActive: false
+          }
+        })
+        const registry = yield* makeReturnNormalModeHandler.pipe(Effect.provide(proxmox.layer))
+        const outcome = yield* registry.run(stepOf("memory_check", { contestId: CONTEST_ID }))
+        expect(outcome.status).toBe(status)
+        expect(outcome.summary).toMatch(/^post-shutdown MemAvailable /)
+      })
+  )
+
   it.effect("handler: 全ての step が healthy な post-mode inventory では succeeded を返す", () =>
     Effect.gen(function* () {
       // benchvm stopped, devvm running, ample free memory。

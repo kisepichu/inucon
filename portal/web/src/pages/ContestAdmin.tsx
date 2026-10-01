@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom"
 import type {
   Artifact,
   ArtifactId,
+  BenchJob,
   Contest,
   ContestId,
   Operation,
@@ -162,13 +163,15 @@ function ConfirmCheckbox({
 
 // 1 操作分の「影響対象 (children) + 専用の確認 checkbox + 実行ボタン」。checkbox を
 // 操作ごとに持たせ、別の操作の確認で押せる状態にしない (plan Task 13 Step 5:
-// mode switch 等は影響する hostname / VMID を示して確認を要求する)。
+// mode switch 等は影響する hostname / VMID を示して確認を要求する)。確認は tick した
+// 時点の resetKey (= 確認した対象) に紐づき、resetKey が変わると未確認に戻る。
 function ConfirmedAction({
   title,
   confirmDescription,
   buttonLabel,
   buttonClassName,
   disabledReason,
+  resetKey,
   busy,
   onRun,
   children
@@ -178,18 +181,25 @@ function ConfirmedAction({
   readonly buttonLabel: string
   readonly buttonClassName: string
   readonly disabledReason: string | null
+  readonly resetKey?: string
   readonly busy: boolean
   readonly onRun: () => Promise<void>
   readonly children?: ReactNode
 }) {
   const headingId = useId()
-  const [confirmed, setConfirmed] = useState(false)
+  const [confirmedKey, setConfirmedKey] = useState<string | null>(null)
+  const key = resetKey ?? ""
+  const confirmed = confirmedKey === key
   const runnable = confirmed && disabledReason === null
   return (
     <section className="dangerous-actions" aria-labelledby={headingId}>
       <h3 id={headingId}>{title}</h3>
       {children}
-      <ConfirmCheckbox checked={confirmed} onChange={setConfirmed} description={confirmDescription} />
+      <ConfirmCheckbox
+        checked={confirmed}
+        onChange={(v) => setConfirmedKey(v ? key : null)}
+        description={confirmDescription}
+      />
       <div className="section-actions">
         <button
           type="button"
@@ -226,7 +236,7 @@ function OverviewPanel({
   // 競技モード切替 / インスタンス準備の影響対象。VMID や hostname の導出は web に
   // 持たず server (GET /preparation-plan) が返したものだけを表示する。取れないうちは
   // 確認させようがないのでボタンを出さない。
-  const needsPlan = actions.enterContestMode || actions.prepareInstances
+  const needsPlan = actions.enterContestMode || actions.prepareInstances || actions.rehearsal
   const [plan, setPlan] = useState<PreparationPlan | null>(null)
   const [planError, setPlanError] = useState<string | null>(null)
 
@@ -326,7 +336,7 @@ function OverviewPanel({
 
       {needsPlan && planError !== null && (
         <p role="alert" className="error">
-          影響対象 (VM / hostname) を取得できないため、競技モード切替 / インスタンス準備 は実行できません: {planError}
+          影響対象 (VM / hostname) を取得できないため、競技モード切替 / インスタンス準備 / rehearsal は実行できません: {planError}
         </p>
       )}
       {needsPlan && plan === null && planError === null && <p className="loading">影響対象を取得しています...</p>}
@@ -399,6 +409,8 @@ function OverviewPanel({
           )}
         </ConfirmedAction>
       )}
+
+      {actions.rehearsal && plan !== null && <RehearsalAction contestId={contest.id} plan={plan} />}
 
       {(actions.startContest || actions.immediateFinish
         || actions.cancelDraft || actions.returnNormal || actions.rearchive) && (
@@ -505,6 +517,86 @@ function OverviewPanel({
         </p>
       )}
     </section>
+  )
+}
+
+// ---- Rehearsal ------------------------------------------------------------
+
+// spec の流れでインスタンス準備と開始の間に置く。readiness `rehearsal` (start の必須項目) は
+// この Contest で purpose=rehearsal・status=finished・passed=true の job が 1 件以上あるときだけ
+// pass になり、score は見ない。対象は preparation-plan の running 枠だけ (backend の
+// enqueueRehearsal も running 以外は RehearsalInstanceNotRunning で拒否する)。結果は既存の
+// job 詳細 (/jobs/:id。queued / running の間は polling し、判定 / score / ログを出す) で見る。
+function RehearsalAction({ contestId, plan }: { readonly contestId: ContestId; readonly plan: PreparationPlan }) {
+  const selectId = useId()
+  const targets = plan.instanceSlots.flatMap((s) =>
+    s.instanceStatus === "running" && s.instanceId !== null ? [{ ...s, instanceId: s.instanceId }] : []
+  )
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const target = targets.find((s) => s.instanceId === selectedId) ?? targets[0] ?? null
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [job, setJob] = useState<BenchJob | null>(null)
+
+  return (
+    <ConfirmedAction
+      title="rehearsal"
+      buttonLabel="rehearsal 実行"
+      buttonClassName="btn-primary"
+      confirmDescription={
+        target === null
+          ? "rehearsal の対象にできる Instance がありません。"
+          : `${target.hostname} (VMID ${target.vmid}) にベンチマーカーを 1 回流し、実際に負荷をかけます。`
+      }
+      disabledReason={target === null ? "running の Instance がありません。先にインスタンス準備を完了させてください" : null}
+      // 対象を変えたら確認し直させる。投入した job が変わったら (= 次の実行は次の負荷) も同じ。
+      resetKey={`${target?.instanceId ?? ""}/${job?.id ?? ""}`}
+      busy={busy}
+      onRun={async () => {
+        if (target === null) return
+        setError(null)
+        setBusy(true)
+        try {
+          setJob(await api.enqueueRehearsal(contestId, { instanceId: target.instanceId }))
+        } catch (err) {
+          setError(messageForError(err, "rehearsal の投入に失敗しました"))
+        } finally {
+          setBusy(false)
+        }
+      }}
+    >
+      <p className="hint">
+        readiness の rehearsal (開始の必須項目) は、この開催回で finished かつ判定 pass の rehearsal job が 1 件以上
+        あると pass になります (score は問いません)。
+      </p>
+      {targets.length > 0 && (
+        <div className="form-field">
+          <label htmlFor={selectId}>対象 Instance</label>
+          <select
+            id={selectId}
+            className="input"
+            value={target?.instanceId ?? ""}
+            onChange={(e) => setSelectedId(e.target.value)}
+          >
+            {targets.map((s) => (
+              <option key={s.instanceId} value={s.instanceId}>
+                {`${s.hostname} — VMID ${s.vmid} (${s.teamName})`}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+      {job !== null && (
+        <p className="notice-ok">
+          rehearsal job を投入しました: <Link to={`/jobs/${job.id}`}>{job.id}</Link> (状態・判定・score・ログを表示します)
+        </p>
+      )}
+      {error !== null && (
+        <p role="alert" className="error">
+          {error}
+        </p>
+      )}
+    </ConfirmedAction>
   )
 }
 

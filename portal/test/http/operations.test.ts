@@ -913,9 +913,10 @@ describe("GET /api/admin/contests/:contestId/preparation-plan", () => {
           shutdownVm: { vmid: DEVVM_VMID, name: DEVVM_VM_NAME },
           startVm: { vmid: BENCHVM_VMID, name: BENCHVM_VM_NAME }
         },
+        // instanceId は Overview の rehearsal が running の枠を対象に選ぶために使う。
         instanceSlots: [
-          { teamNumber: 1, teamName: "team1", index: 1, hostname: "inucon-team1-1", vmid: 1101, instanceStatus: "running" },
-          { teamNumber: 1, teamName: "team1", index: 2, hostname: "inucon-team1-2", vmid: 1102, instanceStatus: null }
+          { teamNumber: 1, teamName: "team1", index: 1, hostname: "inucon-team1-1", vmid: 1101, instanceStatus: "running", instanceId: "i-plan-1-1" },
+          { teamNumber: 1, teamName: "team1", index: 2, hostname: "inucon-team1-2", vmid: 1102, instanceStatus: null, instanceId: null }
         ]
       })
     }).pipe(Effect.provide(OperationsTestLayer))

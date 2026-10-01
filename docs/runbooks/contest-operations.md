@@ -113,10 +113,21 @@ scoreboard は開催回ごとに分離される。手順の全体像:
      `ContestModeNotActive` (409) で拒否されるので、先に 3-2 を完了させる。blocked
      の summary が `ksm_settle_timeout:*` なら `contest-recovery.md` §6、
      `all_slots_consumed_*` なら failed の Instance が枠を占有している。
-   - 3-4. 招待 (Admin ページの招待フォーム) とリハーサル。**リハーサルの起動導線は
-     Admin Web に未実装**で、存在するのは API
-     `POST /api/admin/contests/:contestId/rehearsal` (body `{ "instanceId": ... }`、
-     admin + preparing のみ) だけ。
+   - 3-4. 招待 (Admin ページの招待フォーム) と **「rehearsal 実行」**。インスタンス準備の下の
+     rehearsal 欄で対象 Instance (running の枠だけが hostname / VMID / team 付きで選べる) を
+     選び、「影響を確認しました」→ **rehearsal 実行**。選んだ Instance に本番と同じ
+     ベンチマーカーが 1 回走り、**実際に負荷がかかる** (対象を変えると確認し直しになる)。
+     running の Instance が無いと押せない (先に 3-3 を完了させる)。投入後に出る job の
+     リンク先 (job 詳細) で queued → running → finished / failed、判定 (pass / fail)、
+     score、ログを確認する。readiness の rehearsal は **finished かつ判定 pass** の
+     rehearsal が 1 件以上あると pass になる (score は問わない。finished でも判定 fail は
+     数えない)。job へのリンクは投入した画面にしか出ないので、離れた後は Readiness タブの
+     rehearsal で成功件数を見る。queued のまま進まないときは Readiness タブの runner
+     (heartbeat / benchReady) を確認する。拒否されたとき:
+     - `RehearsalInstanceNotRunning`: 選んだ Instance が running でない。ページを再読み込み
+       して Instance の状態 (3-3 の完了) を確認する。
+     - `TeamJobAlreadyQueued`: そのチームに queued / running の rehearsal が既にある。
+       finished / failed になってから再実行する。
    - 3-5. **Readiness** タブで runner heartbeat / backup / rehearsal 実績 /
      Cloudflare write proven がすべて pass になることを確認。
 4. Readiness all-pass 後に **「開始」(preparing → running)**。
@@ -160,7 +171,9 @@ scoreboard は開催回ごとに分離される。手順の全体像:
    空きとして数えない。足りなければ blocked になり、その時点で benchvm
    は停止・onboot 0、devvm も停止・onboot 0 のまま止まる (8 step 中
    5 番目)。復旧は `docs/runbooks/contest-recovery.md` §6 (Insufficient
-   RAM) に従う。
+   RAM) に従う。devvm が既に running (通常モード中の押し直し) なら
+   memory_check は空きを要求せずに通り、8 step すべてが何も変更せず
+   succeeded で終わる (devvm の RAM は node free から既に引かれている)。
 
 **古い制約 (第1回時点) は撤廃済み**: 「同じ DB で次回を開催するには pod を
 止めて `portal.db` を消して seed し直す」「contest 行の status を SQL で
