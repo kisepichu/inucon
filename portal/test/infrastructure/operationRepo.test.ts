@@ -196,6 +196,67 @@ layer("failStep retryAt=Some reschedules until retryAt <= now", (it) => {
   )
 })
 
+// 先行 step が retry 待ち (queued + 未来の retry_at) の間に後続 step を渡すと、
+// enter_contest_mode なら shutdown_devvm の retry 中に start_benchvm が、finish なら
+// wait_running の retry 中に write_scoreboard_* / finish_contest が走ってしまう。
+// step は先行 step がすべて終わる (succeeded か continueOnError の failed) まで渡さない。
+layer("claimNext: 先行 step の retry 待ちを追い越さない", (it) => {
+  it.effect("先行 step が retry 待ちの間は後続を渡さず、retry で先行が成功してから後続を渡す", () =>
+    Effect.gen(function* () {
+      yield* seedPreparingContest
+      const ops = yield* OperationRepo
+      yield* ops.enqueue(
+        newOp({
+          steps: [
+            { stepKey: "shutdown_devvm", ordinal: 0 },
+            { stepKey: "start_benchvm", ordinal: 1 }
+          ]
+        })
+      )
+      const first = yield* ops.claimNext(0)
+      if (Option.isNone(first)) return yield* Effect.dieMessage("first step not claimed")
+      yield* ops.failStep(first.value.id, sanitizeOperationError({ _tag: "ProxmoxError" }), Option.some(500), 10)
+
+      expect(yield* ops.claimNext(100)).toStrictEqual(Option.none())
+
+      const retried = yield* ops.claimNext(500)
+      expect(Option.map(retried, (s) => [s.stepKey, s.attempt])).toStrictEqual(Option.some(["shutdown_devvm", 2]))
+      if (Option.isSome(retried)) yield* ops.completeStep(retried.value.id, "ok", 501)
+
+      const next = yield* ops.claimNext(502)
+      expect(Option.map(next, (s) => s.stepKey)).toStrictEqual(Option.some("start_benchvm"))
+    })
+  )
+})
+
+// continueOnError の step も、retry 待ちの間はまだ終わっていない (最終的に成功する
+// かもしれない)。cleanup の mark_completed が per-hostname の retry 中に走って
+// residual を観測し blocked に落ちるのを防ぐ。
+layer("claimNext: continueOnError の先行 step も retry 待ちの間は追い越さない", (it) => {
+  it.effect("continueOnError=true の先行 step が retry 待ちなら後続を渡さない", () =>
+    Effect.gen(function* () {
+      yield* seedPreparingContest
+      const ops = yield* OperationRepo
+      yield* ops.enqueue(
+        newOp({
+          kind: "cleanup",
+          steps: [
+            { stepKey: "cleanup:inucon-team1-1", ordinal: 0, continueOnError: true },
+            { stepKey: "cleanup:mark_completed", ordinal: 1 }
+          ]
+        })
+      )
+      const first = yield* ops.claimNext(0)
+      if (Option.isNone(first)) return yield* Effect.dieMessage("first step not claimed")
+      yield* ops.failStep(first.value.id, sanitizeOperationError({ _tag: "CloudflareError" }), Option.some(500), 10)
+
+      expect(yield* ops.claimNext(100)).toStrictEqual(Option.none())
+      const retried = yield* ops.claimNext(500)
+      expect(Option.map(retried, (s) => s.stepKey)).toStrictEqual(Option.some("cleanup:inucon-team1-1"))
+    })
+  )
+})
+
 layer("failStep retryAt=None holds the lock; retry re-runs the op", (it) => {
   it.effect("halted Operation still blocks new enqueue; retry re-enables claim", () =>
     Effect.gen(function* () {

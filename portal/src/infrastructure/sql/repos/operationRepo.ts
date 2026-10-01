@@ -35,9 +35,10 @@ const extractSqlErrorMessage = (cause: unknown): string => {
 //   同一 sql.withTransaction に閉じ込める。partial unique index が最終的な
 //   強制点(2 admin が同時に来ても DB 側の一意違反で 1 つだけ通る)。
 // - claimNext: 「実行可能な次 Step」を単一 UPDATE ... WHERE ... RETURNING で
-//   拾う。同 Operation で running Step があればスキップ、preceding failed/
-//   blocked (continue_on_error=0) があればスキップ、retry_at <= now、lease
-//   期限切れ or NULL、queued 状態、を条件に組む。UPDATE の副作用として
+//   拾う。同 Operation で running Step があればスキップ、先行 Step がすべて
+//   終わって (succeeded か continue_on_error=1 の failed) いなければスキップ
+//   (retry 待ちの先行 Step も追い越さない)、retry_at <= now、lease 期限切れ or
+//   NULL、queued 状態、を条件に組む。UPDATE の副作用として
 //   attempt+=1、status=running、started_at=now、lease_expires_at=now+LEASE。
 // - completeStep / failStep / blockStep: step の状態遷移を単一 UPDATE で
 //   行い、その直後に Operation 全体の再評価(reevaluateOperation)を回す。
@@ -404,7 +405,7 @@ export const OperationRepoLive: Layer.Layer<
           `
         ).pipe(Effect.flatMap((rows) => Effect.forEach(rows, decodeOperation))),
 
-      // claimNext: unfinished operation の中で「先行するハルト条件が無く」
+      // claimNext: unfinished operation の中で「先行 Step がすべて終わっていて」
       // 「retry_at <= now」で「queued」な最小 ordinal Step を 1 件だけ拾い、
       // running に遷移させる。ordering:
       //   1. operation.created_at, operation.id  ← FIFO
@@ -425,14 +426,19 @@ export const OperationRepoLive: Layer.Layer<
                     SELECT 1 FROM operation_steps s2
                     WHERE s2.operation_id = s.operation_id AND s2.status = 'running'
                   )
-                  -- 先行する halting-failed / blocked Step が無い
+                  -- 先行 Step がすべて終わっている (succeeded か continue_on_error=1
+                  -- の failed)。blocked / halting-failed に加えて、retry 待ち
+                  -- (queued + 未来の retry_at) の先行 Step も追い越さない —
+                  -- 追い越すと enter_contest_mode は shutdown_devvm の retry 中に
+                  -- start_benchvm を、finish は wait_running の retry 中に
+                  -- finish_contest を実行してしまう。
                   AND NOT EXISTS (
                     SELECT 1 FROM operation_steps s3
                     WHERE s3.operation_id = s.operation_id
                       AND s3.ordinal < s.ordinal
-                      AND (
-                        s3.status = 'blocked'
-                        OR (s3.status = 'failed' AND s3.continue_on_error = 0)
+                      AND NOT (
+                        s3.status = 'succeeded'
+                        OR (s3.status = 'failed' AND s3.continue_on_error = 1)
                       )
                   )
                 ORDER BY o.created_at ASC, o.id ASC, s.ordinal ASC
