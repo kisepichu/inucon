@@ -132,7 +132,7 @@ beforeEach(() => {
   planSpy = vi.spyOn(api, "planReconciliation").mockResolvedValue(planFixture) as unknown as MockInstance
   applySpy = vi.spyOn(api, "applyReconciliation").mockResolvedValue(operationFixture) as unknown as MockInstance
   opsListSpy = vi.spyOn(api, "listContestOperations").mockResolvedValue([]) as unknown as MockInstance
-  artifactsSpy = vi.spyOn(api, "listContestArtifacts").mockResolvedValue([artifactFixture]) as unknown as MockInstance
+  artifactsSpy = vi.spyOn(api, "listAdminContestArtifacts").mockResolvedValue([artifactFixture]) as unknown as MockInstance
   startSpy = vi.spyOn(api, "requestContestStart").mockResolvedValue(operationFixture) as unknown as MockInstance
   finalizeSpy = vi.spyOn(api, "requestContestFinalize").mockResolvedValue(operationFixture) as unknown as MockInstance
 })
@@ -259,6 +259,42 @@ describe("ContestAdmin", () => {
     await user.click(screen.getByRole("button", { name: /off-host verify/i }))
     await waitFor(() => expect(verifySpy).toHaveBeenCalledTimes(1))
     expect(verifySpy).toHaveBeenCalledWith(artifactFixture.id, { sha256: "a".repeat(64) })
+  })
+
+  it("Archive タブは admin list 経由で snapshot 行を描画し、pending 行だけに verify 入力を出す", async () => {
+    // 公開 list (`listContestArtifacts`) は snapshot を除外するため、admin 画面は
+    // admin list を呼ばないと off-host verify 導線に到達できない。
+    artifactsSpy.mockResolvedValue([
+      artifactFixture,
+      {
+        ...artifactFixture,
+        id: "art-snapshot",
+        kind: "snapshot",
+        sizeBytes: 212992,
+        offHostStatus: "pending",
+        sha256: "a".repeat(64)
+      }
+    ])
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText(/準備中/)
+    await user.click(screen.getByRole("tab", { name: /Archive/ }))
+    await waitFor(() => expect(artifactsSpy).toHaveBeenCalledWith(contestFixture.id))
+    // snapshot 行が列挙される
+    expect(await screen.findByText("snapshot")).toBeInTheDocument()
+    expect(screen.getByText("212992")).toBeInTheDocument()
+    // verify 入力は pending の snapshot 行にだけ出る (not_applicable には出さない)
+    const shaInputs = screen.getAllByLabelText(/SHA-256/i)
+    expect(shaInputs).toHaveLength(1)
+    expect(shaInputs[0]).toHaveAttribute("id", "sha-art-snapshot")
+    expect(screen.getAllByRole("button", { name: /off-host verify/i })).toHaveLength(1)
+    // download は全 kind を AdminOnly 経路に通す (公開 download は snapshot を 404
+    // にし、かつ max-age=60 で再生成後の stale bytes を返しうる)。
+    const links = screen.getAllByRole("link", { name: /download/i })
+    expect(links.map((a) => a.getAttribute("href"))).toEqual([
+      "/api/admin/artifacts/art-scoreboard/download",
+      "/api/admin/artifacts/art-snapshot/download"
+    ])
   })
 
   it("immediate finish は running 以外では表示されない", async () => {

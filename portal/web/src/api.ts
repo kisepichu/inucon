@@ -178,8 +178,10 @@ export const api = {
     request<Operation>(`/api/admin/contests/${contestId}/archive`, { method: "POST" }),
 
   // Task 11: artifact 一覧 / 検証。生 storagePath は返らない (id のみ)。
-  listContestArtifacts: (contestId: ContestId) =>
-    request<Array<Artifact>>(`/api/contests/${contestId}/artifacts`),
+  // 一覧は AdminOnly 経路だけを持つ。公開 list (/api/contests/:id/artifacts) は
+  // snapshot を落とすので admin 画面から呼ぶと off-host verify 導線が消える。
+  listAdminContestArtifacts: (contestId: ContestId) =>
+    request<Array<Artifact>>(`/api/admin/contests/${contestId}/artifacts`),
   verifyArtifactChecksum: (artifactId: ArtifactId, body: VerifyArtifactRequest) =>
     request<Artifact>(`/api/admin/artifacts/${artifactId}/verify`, { method: "POST", body }),
 

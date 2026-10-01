@@ -855,6 +855,18 @@ export const artifactsGroup = HttpApiGroup.make("artifacts")
       .addSuccess(Schema.Array(Artifact))
       .addError(NotFound)
   )
+  // Task 13 fix: Archive タブ用の AdminOnly 一覧。公開 list は snapshot を
+  // 意図的に落とすので、admin が off-host verify すべき DB snapshot 行に
+  // 到達できなかった。response schema は公開 list と同形で、admin だけが
+  // 全 kind (snapshot 含む) を見る。
+  .add(
+    HttpApiEndpoint.get(
+      "listAdminContestArtifacts"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/artifacts`
+      .addSuccess(Schema.Array(Artifact))
+      .addError(NotFound)
+      .middleware(AdminOnly)
+  )
   .add(
     HttpApiEndpoint.get(
       "downloadArtifact"
