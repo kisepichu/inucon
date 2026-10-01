@@ -14,6 +14,8 @@ import type {
 import { ApiError, api } from "../api.ts"
 import {
   adoptRequiredHostnames,
+  blockedHostnames,
+  cleanupTargetEntries,
   computeContestActions,
   contestStatusLabel,
   groupReadinessByStatus,
@@ -216,8 +218,7 @@ function OverviewPanel({
       </dl>
 
       {(actions.beginPrepare || actions.startContest || actions.immediateFinish
-        || actions.cancelDraft || actions.cleanup || actions.returnNormal
-        || actions.rearchive) && (
+        || actions.cancelDraft || actions.returnNormal || actions.rearchive) && (
         <div className="dangerous-actions">
           <ConfirmCheckbox
             checked={confirm}
@@ -474,26 +475,55 @@ function ReadinessPanel({ contestId }: { readonly contestId: ContestId }) {
 
 // ---- Reconciliation -------------------------------------------------------
 
+// plan の digest は (inventory, adoptHostnames) の関数で、server は apply / cleanup
+// のたびに plan を再計算して digest を照合する。apply は送られた adoptHostnames で、
+// cleanup は adoptHostnames=[] で再計算するので、それぞれ「同じ adoptHostnames で
+// 取った plan」の digest しか通らない。adopt すると unmanaged_orphan の action が
+// blocked → adopt_cleanup に変わるため、adopt=[] で取った digest を adopt 付き
+// apply に流用すると必ず StaleReconciliationPlan になる。
 function ReconciliationPanel({ contestId, contest }: { readonly contestId: ContestId; readonly contest: Contest }) {
+  const actions = useMemo(() => computeContestActions(contest), [contest])
+  // 「診断」で取る adoptHostnames=[] の plan。cleanup の対象表示と digest は
+  // adopt の有無に関係なく常にこの plan から取る。
   const [plan, setPlan] = useState<ReconciliationPlan | null>(null)
   const [adopted, setAdopted] = useState<Readonly<Record<string, true>>>({})
+  // adopt を全件確認した後に adoptHostnames=requiredAdopt で取り直した plan。
+  // adopt 付き apply はこの plan を表示した上でこの digest で送る
+  // (operator が見た plan = apply される plan)。
+  const [adoptPlan, setAdoptPlan] = useState<ReconciliationPlan | null>(null)
+  const [cleanupConfirm, setCleanupConfirm] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [lastOp, setLastOp] = useState<Operation | null>(null)
 
   const requiredAdopt = plan === null ? [] : adoptRequiredHostnames(plan)
   const allAdopted = requiredAdopt.every((h) => adopted[h] === true)
+  // adopt 不要なら診断した plan をそのまま、必要なら adopt 付きで取り直した plan を
+  // apply する。取り直すまでは null (= 適用不可)。
+  const applyPlan = requiredAdopt.length === 0 ? plan : adoptPlan
+  const shownPlan = applyPlan ?? plan
+  const cleanupTargets = plan === null ? [] : cleanupTargetEntries(plan)
+  const cleanupBlocked = plan === null ? [] : blockedHostnames(plan)
+
+  const resetPlans = () => {
+    setPlan(null)
+    setAdoptPlan(null)
+    setAdopted({})
+    setCleanupConfirm(false)
+  }
 
   const runPlan = async () => {
     setError(null)
+    setNotice(null)
     setBusy(true)
     setLastOp(null)
     try {
       // plan 再取得時は前回の adopt チェック状態を保持しない (別の plan/revision の
       // ホスト名が残ると誤 apply の危険がある)。
       const p = await api.planReconciliation(contestId, { adoptHostnames: [] })
+      resetPlans()
       setPlan(p)
-      setAdopted({})
     } catch (err) {
       setError(messageForError(err, "診断に失敗しました"))
     } finally {
@@ -501,20 +531,69 @@ function ReconciliationPanel({ contestId, contest }: { readonly contestId: Conte
     }
   }
 
+  const toggleAdopt = (hostname: string, checked: boolean) => {
+    setAdopted((prev) => {
+      const next = { ...prev }
+      if (checked) next[hostname] = true
+      else delete next[hostname]
+      return next
+    })
+    // adopt 集合が変わったら、取り直した plan は operator が確認した集合と
+    // 一致しなくなるので破棄する (adopt=[] の plan 表示に戻る)。
+    setAdoptPlan(null)
+  }
+
+  const runAdoptPlan = async () => {
+    if (plan === null || requiredAdopt.length === 0 || !allAdopted) return
+    setError(null)
+    setBusy(true)
+    try {
+      setAdoptPlan(await api.planReconciliation(contestId, { adoptHostnames: requiredAdopt }))
+    } catch (err) {
+      setError(messageForError(err, "adopt を反映した plan の取得に失敗しました"))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const runApply = async () => {
-    if (plan === null || !allAdopted) return
+    if (applyPlan === null) return
     setError(null)
     setBusy(true)
     try {
       const op = await api.applyReconciliation(contestId, {
-        planDigest: plan.planDigest,
-        adoptHostnames: requiredAdopt
+        planDigest: applyPlan.planDigest,
+        // digest を計算したときの adoptHostnames を同じ plan から送る。
+        adoptHostnames: applyPlan.adoptHostnames
       })
       setLastOp(op)
       // 適用済み plan は無効化する (stale 前提)。
-      setPlan(null)
+      resetPlans()
     } catch (err) {
       setError(messageForError(err, "適用に失敗しました"))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const runCleanup = async () => {
+    if (plan === null || !cleanupConfirm || cleanupBlocked.length > 0) return
+    setError(null)
+    setNotice(null)
+    setBusy(true)
+    try {
+      // server は adoptHostnames=[] で plan を取り直すので、adopt=[] の plan の digest を送る。
+      const op = await api.requestContestCleanup(contestId, { planDigest: plan.planDigest })
+      setLastOp(op)
+      resetPlans()
+    } catch (err) {
+      if (err instanceof ApiError && err.tag === "NothingToReconcile") {
+        // 撤収するものが無い = 目的の状態に到達済み。失敗ではない。
+        setNotice("cleanup 対象はありません (既に clean)")
+        resetPlans()
+      } else {
+        setError(messageForError(err, "cleanup に失敗しました"))
+      }
     } finally {
       setBusy(false)
     }
@@ -533,7 +612,7 @@ function ReconciliationPanel({ contestId, contest }: { readonly contestId: Conte
         managed_orphan は portal 所有のため自動 cleanup、unmanaged_orphan は
         hostname ごとの adopt 確認を経てから削除します。
       </p>
-      {plan !== null && (
+      {shownPlan !== null && (
         <>
           <div className="table-wrap">
             <table className="data-table">
@@ -542,7 +621,7 @@ function ReconciliationPanel({ contestId, contest }: { readonly contestId: Conte
                   <th>hostname</th>
                   <th>classification</th>
                   <th>action</th>
-                  <th>Proxmox</th>
+                  <th>Proxmox VMID</th>
                   <th>CF DNS</th>
                   <th>CF ingress</th>
                   <th>CF app</th>
@@ -550,12 +629,12 @@ function ReconciliationPanel({ contestId, contest }: { readonly contestId: Conte
                 </tr>
               </thead>
               <tbody>
-                {plan.entries.map((e: ReconciliationEntry) => (
+                {shownPlan.entries.map((e: ReconciliationEntry) => (
                   <tr key={e.hostname}>
                     <td className="mono">{e.hostname}</td>
                     <td>{e.classification}</td>
                     <td>{e.action}</td>
-                    <td className="num">{e.proxmoxVmObserved ? "1" : "0"}</td>
+                    <td className="num mono">{e.proxmoxVmid ?? "-"}</td>
                     <td className="num">{e.cloudflareRouteCount}</td>
                     <td className="num">{e.cloudflareIngressCount}</td>
                     <td className="num">{e.cloudflareAppCount}</td>
@@ -569,47 +648,100 @@ function ReconciliationPanel({ contestId, contest }: { readonly contestId: Conte
             <div className="adopt-block">
               <p className="hint">
                 以下の hostname は portal 所有として adopt (合意して自動削除) してください。
-                個別に確認してください。
+                個別に確認し、全件確認したら adopt を反映した plan を取得して、
+                action が adopt_cleanup に変わったことを確かめてから適用してください。
               </p>
               {requiredAdopt.map((h) => (
                 <label key={h} className="checkbox-row">
                   <input
                     type="checkbox"
                     checked={adopted[h] === true}
-                    onChange={(e) =>
-                      setAdopted((prev) => {
-                        const next = { ...prev }
-                        if (e.target.checked) next[h] = true
-                        else delete next[h]
-                        return next
-                      })
-                    }
+                    disabled={busy}
+                    onChange={(e) => toggleAdopt(h, e.target.checked)}
                   />
                   <span className="mono">{h}</span>
                 </label>
               ))}
+              <div className="section-actions">
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  disabled={busy || !allAdopted || adoptPlan !== null}
+                  onClick={runAdoptPlan}
+                >
+                  adopt を反映した plan を取得
+                </button>
+              </div>
             </div>
           )}
           <div className="section-actions">
             <button
               type="button"
               className="btn btn-danger"
-              disabled={busy || !allAdopted}
+              disabled={busy || applyPlan === null}
               onClick={runApply}
             >
               適用
             </button>
             <p className="disabled-reason mono">
-              plan digest: {plan.planDigest.slice(0, 12)}…
+              plan digest: {shownPlan.planDigest.slice(0, 12)}…
             </p>
           </div>
         </>
+      )}
+      {actions.cleanup && plan !== null && (
+        <div className="dangerous-actions">
+          <h3>Cleanup</h3>
+          <p className="hint">
+            外部リソースを撤収し Instance を deleted に遷移します。server は adopt なしで
+            plan を取り直すので、対象は「診断」で取得した plan のものです。
+          </p>
+          {cleanupTargets.length === 0 && cleanupBlocked.length === 0 ? (
+            <p className="notice-ok">cleanup 対象はありません (既に clean)</p>
+          ) : (
+            <>
+              <ul>
+                {cleanupTargets.map((e) => (
+                  <li key={e.hostname} data-testid="cleanup-target">
+                    <span className="mono">{e.hostname}</span> — VMID{" "}
+                    <span className="mono">{e.proxmoxVmid ?? "なし"}</span>
+                  </li>
+                ))}
+              </ul>
+              {cleanupBlocked.length > 0 && (
+                <p className="disabled-reason">
+                  blocked の entry があるため cleanup できません。cleanup は adopt せずに plan を
+                  取り直すので、unmanaged_orphan は先に adopt して適用し、診断し直してください:{" "}
+                  <span className="mono">{cleanupBlocked.join(", ")}</span>
+                </p>
+              )}
+              <ConfirmCheckbox
+                checked={cleanupConfirm}
+                onChange={setCleanupConfirm}
+                description={`上記 ${cleanupTargets.length} 件の hostname について、表示した VMID の Proxmox VM、Cloudflare DNS / tunnel ingress / Access application、ResourceBinding を撤収し、Instance を deleted に遷移します。元に戻せません。`}
+              />
+              <div className="section-actions">
+                <button
+                  type="button"
+                  className="btn btn-danger"
+                  disabled={busy || !cleanupConfirm || cleanupBlocked.length > 0 || cleanupTargets.length === 0}
+                  aria-busy={busy}
+                  onClick={runCleanup}
+                >
+                  cleanup 実行
+                </button>
+                <p className="disabled-reason mono">plan digest: {plan.planDigest.slice(0, 12)}…</p>
+              </div>
+            </>
+          )}
+        </div>
       )}
       {error !== null && (
         <p role="alert" className="error">
           {error}
         </p>
       )}
+      {notice !== null && <p className="notice-ok">{notice}</p>}
       {lastOp !== null && (
         <p className="notice-ok">
           Operation を発行しました: <Link to={`/admin/operations/${lastOp.id}`}>{lastOp.id}</Link>

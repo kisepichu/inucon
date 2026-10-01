@@ -27,6 +27,7 @@ import {
 } from "../../../application/usecases/reconciliation.js"
 import { computeReadiness } from "../../../application/usecases/readiness.js"
 import { cleanupContestResources, returnNormalMode } from "../../../application/usecases/cleanup.js"
+import { needsCleanupOperation } from "../../../domain/reconciliation.js"
 
 // Task 7: reconciliation plan/apply の HTTP handler。AdminOnly middleware は
 // shared/api の group 定義側で付与済みなので、handler は CurrentUser を
@@ -36,13 +37,17 @@ export const OperationsLive = HttpApiBuilder.group(api, "operations", (handlers)
   handlers
     .handle("planReconciliation", ({ path, payload }) =>
       planReconciliation({ contestId: path.contestId, adoptHostnames: payload.adoptHostnames }).pipe(
-        // wire schema は instanceId: NullOr(InstanceId) だが domain は
-        // Option<InstanceId>。境界で null に畳んで返す(BenchJob と同じ方針)。
+        // wire schema は instanceId / proxmoxVmid が NullOr だが domain は Option。
+        // 境界で null に畳んで返す(BenchJob と同じ方針)。cleanupTarget は
+        // cleanupContestResources が step 対象を選ぶのと同じ述語で計算する —
+        // Admin Web に対象選択を複製させない (PR #77 の drift 対策)。
         Effect.map((plan) => ({
           ...plan,
           entries: plan.entries.map((e) => ({
             ...e,
-            instanceId: Option.getOrNull(e.instanceId)
+            proxmoxVmid: Option.getOrNull(e.proxmoxVmid),
+            instanceId: Option.getOrNull(e.instanceId),
+            cleanupTarget: needsCleanupOperation(e)
           }))
         })),
         Effect.catchTags({

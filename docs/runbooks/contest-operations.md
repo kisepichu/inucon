@@ -89,8 +89,9 @@ scoreboard は開催回ごとに分離される。手順の全体像:
    quota / 期間 / Team 編成コピー) を埋める。**日付は operator が確定した
    値を入力する (推測しない)**。desiredInstanceCount / instanceQuota は第2回
    でも設定値であり、コード側にハードコードしない (Global Constraints)。
-2. ContestAdmin → **Reconciliation** タブで plan を Refresh → adopt 対象
-   hostname を明示 → apply。差分ゼロを確認。
+2. ContestAdmin → **Reconciliation** タブで **診断** → adopt 対象 hostname を
+   個別にチェック → **adopt を反映した plan を取得** (action が `adopt_cleanup`
+   に変わることを確認) → **適用**。差分ゼロを確認。
 3. ContestAdmin → **Readiness** タブで runner heartbeat / backup /
    rehearsal 実績 / Cloudflare write proven がすべて pass になるまで
    Instance 払い出し・招待・リハーサルを実施。
@@ -110,8 +111,8 @@ scoreboard は開催回ごとに分離される。手順の全体像:
 
    | # | 操作 | 前 gate | 飛ばすとどうなるか |
    | --- | --- | --- | --- |
-   | 7-1 | **Reconciliation** タブ → Refresh → 未 adopt の orphan があれば adopt して apply | — | Cleanup が `AmbiguousReconciliation` で拒否される。Cleanup は常に `adoptHostnames: []` で plan を取り直すため、**Cleanup 側から orphan を adopt する経路は無い** |
-   | 7-2 | **Cleanup** Operation (managed 外部 resource の撤収 + Instance を `deleted` に遷移) | blocked entry が 0 件 | Return normal mode が `ResidualManagedResource` (409) で拒否される。また Instance が `deleted` に落ちないため、次回開催の readiness `previous_cleanup` が fail し続け **draft から `preparing` に上がれない** |
+   | 7-1 | **Reconciliation** タブ → **診断** → 未 adopt の orphan があれば adopt をチェック → **adopt を反映した plan を取得** → **適用** | — | Cleanup が押せない (blocked の理由を表示)。Cleanup は常に `adoptHostnames: []` で plan を取り直すため、**Cleanup 側から orphan を adopt する経路は無い** |
+   | 7-2 | **Cleanup** Operation (managed 外部 resource の撤収 + Instance を `deleted` に遷移)。7-1 の Operation 完了後に **Reconciliation** タブ → **診断** → Cleanup 欄の対象 hostname / VMID を確認 → 「影響を確認しました」→ **cleanup 実行**。対象 0 件なら「既に clean」と表示される | blocked entry が 0 件 | Return normal mode が `ResidualManagedResource` (409) で拒否される。また Instance が `deleted` に落ちないため、次回開催の readiness `previous_cleanup` が fail し続け **draft から `preparing` に上がれない** |
    | 7-3 | **Return normal mode** (benchvm 停止 → devvm 復帰) | managed VM が Proxmox に残っていない | handler の `verify_no_managed_vms` で blocked |
 
    7-1 で adopt を要求されるのは「命名規約に合致する hostname の
