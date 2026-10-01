@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { type ReactNode, useCallback, useEffect, useId, useMemo, useState } from "react"
 import { Link, useNavigate, useParams } from "react-router-dom"
 import type {
   Artifact,
@@ -6,6 +6,7 @@ import type {
   Contest,
   ContestId,
   Operation,
+  PreparationPlan,
   ReadinessCheck,
   ReconciliationEntry,
   ReconciliationPlan,
@@ -159,6 +160,54 @@ function ConfirmCheckbox({
   )
 }
 
+// 1 操作分の「影響対象 (children) + 専用の確認 checkbox + 実行ボタン」。checkbox を
+// 操作ごとに持たせ、別の操作の確認で押せる状態にしない (plan Task 13 Step 5:
+// mode switch 等は影響する hostname / VMID を示して確認を要求する)。
+function ConfirmedAction({
+  title,
+  confirmDescription,
+  buttonLabel,
+  buttonClassName,
+  disabledReason,
+  busy,
+  onRun,
+  children
+}: {
+  readonly title: string
+  readonly confirmDescription: string
+  readonly buttonLabel: string
+  readonly buttonClassName: string
+  readonly disabledReason: string | null
+  readonly busy: boolean
+  readonly onRun: () => Promise<void>
+  readonly children?: ReactNode
+}) {
+  const headingId = useId()
+  const [confirmed, setConfirmed] = useState(false)
+  const runnable = confirmed && disabledReason === null
+  return (
+    <section className="dangerous-actions" aria-labelledby={headingId}>
+      <h3 id={headingId}>{title}</h3>
+      {children}
+      <ConfirmCheckbox checked={confirmed} onChange={setConfirmed} description={confirmDescription} />
+      <div className="section-actions">
+        <button
+          type="button"
+          className={`btn ${buttonClassName}`}
+          disabled={!runnable || busy}
+          aria-busy={busy}
+          onClick={() => {
+            if (runnable) void onRun()
+          }}
+        >
+          {buttonLabel}
+        </button>
+        {disabledReason !== null && <p className="disabled-reason">{disabledReason}</p>}
+      </div>
+    </section>
+  )
+}
+
 // ---- Overview -------------------------------------------------------------
 
 function OverviewPanel({
@@ -174,9 +223,34 @@ function OverviewPanel({
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [lastOp, setLastOp] = useState<Operation | null>(null)
+  // 競技モード切替 / インスタンス準備の影響対象。VMID や hostname の導出は web に
+  // 持たず server (GET /preparation-plan) が返したものだけを表示する。取れないうちは
+  // 確認させようがないのでボタンを出さない。
+  const needsPlan = actions.enterContestMode || actions.prepareInstances
+  const [plan, setPlan] = useState<PreparationPlan | null>(null)
+  const [planError, setPlanError] = useState<string | null>(null)
 
-  const runOp = async (fn: () => Promise<Operation>, description: string) => {
-    if (!confirm) return
+  useEffect(() => {
+    if (!needsPlan) return
+    let canceled = false
+    ;(async () => {
+      try {
+        const p = await api.getPreparationPlan(contest.id)
+        if (!canceled) {
+          setPlan(p)
+          setPlanError(null)
+        }
+      } catch (err) {
+        if (!canceled) setPlanError(messageForError(err, "影響対象の取得に失敗しました"))
+      }
+    })()
+    return () => {
+      canceled = true
+    }
+  }, [needsPlan, contest.id, contest.revision])
+
+  // Operation を積んで詳細画面へ誘導する。確認 checkbox は呼び出し側で判定済み。
+  const submitOp = async (fn: () => Promise<Operation>, description: string) => {
     setError(null)
     setBusy(true)
     try {
@@ -184,7 +258,6 @@ function OverviewPanel({
       setLastOp(op)
       setConfirm(false)
       await onChanged()
-      // Operation を詳細画面へ誘導
       navigate(`/admin/operations/${op.id}`, { state: { description } })
     } catch (err) {
       setError(messageForError(err, "処理に失敗しました"))
@@ -192,6 +265,15 @@ function OverviewPanel({
       setBusy(false)
     }
   }
+
+  // ライフサイクル操作 (共通 checkbox) 用。
+  const runOp = async (fn: () => Promise<Operation>, description: string) => {
+    if (!confirm) return
+    await submitOp(fn, description)
+  }
+
+  const toCreate = plan?.instanceSlots.filter((s) => s.instanceStatus === null) ?? []
+  const existing = plan?.instanceSlots.filter((s) => s.instanceStatus !== null) ?? []
 
   return (
     <section className="section">
@@ -217,38 +299,116 @@ function OverviewPanel({
         <dd className="mono">{contest.revision}</dd>
       </dl>
 
-      {(actions.beginPrepare || actions.startContest || actions.immediateFinish
+      {/* spec の流れ: 準備開始 (§3 preflight) → 競技モード切替 (§3) → インスタンス準備 (§4)
+          → rehearsal → 開始 (§5)。各操作は対象の Contest.status でだけ出る。 */}
+      {actions.beginPrepare && (
+        <ConfirmedAction
+          title="準備開始"
+          buttonLabel="準備開始"
+          buttonClassName="btn-secondary"
+          confirmDescription={`第${contest.edition}回 (revision ${contest.revision}) を draft から preparing に遷移します。外部リソースは変更しません。`}
+          disabledReason={null}
+          busy={busy}
+          onRun={async () => {
+            setError(null)
+            setBusy(true)
+            try {
+              await api.beginContestPreparation(contest.id, { expectedRevision: contest.revision })
+              await onChanged()
+            } catch (err) {
+              setError(messageForError(err, "準備開始に失敗しました"))
+            } finally {
+              setBusy(false)
+            }
+          }}
+        />
+      )}
+
+      {needsPlan && planError !== null && (
+        <p role="alert" className="error">
+          影響対象 (VM / hostname) を取得できないため、競技モード切替 / インスタンス準備 は実行できません: {planError}
+        </p>
+      )}
+      {needsPlan && plan === null && planError === null && <p className="loading">影響対象を取得しています...</p>}
+
+      {actions.enterContestMode && plan !== null && (
+        <ConfirmedAction
+          title="競技モード切替"
+          buttonLabel="競技モード切替"
+          buttonClassName="btn-danger"
+          confirmDescription={`${plan.contestMode.shutdownVm.name} (VMID ${plan.contestMode.shutdownVm.vmid}) を停止し、${plan.contestMode.startVm.name} (VMID ${plan.contestMode.startVm.vmid}) を起動します。停止中は ${plan.contestMode.shutdownVm.name} 上のサービスを使えません。`}
+          disabledReason={null}
+          busy={busy}
+          onRun={() => submitOp(() => api.requestEnterContestMode(contest.id), "競技モード切替")}
+        >
+          <ul>
+            <li data-testid="mode-shutdown">
+              <span className="mono">{plan.contestMode.shutdownVm.name}</span> (VMID{" "}
+              <span className="mono">{plan.contestMode.shutdownVm.vmid}</span>): onboot=0 → guest shutdown
+              (force stop はしない) → 停止を待つ
+            </li>
+            <li data-testid="mode-start">
+              <span className="mono">{plan.contestMode.startVm.name}</span> (VMID{" "}
+              <span className="mono">{plan.contestMode.startVm.vmid}</span>): 空きメモリを確認 → onboot=1 → 起動
+            </li>
+          </ul>
+          <p className="hint">
+            shutdown が時間内に終わらなければ Operation は blocked で止まります (contest-recovery runbook §5)。
+          </p>
+        </ConfirmedAction>
+      )}
+
+      {actions.prepareInstances && plan !== null && (
+        <ConfirmedAction
+          title="インスタンス準備"
+          buttonLabel="インスタンス準備"
+          buttonClassName="btn-primary"
+          confirmDescription={`上記 ${toCreate.length} 台の VM を 1 台ずつ作成し、Cloudflare DNS / tunnel ingress / Access application を設定します。`}
+          disabledReason={toCreate.length === 0 ? "作成予定の Instance がありません" : null}
+          busy={busy}
+          onRun={() => submitOp(() => api.requestPrepareInstances(contest.id), "インスタンス準備")}
+        >
+          <p className="hint">競技モード切替が完了している (VM の停止 / 起動が済んでいる) ことが前提です。</p>
+          <p>{`作成予定 ${toCreate.length} 台`}</p>
+          {toCreate.length > 0 && (
+            <ul>
+              {toCreate.map((s) => (
+                <li key={s.hostname} data-testid="prepare-create">
+                  <span className="mono">{s.hostname}</span> — VMID <span className="mono">{s.vmid}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {existing.length > 0 && (
+            <>
+              <p className="hint">既に Instance がある枠は作り直しません:</p>
+              <ul>
+                {existing.map((s) => (
+                  <li key={s.hostname} data-testid="prepare-existing">
+                    <span className="mono">{s.hostname}</span> — VMID <span className="mono">{s.vmid}</span> —{" "}
+                    {s.instanceStatus}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          {existing.some((s) => s.instanceStatus === "failed") && (
+            <p className="disabled-reason">
+              failed の枠があるため、作成後も全台 running にならず Operation は blocked で止まります。
+            </p>
+          )}
+        </ConfirmedAction>
+      )}
+
+      {(actions.startContest || actions.immediateFinish
         || actions.cancelDraft || actions.returnNormal || actions.rearchive) && (
-        <div className="dangerous-actions">
+        <section className="dangerous-actions" aria-label="ライフサイクル操作">
           <ConfirmCheckbox
             checked={confirm}
             onChange={setConfirm}
             description="この操作は Contest 状態遷移と外部リソースへの副作用を伴います。開催回・revision・対象を確認してください。"
           />
           <div className="section-actions">
-            {actions.beginPrepare && (
-              <button
-                type="button"
-                className="btn btn-secondary"
-                disabled={!confirm || busy}
-                onClick={async () => {
-                  if (!confirm) return
-                  setError(null)
-                  setBusy(true)
-                  try {
-                    await api.beginContestPreparation(contest.id, { expectedRevision: contest.revision })
-                    setConfirm(false)
-                    await onChanged()
-                  } catch (err) {
-                    setError(messageForError(err, "準備開始に失敗しました"))
-                  } finally {
-                    setBusy(false)
-                  }
-                }}
-              >
-                準備開始
-              </button>
-            )}
             {actions.startContest && (
               <button
                 type="button"
@@ -331,7 +491,7 @@ function OverviewPanel({
               </button>
             )}
           </div>
-        </div>
+        </section>
       )}
 
       {error !== null && (

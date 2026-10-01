@@ -3,6 +3,7 @@ import { Effect, Option } from "effect"
 import {
   AmbiguousReconciliation,
   api,
+  ContestModeNotActive,
   ContestNotPreparing,
   ContestRevisionConflict,
   InstanceNotFound,
@@ -21,6 +22,8 @@ import { CurrentUser } from "shared"
 import { ContestRepo, OperationRepo } from "../../../application/ports.js"
 import { enqueueRehearsal } from "../../../application/usecases/bench.js"
 import { requestContestStart } from "../../../application/usecases/contestAdmin.js"
+import { enterContestMode } from "../../../application/usecases/modeOperation.js"
+import { getPreparationPlan, prepareContest } from "../../../application/usecases/prepare.js"
 import {
   applyReconciliation,
   planReconciliation
@@ -227,6 +230,73 @@ export const OperationsLive = HttpApiBuilder.group(api, "operations", (handlers)
           // (409) を使い、from/to の状態を透過的に伝える。
           InvalidContestTransition: (e: { readonly from: unknown; readonly to: unknown }) =>
             Effect.fail(new InvalidContestTransition({ from: e.from as never, to: e.to as never }))
+        }),
+        Effect.orDie
+      )
+    )
+    // 競技モード切替 / インスタンス準備の確認画面用。prepare の作成対象は
+    // planPrepareSlots (handler と同じ関数) から出す。
+    .handle("getPreparationPlan", ({ path }) =>
+      getPreparationPlan(path.contestId).pipe(
+        Effect.map((plan) => ({
+          contestId: plan.contestId,
+          contestMode: plan.contestMode,
+          instanceSlots: plan.instanceSlots.map((slot) => ({
+            teamNumber: slot.teamNumber,
+            teamName: slot.teamName,
+            index: slot.index,
+            hostname: slot.hostname,
+            vmid: slot.vmid,
+            instanceStatus: slot.occupant?.status ?? null
+          }))
+        })),
+        Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound())
+        }),
+        Effect.orDie
+      )
+    )
+    // spec §3: enter_contest_mode Operation の enqueue (return-normal-mode の対)。
+    .handle("requestEnterContestMode", ({ path }) =>
+      Effect.gen(function* () {
+        const user = yield* CurrentUser
+        return yield* enterContestMode({ contestId: path.contestId, actorUserId: user.id })
+      }).pipe(
+        Effect.map((op) => ({
+          ...op,
+          sanitizedError: Option.getOrNull(op.sanitizedError),
+          startedAt: Option.getOrNull(op.startedAt),
+          finishedAt: Option.getOrNull(op.finishedAt)
+        })),
+        Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound()),
+          InvalidContestTransition: (e: { readonly from: unknown; readonly to: unknown }) =>
+            Effect.fail(new InvalidContestTransition({ from: e.from as never, to: e.to as never })),
+          OperationInProgress: () => Effect.fail(new OperationalContestConflict())
+        }),
+        Effect.orDie
+      )
+    )
+    // spec §4: prepare Operation の enqueue。競技モードを確かめられなければ 409
+    // ContestModeNotActive、inventory 自体が読めなければ 503 (どちらも積まない)。
+    .handle("requestPrepareInstances", ({ path }) =>
+      Effect.gen(function* () {
+        const user = yield* CurrentUser
+        return yield* prepareContest({ contestId: path.contestId, actorUserId: user.id })
+      }).pipe(
+        Effect.map((op) => ({
+          ...op,
+          sanitizedError: Option.getOrNull(op.sanitizedError),
+          startedAt: Option.getOrNull(op.startedAt),
+          finishedAt: Option.getOrNull(op.finishedAt)
+        })),
+        Effect.catchTags({
+          ContestNotFound: () => Effect.fail(new NotFound()),
+          InvalidContestTransition: (e: { readonly from: unknown; readonly to: unknown }) =>
+            Effect.fail(new InvalidContestTransition({ from: e.from as never, to: e.to as never })),
+          ContestModeNotActive: (e) => Effect.fail(new ContestModeNotActive({ reason: e.reason })),
+          ProxmoxError: () => Effect.fail(new ProviderUnavailable({ provider: "proxmox" })),
+          OperationInProgress: () => Effect.fail(new OperationalContestConflict())
         }),
         Effect.orDie
       )

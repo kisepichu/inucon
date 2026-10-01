@@ -1,6 +1,7 @@
 import { Data } from "effect"
 import type { ContestStatus } from "../domain/contest.js"
 import type { InstanceId, TeamId } from "../domain/ids.js"
+import type { ContestModeBlocker } from "../domain/modeVmIds.js"
 
 // ユースケース(オーケストレーション)固有のエラー。
 //
@@ -129,4 +130,11 @@ export class InvalidArchiveState extends Data.TaggedError("InvalidArchiveState")
 // summary に残すが、raw provider payload は載せない。
 export class ResidualManagedResource extends Data.TaggedError("ResidualManagedResource")<{
   readonly hostnames: ReadonlyArray<string>
+}> {}
+
+// prepare (team VM の払い出し) を競技モード以外で enqueue しようとした。reason は
+// domain/modeVmIds.ts の contestModeBlocker が返す固定 key(provider raw response
+// は載せない)。UI は「先に競技モード切替」を案内する。
+export class ContestModeNotActive extends Data.TaggedError("ContestModeNotActive")<{
+  readonly reason: ContestModeBlocker
 }> {}

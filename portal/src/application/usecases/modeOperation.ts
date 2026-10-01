@@ -1,7 +1,11 @@
 import { Effect, Option } from "effect"
+import { InvalidContestTransition } from "../../domain/errors.js"
+import type { ContestId, UserId } from "../../domain/ids.js"
+import { BENCHVM_VM_NAME, BENCHVM_VMID, DEVVM_VM_NAME, DEVVM_VMID, modeVmIdentityMismatch } from "../../domain/modeVmIds.js"
+import type { Operation } from "../../domain/operation.js"
+import { ContestNotFound } from "../errors.js"
 import type { OperationHandler } from "../ports.js"
-import { ModeTransitionTimeout, OperationExecutionError, ProxmoxPort } from "../ports.js"
-import { modeVmIdentityMismatch } from "../../domain/modeVmIds.js"
+import { ContestRepo, ModeTransitionTimeout, OperationExecutionError, OperationInProgress, OperationRepo, ProxmoxPort, RepoError } from "../ports.js"
 import type { StepOutcome } from "./operations.js"
 
 // Task 8: enter_contest_mode Operation の step handler。
@@ -126,6 +130,12 @@ export const makeEnterContestModeHandler: Effect.Effect<OperationHandler, never,
             return yield* Effect.fail(new OperationExecutionError({ cause: result.left }))
           }
           case "memory_check": {
+            // benchvm が既に running なら起動用の空きは要らない(競技モード中の押し直し)。
+            // ここで空きを要求すると benchvm / team VM が使っている分だけ足りずに blocked
+            // になり、global lock を握ったまま prepare / start を止める。
+            if (benchvm.status === "running") {
+              return succeeded("benchvm already running")
+            }
             // post-shutdown MemAvailable = 現時点の free + devvm 停止で解放される RAM。
             // devvm が既に stopped ならその分は加算しない(release 済み)。
             const nodeFreeMemBytes = Option.getOrNull(inv.nodeFreeMemBytes)
@@ -182,9 +192,19 @@ export const makeEnterContestModeHandler: Effect.Effect<OperationHandler, never,
     return { run: runStep }
   })
 
-// Task 8: enter_contest_mode Operation の NewOperation を組み立てるヘルパー。
-// admin 呼び出し(Task 12 で export される handler / HTTP endpoint)、および
-// 単体テストで再利用する。
+// enter_contest_mode が触る VM。handler は inventory の devvm / benchvm (proxmox
+// client が DEVVM_VMID / BENCHVM_VMID の config + qemu 一覧から解決し、power 操作の
+// 前に期待名と突き合わせる) に対して power 操作を出すので、確認画面に出す対象は
+// この定数で正確に表せる。Admin Web は GET /preparation-plan 経由でこれを受け取る。
+export const ENTER_CONTEST_MODE_TARGETS = {
+  // set_devvm_onboot_0 → shutdown_devvm (guest shutdown、force stop しない)
+  shutdownVm: { vmid: DEVVM_VMID, name: DEVVM_VM_NAME },
+  // set_benchvm_onboot_1 → start_benchvm
+  startVm: { vmid: BENCHVM_VMID, name: BENCHVM_VM_NAME }
+} as const
+
+// enter_contest_mode Operation の step 一覧 (spec の順)。enterContestMode が使う。
+// handler は inputSummary を読まず、毎 step inventory を再観測する。
 export const buildEnterContestModeSteps = (): ReadonlyArray<{
   readonly stepKey: EnterContestModeStepKey
   readonly ordinal: number
@@ -197,3 +217,33 @@ export const buildEnterContestModeSteps = (): ReadonlyArray<{
     inputSummary: "{}",
     continueOnError: false
   }))
+
+export type EnterContestModeError = RepoError | ContestNotFound | InvalidContestTransition | OperationInProgress
+
+// spec §3「preparing と競技モード」: operator が Admin Web で明示確認したときだけ
+// enter_contest_mode Operation を積む。preparing 以外は拒否する (draft は readiness
+// gate を通っておらず、running 以降は benchvm 経由の参加者経路を前提にしている)。
+// 既に競技モードでも拒否しない — 各 step が観測状態で冪等成功する。global lock
+// (unfinished Operation 1 本) は OperationRepo.enqueue が OperationInProgress で返す。
+export const enterContestMode = (args: {
+  readonly contestId: ContestId
+  readonly actorUserId: UserId
+}): Effect.Effect<Operation, EnterContestModeError, ContestRepo | OperationRepo> =>
+  Effect.gen(function* () {
+    const found = yield* (yield* ContestRepo).findById(args.contestId)
+    if (Option.isNone(found)) {
+      return yield* Effect.fail(new ContestNotFound())
+    }
+    const contest = found.value
+    if (contest.status !== "preparing") {
+      return yield* Effect.fail(new InvalidContestTransition({ from: contest.status, to: "preparing" }))
+    }
+    return yield* (yield* OperationRepo).enqueue({
+      contestId: contest.id,
+      kind: "enter_contest_mode",
+      actor: { kind: "admin", userId: args.actorUserId },
+      planDigest: `enter_contest_mode:c${contest.id}:r${contest.revision}`,
+      contestRevision: contest.revision,
+      steps: buildEnterContestModeSteps()
+    })
+  })

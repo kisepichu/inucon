@@ -155,12 +155,29 @@ describe("enter_contest_mode の handler", () => {
           ...HEALTHY_INVENTORY,
           nodeFreeMemBytes: 2 * 1024 * 1024 * 1024,
           devvm: { ...HEALTHY_INVENTORY.devvm, memoryBytes: 1 * 1024 * 1024 * 1024, status: "stopped" },
-          benchvm: { ...HEALTHY_INVENTORY.benchvm, memoryBytes: 4 * 1024 * 1024 * 1024 }
+          benchvm: { ...HEALTHY_INVENTORY.benchvm, memoryBytes: 4 * 1024 * 1024 * 1024, status: "stopped" }
         }
       })
       const h = yield* handler
       const outcome = yield* h.run(stepOf("memory_check"))
       expect(outcome.status).toBe("blocked")
+    })
+  )
+
+  // 競技モード中 (benchvm が既に running で RAM を使っている) に Overview の「競技モード
+  // 切替」が押し直されても、benchvm を起動する分の空きを要求して blocked にしない。blocked
+  // は global lock を握ったままになり、cancel UI が無いので prepare / start まで止まる。
+  it.effect("競技モード中に押し直しても空きメモリによらず全 step が何も変更せず succeeded", () =>
+    Effect.gen(function* () {
+      const { handler, proxmox } = buildHandler({
+        infrastructureInventory: { ...HEALTHY_INVENTORY, nodeFreeMemBytes: 1 * 1024 * 1024 * 1024 }
+      })
+      const h = yield* handler
+      for (const key of ENTER_CONTEST_MODE_STEP_KEYS) {
+        expect(yield* h.run(stepOf(key))).toMatchObject({ status: "succeeded" })
+      }
+      const state = yield* proxmox.getState
+      expect([state.shutdownRequests, state.startedVmids, state.onBootByVmid]).toEqual([[], [], {}])
     })
   )
 

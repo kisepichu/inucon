@@ -92,9 +92,33 @@ scoreboard は開催回ごとに分離される。手順の全体像:
 2. ContestAdmin → **Reconciliation** タブで **診断** → adopt 対象 hostname を
    個別にチェック → **adopt を反映した plan を取得** (action が `adopt_cleanup`
    に変わることを確認) → **適用**。差分ゼロを確認。
-3. ContestAdmin → **Readiness** タブで runner heartbeat / backup /
-   rehearsal 実績 / Cloudflare write proven がすべて pass になるまで
-   Instance 払い出し・招待・リハーサルを実施。
+3. ContestAdmin → **Overview** で開催準備を進める。Overview の操作はこの順に
+   並び、それぞれ対象の Contest 状態でだけ表示される:
+   - 3-1. **「準備開始」**(draft → preparing)。状態を変えるだけで外部リソースは
+     触らない。前回開催の Instance が残っている (`previous_cleanup`) / 未完了
+     Operation がある / 遷移中 Instance がある場合は
+     `ContestNotReadyForPreparation` (409) で拒否される。
+   - 3-2. **「競技モード切替」**(spec §3、`enter_contest_mode` Operation)。確認欄に
+     出る VM / VMID (devvm 9300 を onboot=0 → guest shutdown、空きメモリ確認後に
+     benchvm 9200 を onboot=1 → 起動) を確認して「影響を確認しました」→ 実行。
+     VMID は portal が `portal/src/domain/modeVmIds.ts` から返した値。遷移先の
+     Operation 詳細で全 step が succeeded になるのを待つ。既に競技モードなら全 step
+     が何も変更せず succeeded で終わる。shutdown が timeout して blocked になったら
+     `contest-recovery.md` §5 (force stop はしない)。
+   - 3-3. **「インスタンス準備」**(spec §4、`prepare` Operation)。確認欄に作成予定の
+     hostname / VMID と台数、既に Instance がある枠 (作り直さない) が出るので確認して
+     実行。全 team を desiredInstanceCount まで **1 台ずつ** 作り、running が 1 台でも
+     あれば空きメモリが閾値に戻るまで KSM 統合を最大 10 分待つ。競技モードでない
+     (devvm が停止していない / benchvm が起動していない / 観測できない) と
+     `ContestModeNotActive` (409) で拒否されるので、先に 3-2 を完了させる。blocked
+     の summary が `ksm_settle_timeout:*` なら `contest-recovery.md` §6、
+     `all_slots_consumed_*` なら failed の Instance が枠を占有している。
+   - 3-4. 招待 (Admin ページの招待フォーム) とリハーサル。**リハーサルの起動導線は
+     Admin Web に未実装**で、存在するのは API
+     `POST /api/admin/contests/:contestId/rehearsal` (body `{ "instanceId": ... }`、
+     admin + preparing のみ) だけ。
+   - 3-5. **Readiness** タブで runner heartbeat / backup / rehearsal 実績 /
+     Cloudflare write proven がすべて pass になることを確認。
 4. Readiness all-pass 後に **「開始」(preparing → running)**。
 5. 終了は **scheduledEndAt 到達で worker が自動 finalize**。急ぐ場合のみ
    Admin Web の即時 finalize (`POST /api/admin/contests/:id/finalize`) を
@@ -124,10 +148,11 @@ scoreboard は開催回ごとに分離される。手順の全体像:
    **7-3 は次回開催に必須ではない**。次回開催を `preparing` に上げる gate
    は readiness `previous_cleanup` (7-2 で満たされる) だけで、mode は
    見ない。devvm を当面使わないなら contest mode のまま置いておくのが
-   手間が少ない。enter contest mode の handler は contest mode からは 7 step
-   すべてが「already」で何も変更せず通る設計。ただし 2026-10-01 時点で
-   Admin Web に enter contest mode の起動経路は無いので、7-3 を実施した後に
-   contest mode へ戻すには eevee 側で
+   手間が少ない。enter contest mode は contest mode からは 7 step すべてが
+   「already」で何も変更せず通る。7-3 を実施した後に contest mode へ戻すのは、
+   次回開催を preparing に上げてから Overview の **「競技モード切替」**
+   (手順 3-2) で行う。finished / canceled の Contest からは起動できないので、
+   それより前に戻すなら eevee 側で
    `../nixos-config-private/scripts/eevee-mode.sh contest` を使う。
 
    7-3 の memory_check は benchvm を停止した**後**に「node free ≥ devvm

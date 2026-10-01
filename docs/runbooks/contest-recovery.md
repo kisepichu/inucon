@@ -175,11 +175,13 @@ apply Operation が succeeded。Cloudflare 側 dashboard で app / DNS が
 
 ## 5. Shutdown timeout (mode transition)
 
-**症状**: `enter_contest_mode` / `return_normal_mode` Operation の
-`wait_devvm_stopped` step が `blocked` に落ち、summary に
-`"devvm guest shutdown did not complete within <ms>ms; verify guest
-agent then run 'qm shutdown 9300' manually (do not force stop)"` が
-出ている (`portal/src/application/usecases/modeOperation.ts` 102-107 行)。
+**症状**: `enter_contest_mode` Operation の `wait_devvm_stopped` step
+(`return_normal_mode` なら `wait_benchvm_stopped`) が `blocked` に落ち、
+summary に `"devvm guest shutdown did not complete within <ms>ms; verify
+guest agent then run 'qm shutdown 9300' manually (do not force stop)"`
+(`return_normal_mode` なら benchvm / 9200) が出ている
+(`portal/src/application/usecases/modeOperation.ts` の `wait_devvm_stopped`
+case、`cleanup.ts` の `wait_benchvm_stopped` case)。
 
 **VMID mapping (実機 `qm list` 実測、2026-09-22)**: **9300 = devvm**
 (開発サーバ、memory 12288 MiB、onboot 1)、**9200 = benchvm** (bench
@@ -201,18 +203,22 @@ runner を止める」**。portal 側は power 操作の前に observed name を
    poweroff` を実行。
 2. できないなら eevee で **`qm shutdown 9300`** をもう一度発行
    (guest ACPI shutdown。`qm stop` は絶対に使わない — force stop 禁止
-   は `application/ports.ts` 481 行と設計制約)。
-3. `qm status 9300` が `stopped` になったら Admin Web → Operations
-   タブから対象 Operation を **cancel** (下記 §12 「Operation cancel の
-   一般手順」)。**cancel だけでは再開しない**: `contestScheduler` の
-   tick は `tickFinalize` / `tickRevokeAccess` / `tickCleanup` の 3 種
-   しか無く (`portal/src/infrastructure/worker/contestScheduler.ts`)、
+   は `application/ports.ts` の `ProxmoxPort` 定義のコメントと設計制約)。
+3. `qm status 9300` が `stopped` になったら対象 Operation を **cancel**
+   する。Admin Web に cancel UI は無いので §12 「Contest stuck in
+   `finalizing`」手順 2 の SQL で canceled 化する。**cancel だけでは
+   再開しない**: `contestScheduler` の tick は `tickFinalize` /
+   `tickRevokeAccess` / `tickCleanup` の 3 種しか無く
+   (`portal/src/infrastructure/worker/contestScheduler.ts`)、
    `enter_contest_mode` / `return_normal_mode` を自動 re-enqueue する
-   経路は無い。cancel 後に **Admin Web から改めて enter_contest_mode
-   (または return_normal_mode) をリクエスト** する。devvm は既に
-   stopped なので `wait_devvm_stopped` は即成功し、`memory_check`
-   から自然に継続する (`portal/src/application/usecases/modeOperation.ts`
-   93-96 行)。
+   経路は無い。cancel 後に ContestAdmin → **Overview** の
+   **「競技モード切替」** (`return_normal_mode` なら **「通常モード復帰」**)
+   を改めて押す。新しい Operation は先頭 step から走るが、devvm は既に
+   onboot=0 / stopped なので `set_devvm_onboot_0` / `shutdown_devvm` /
+   `wait_devvm_stopped` は観測状態で即成功し、実質 `memory_check` から
+   進む (`modeOperation.ts` の各 case 冒頭の冪等ショートカット。
+   `return_normal_mode` は `verify_no_managed_vms` の後、benchvm 側の同じ
+   3 step が同様に即成功する)。
 
 **手で mode 遷移を通す場合**: 単発の `qm start` / `qm shutdown` を並べる
 のではなく **`../nixos-config-private/scripts/eevee-mode.sh
@@ -249,7 +255,7 @@ Operation が succeeded で終わり、`benchvm (9200)` が `running` になる
 - mode transition 中: `enter_contest_mode` の `memory_check` step が
   `blocked` に落ち、summary に `post-shutdown MemAvailable <B> <
   benchvm(<B>) + reserve(<B>); check other workloads on the node before
-  retrying` が出る (`modeOperation.ts` 118-121 行)。
+  retrying` が出る (`modeOperation.ts` の `memory_check` case)。
 - `return_normal_mode` の `memory_check` step (benchvm 停止**後**に
   node free ≥ devvm の割当 + reserve 1 GiB) が `blocked`。この時点で
   benchvm は停止・onboot 0、devvm も停止・onboot 0 (8 step 中 5 番目)。
@@ -265,9 +271,12 @@ Operation が succeeded で終わり、`benchvm (9200)` が `running` になる
 - 他 workload (講評 VM、開発 VM 等) が eevee で走っていないか。
 
 **復旧手順**:
-1. 明らかに 5-10 分待てば KSM で下がる状況なら、Admin Web で該当
-   Operation を **cancel** (§12「Operation cancel の一般手順」) し、
-   5-10 分後に再度 apply / start / mode 遷移をリクエスト。
+1. 明らかに 5-10 分待てば KSM で下がる状況なら、該当 Operation を
+   **cancel** し (Admin Web に cancel UI は無いので §12 手順 2 の SQL)、
+   5-10 分後に再度 apply / start / mode 遷移 / インスタンス準備をリクエスト
+   (mode 遷移とインスタンス準備は ContestAdmin → Overview のボタン)。
+   インスタンス準備は既に running の枠を作り直さず、残りの枠から 1 台ずつ
+   再開する。
 2. 他 workload が原因なら、それらを別ノード or 停止に回してから再試行。
 3. ARC が数 GiB を占めているなら、ARC 上限を一時的に下げると再起動なしに
    空きが増える (例: 2 GiB):
@@ -277,9 +286,13 @@ Operation が succeeded で終わり、`benchvm (9200)` が `running` になる
 4. 恒久的に足りないなら quota / desiredInstanceCount を下げる
    (Contest 設定変更 → Reconciliation タブで診断 → 適用)。
 5. `return_normal_mode` が blocked の場合、devvm を当面使わないなら
-   cancel して contest mode に戻す。2026-10-01 時点で Admin Web には
-   enter_contest_mode の起動経路が無い (handler はあるが endpoint / UI が
-   未結線) ので、eevee 側で
+   cancel して contest mode に戻す。この時点で benchvm / devvm とも停止・
+   onboot 0 なので、次回開催を preparing に上げてから ContestAdmin →
+   **Overview** の **「競技モード切替」** (`contest-operations.md` 手順 3-2)
+   を押す。devvm 側の step は即成功し、memory_check → benchvm の onboot=1
+   → 起動が行われる。「競技モード切替」は preparing の Contest にしか出ず、
+   return_normal_mode を流した finished / canceled の Contest からは起動
+   できないので、それより前に benchvm を戻したいときだけ eevee 側で
    `../nixos-config-private/scripts/eevee-mode.sh contest` を使う
    (benchvm を起動し、onboot を benchvm=1 / devvm=0 に戻す)。devvm を
    起動したいなら 3 で空きを作ってから return_normal_mode を再リクエスト

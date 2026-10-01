@@ -3,10 +3,15 @@ import { it } from "@effect/vitest"
 import { Effect, Option, Schema } from "effect"
 import { Operation, ReconciliationPlan } from "shared/schemas"
 import { describe, expect } from "vitest"
-import { CloudflareError, ContestRepo, InstanceRepo, OperationRepo, ResourceBindingRepo, TeamRepo } from "../../src/application/ports.js"
+import { CloudflareError, ContestRepo, InstanceRepo, OperationRepo, ProxmoxError, ResourceBindingRepo, TeamRepo } from "../../src/application/ports.js"
+import { ENTER_CONTEST_MODE_STEP_KEYS } from "../../src/application/usecases/modeOperation.js"
+import { PREPARE_STEP_KEY } from "../../src/application/usecases/prepare.js"
+import type { ContestStatus } from "../../src/domain/contest.js"
 import { ContestId, InstanceId, OperationId, ResourceBindingId, TeamId } from "../../src/domain/ids.js"
 import { Instance } from "../../src/domain/instance.js"
+import { BENCHVM_VM_NAME, BENCHVM_VMID, DEVVM_VM_NAME, DEVVM_VMID } from "../../src/domain/modeVmIds.js"
 import { ResourceBinding } from "../../src/domain/resourceBinding.js"
+import type { InfrastructureInventorySeed } from "../support/inMemory.js"
 import { login } from "../support/login.js"
 import { asAdmin } from "../support/apiTestHelpers.js"
 import { makeAppTestLayer } from "../support/testApi.js"
@@ -653,6 +658,265 @@ describe("POST /api/admin/contests/:contestId/return-normal-mode (Task 12)", () 
         })
       )
     )
+  )
+})
+
+// 競技モード切替 / インスタンス準備の起動経路 (Admin Web → HTTP → Operation)。
+// handler / step は Task 8 / 9 で実装済みだが enqueue する経路が無かった。
+const GiB = 1024 * 1024 * 1024
+// enter_contest_mode が収束した後 = devvm stopped / benchvm running。
+const CONTEST_MODE_INVENTORY: InfrastructureInventorySeed = {
+  devvm: { vmid: DEVVM_VMID, name: DEVVM_VM_NAME, status: "stopped", memoryBytes: 12 * GiB, onBoot: false },
+  benchvm: { vmid: BENCHVM_VMID, name: BENCHVM_VM_NAME, status: "running", memoryBytes: 4 * GiB, onBoot: true }
+}
+const ContestModeTestLayer = makeAppTestLayer({
+  adminGithubLogins: ["admin-login"],
+  proxmoxInfrastructureInventory: CONTEST_MODE_INVENTORY
+})
+const NON_PREPARING_STATUSES = ["draft", "running", "finalizing", "finished", "canceled"] as const
+
+const seedContest = (status: ContestStatus) =>
+  Effect.gen(function* () {
+    const contest = makeContest({ id: ContestId.make(`c-mode-${status}`), edition: 2, status, revision: 4 })
+    yield* (yield* ContestRepo).create(contest)
+    return contest
+  })
+
+// 別 Operation が global lock (unfinished 1 本) を掴んでいる状態。
+const seedUnfinishedOperation = (contestId: ContestId) =>
+  Effect.gen(function* () {
+    yield* (yield* OperationRepo).enqueue({
+      contestId,
+      kind: "reconcile",
+      actor: { kind: "scheduler" },
+      planDigest: "d-busy",
+      contestRevision: 4,
+      steps: [{ stepKey: "reconcile:busy", ordinal: 0, inputSummary: "{}", continueOnError: false }]
+    })
+  })
+
+describe("POST /api/admin/contests/:contestId/enter-contest-mode", () => {
+  const path = (contestId: ContestId) => `/api/admin/contests/${contestId}/enter-contest-mode`
+
+  it.effect("未認証は 401", () =>
+    Effect.gen(function* () {
+      const contest = yield* seedContest("preparing")
+      const res = yield* (yield* HttpClient.HttpClient).post(path(contest.id))
+      expect(res.status).toBe(401)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("非 admin は 403", () =>
+    Effect.gen(function* () {
+      const contest = yield* seedContest("preparing")
+      const { cookieHeader } = yield* login({ githubLogin: "u-ecm-nonadmin", githubId: 8300 })
+      const res = yield* postJson(cookieHeader, path(contest.id), {})
+      expect(res.status).toBe(403)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("存在しない contest は 404", () =>
+    Effect.gen(function* () {
+      const { cookieHeader } = yield* asAdmin()
+      const res = yield* postJson(cookieHeader, path(ContestId.make("nope")), {})
+      expect(res.status).toBe(404)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect.each(NON_PREPARING_STATUSES)("%s の Contest は 409 InvalidContestTransition で Operation を積まない", (status) =>
+    Effect.gen(function* () {
+      const contest = yield* seedContest(status)
+      const { cookieHeader } = yield* asAdmin()
+      const res = yield* postJson(cookieHeader, path(contest.id), {})
+      expect(res.status).toBe(409)
+      expect(yield* res.json).toMatchObject({ _tag: "InvalidContestTransition", from: status })
+      expect(yield* (yield* OperationRepo).hasUnfinished).toBe(false)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("preparing なら devvm 停止 → benchvm 起動の step を持つ enter_contest_mode Operation を積む", () =>
+    Effect.gen(function* () {
+      const contest = yield* seedContest("preparing")
+      const { cookieHeader } = yield* asAdmin()
+      const res = yield* postJson(cookieHeader, path(contest.id), {})
+      expect(res.status).toBe(200)
+      const op = Schema.decodeUnknownSync(Operation)(yield* res.json)
+      expect([op.kind, op.status, op.contestId]).toEqual(["enter_contest_mode", "queued", contest.id])
+      const steps = yield* (yield* OperationRepo).listSteps(OperationId.make(op.id))
+      // worker の registry は ENTER_CONTEST_MODE_STEP_KEYS の step だけを mode handler に
+      // 渡す。順序は modeOperation.test.ts が spec の順で固定している。
+      expect(steps.map((s) => [s.ordinal, s.stepKey, s.continueOnError])).toEqual(
+        ENTER_CONTEST_MODE_STEP_KEYS.map((key, i) => [i, key, false])
+      )
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("別 Operation が未完了なら 409 OperationalContestConflict", () =>
+    Effect.gen(function* () {
+      const contest = yield* seedContest("preparing")
+      yield* seedUnfinishedOperation(contest.id)
+      const { cookieHeader } = yield* asAdmin()
+      const res = yield* postJson(cookieHeader, path(contest.id), {})
+      expect(res.status).toBe(409)
+      expect(yield* res.json).toMatchObject({ _tag: "OperationalContestConflict" })
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+})
+
+describe("POST /api/admin/contests/:contestId/prepare-instances", () => {
+  const path = (contestId: ContestId) => `/api/admin/contests/${contestId}/prepare-instances`
+
+  it.effect("未認証は 401", () =>
+    Effect.gen(function* () {
+      const contest = yield* seedContest("preparing")
+      const res = yield* (yield* HttpClient.HttpClient).post(path(contest.id))
+      expect(res.status).toBe(401)
+    }).pipe(Effect.provide(ContestModeTestLayer))
+  )
+
+  it.effect("非 admin は 403", () =>
+    Effect.gen(function* () {
+      const contest = yield* seedContest("preparing")
+      const { cookieHeader } = yield* login({ githubLogin: "u-prep-nonadmin", githubId: 8400 })
+      const res = yield* postJson(cookieHeader, path(contest.id), {})
+      expect(res.status).toBe(403)
+    }).pipe(Effect.provide(ContestModeTestLayer))
+  )
+
+  it.effect("存在しない contest は 404", () =>
+    Effect.gen(function* () {
+      const { cookieHeader } = yield* asAdmin()
+      const res = yield* postJson(cookieHeader, path(ContestId.make("nope")), {})
+      expect(res.status).toBe(404)
+    }).pipe(Effect.provide(ContestModeTestLayer))
+  )
+
+  it.effect.each(NON_PREPARING_STATUSES)("%s の Contest は 409 InvalidContestTransition で Operation を積まない", (status) =>
+    Effect.gen(function* () {
+      const contest = yield* seedContest(status)
+      const { cookieHeader } = yield* asAdmin()
+      const res = yield* postJson(cookieHeader, path(contest.id), {})
+      expect(res.status).toBe(409)
+      expect(yield* res.json).toMatchObject({ _tag: "InvalidContestTransition", from: status })
+      expect(yield* (yield* OperationRepo).hasUnfinished).toBe(false)
+    }).pipe(Effect.provide(ContestModeTestLayer))
+  )
+
+  it.effect("normal mode (devvm 起動中) なら 409 ContestModeNotActive で Operation を積まない", () =>
+    Effect.gen(function* () {
+      const contest = yield* seedContest("preparing")
+      const { cookieHeader } = yield* asAdmin()
+      const res = yield* postJson(cookieHeader, path(contest.id), {})
+      expect(res.status).toBe(409)
+      expect(yield* res.json).toEqual({ _tag: "ContestModeNotActive", reason: "devvm_not_stopped" })
+      expect(yield* (yield* OperationRepo).hasUnfinished).toBe(false)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("Proxmox inventory が読めなければ 503 ProviderUnavailable で Operation を積まない", () =>
+    Effect.gen(function* () {
+      const contest = yield* seedContest("preparing")
+      const { cookieHeader } = yield* asAdmin()
+      const res = yield* postJson(cookieHeader, path(contest.id), {})
+      expect(res.status).toBe(503)
+      expect(yield* res.json).toEqual({ _tag: "ProviderUnavailable", provider: "proxmox" })
+      expect(yield* (yield* OperationRepo).hasUnfinished).toBe(false)
+    }).pipe(
+      Effect.provide(
+        makeAppTestLayer({
+          adminGithubLogins: ["admin-login"],
+          proxmoxInfrastructureInventory: CONTEST_MODE_INVENTORY,
+          proxmoxFailWith: { getInfrastructureInventory: new ProxmoxError({ cause: "simulated outage" }) }
+        })
+      )
+    )
+  )
+
+  it.effect("競技モードの preparing なら converge_contest_instances 1 step の prepare Operation を積む", () =>
+    Effect.gen(function* () {
+      const contest = yield* seedContest("preparing")
+      const { cookieHeader } = yield* asAdmin()
+      const res = yield* postJson(cookieHeader, path(contest.id), {})
+      expect(res.status).toBe(200)
+      const op = Schema.decodeUnknownSync(Operation)(yield* res.json)
+      expect([op.kind, op.status, op.contestId]).toEqual(["prepare", "queued", contest.id])
+      const steps = yield* (yield* OperationRepo).listSteps(OperationId.make(op.id))
+      // prepare handler は inputSummary の contestId で対象 Contest を再読する。
+      expect(steps.map((s) => [s.stepKey, JSON.parse(s.inputSummary)])).toEqual([
+        [PREPARE_STEP_KEY, { contestId: contest.id }]
+      ])
+    }).pipe(Effect.provide(ContestModeTestLayer))
+  )
+
+  it.effect("別 Operation が未完了なら 409 OperationalContestConflict", () =>
+    Effect.gen(function* () {
+      const contest = yield* seedContest("preparing")
+      yield* seedUnfinishedOperation(contest.id)
+      const { cookieHeader } = yield* asAdmin()
+      const res = yield* postJson(cookieHeader, path(contest.id), {})
+      expect(res.status).toBe(409)
+      expect(yield* res.json).toMatchObject({ _tag: "OperationalContestConflict" })
+    }).pipe(Effect.provide(ContestModeTestLayer))
+  )
+})
+
+// Admin Web が確認 checkbox の前に出す「影響を受ける VMID / hostname」。web 側に
+// VMID 定数や hostname 導出を複製させないため server が返す。
+describe("GET /api/admin/contests/:contestId/preparation-plan", () => {
+  const path = (contestId: ContestId) => `/api/admin/contests/${contestId}/preparation-plan`
+
+  it.effect("非 admin は 403", () =>
+    Effect.gen(function* () {
+      const contest = yield* seedContest("preparing")
+      const { cookieHeader: cookie } = yield* login({ githubLogin: "u-plan-nonadmin", githubId: 8500 })
+      const res = yield* (yield* HttpClient.HttpClient).get(path(contest.id), { headers: { cookie } })
+      expect(res.status).toBe(403)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("存在しない contest は 404", () =>
+    Effect.gen(function* () {
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const res = yield* (yield* HttpClient.HttpClient).get(path(ContestId.make("nope")), { headers: { cookie } })
+      expect(res.status).toBe(404)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("mode 切替で止める / 起動する VM と、prepare が作る枠・既存 Instance を返す", () =>
+    Effect.gen(function* () {
+      const contest = yield* seedContest("preparing")
+      const team = makeTeam({ id: TeamId.make("t-plan-1"), contestId: contest.id, teamNumber: 1, name: "team1", desiredInstanceCount: 2 })
+      yield* (yield* TeamRepo).create(team)
+      yield* (yield* InstanceRepo).create(
+        new Instance({
+          id: InstanceId.make("i-plan-1-1"),
+          contestId: contest.id,
+          teamId: team.id,
+          index: 1,
+          vmid: 1101,
+          privateIp: "10.100.1.11",
+          status: "running",
+          progress: [],
+          errorMessage: Option.none(),
+          createdAt: 1000,
+          updatedAt: 1000
+        })
+      )
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const res = yield* (yield* HttpClient.HttpClient).get(path(contest.id), { headers: { cookie } })
+      expect(res.status).toBe(200)
+      expect(yield* res.json).toEqual({
+        contestId: contest.id,
+        contestMode: {
+          shutdownVm: { vmid: DEVVM_VMID, name: DEVVM_VM_NAME },
+          startVm: { vmid: BENCHVM_VMID, name: BENCHVM_VM_NAME }
+        },
+        instanceSlots: [
+          { teamNumber: 1, teamName: "team1", index: 1, hostname: "inucon-team1-1", vmid: 1101, instanceStatus: "running" },
+          { teamNumber: 1, teamName: "team1", index: 2, hostname: "inucon-team1-2", vmid: 1102, instanceStatus: null }
+        ]
+      })
+    }).pipe(Effect.provide(OperationsTestLayer))
   )
 })
 

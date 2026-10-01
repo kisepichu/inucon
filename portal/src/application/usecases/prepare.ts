@@ -2,11 +2,12 @@ import { Clock, Context, Effect, Layer, Option } from "effect"
 import type { Contest } from "../../domain/contest.js"
 import { InvalidContestTransition } from "../../domain/errors.js"
 import type { ContestId, InstanceId, TeamId, UserId } from "../../domain/ids.js"
-import { newInstance } from "../../domain/instance.js"
+import { newInstance, vmidFor } from "../../domain/instance.js"
 import type { Instance } from "../../domain/instance.js"
+import { contestModeBlocker } from "../../domain/modeVmIds.js"
 import type { NewOperation, Operation, OperationStep } from "../../domain/operation.js"
 import type { Team } from "../../domain/team.js"
-import { ContestNotFound } from "../errors.js"
+import { ContestModeNotActive, ContestNotFound } from "../errors.js"
 import {
   ContestRepo,
   InstanceRepo,
@@ -14,13 +15,16 @@ import {
   OperationInProgress,
   OperationRepo,
   ProvisioningConfig,
+  ProxmoxError,
   ProxmoxPort,
   RepoError,
   TeamRepo,
   UuidGen
 } from "../ports.js"
 import type { OperationHandler } from "../ports.js"
+import { ENTER_CONTEST_MODE_TARGETS } from "./modeOperation.js"
 import type { StepOutcome } from "./operations.js"
+import { hostnameStemFor } from "./provisioning.js"
 
 // Task 9: prepareContest Operation。preparing Contest の全 team を
 // desiredInstanceCount まで収束させる。
@@ -78,16 +82,24 @@ export const PrepareConfigDefault: Layer.Layer<PrepareConfig> = Layer.succeed(
 // enqueue する。cross-lock (creating/deleting Instance あり) と unfinished
 // Operation の存在は OperationRepo.enqueue の SQL 側 atomic ガードが検出する
 // (呼び出し元は OperationInProgress として transmit する)。
+//
+// enqueue 前に Proxmox inventory を読み、競技モード (devvm stopped / benchvm
+// running) でなければ ContestModeNotActive で拒否する。handler 自体は mode VM を
+// 見ないので、normal mode のまま積むと KSM 待ち 10 分の末に ksm_settle_timeout で
+// blocked になるだけで operator に理由が伝わらない。inventory が読めない
+// (ProxmoxError) / mode VM が観測できない場合も積まない (fail closed)。
 export type PrepareContestError =
   | RepoError
   | ContestNotFound
   | InvalidContestTransition
+  | ContestModeNotActive
+  | ProxmoxError
   | OperationInProgress
 
 export const prepareContest = (args: {
   readonly contestId: ContestId
   readonly actorUserId: UserId
-}): Effect.Effect<Operation, PrepareContestError, ContestRepo | OperationRepo> =>
+}): Effect.Effect<Operation, PrepareContestError, ContestRepo | OperationRepo | ProxmoxPort> =>
   Effect.gen(function* () {
     const contests = yield* ContestRepo
     const contest = yield* contests.findById(args.contestId).pipe(
@@ -104,6 +116,14 @@ export const prepareContest = (args: {
       )
     }
 
+    const inventory = yield* (yield* ProxmoxPort).getInfrastructureInventory
+    const blocker = contestModeBlocker({
+      devvm: Option.getOrNull(inventory.devvm),
+      benchvm: Option.getOrNull(inventory.benchvm)
+    })
+    if (blocker !== null) {
+      return yield* Effect.fail(new ContestModeNotActive({ reason: blocker }))
+    }
     const operations = yield* OperationRepo
     const input: NewOperation = {
       contestId: contest.id,
@@ -167,48 +187,76 @@ const parseStepInput = (raw: string): StepInput | null => {
   return { contestId: value as unknown as ContestId }
 }
 
-// (teamNumber, index) 昇順で「まだ running まで到達していない枠」を返す。
-// creating / deleting はスキップ (別で待たれる)。既存 running / failed は
-// 「その枠は既に処理済み」として消費される (failed は operator の再削除・
-// 手動整理を要求するので prepare 側は次の枠に進む)。
-interface Slot {
+// prepare が収束させる desired 枠 (team × 1..desiredInstanceCount) を
+// (teamNumber, index) 昇順に並べたもの。occupant は deleted 以外でその枠を占有して
+// いる Instance (running / failed / creating / deleting)。handler は occupant の無い
+// 枠だけをこの順に 1 台ずつ作る。failed も枠を占有する (operator の再削除・手動整理を
+// 要求するので prepare は作り直さず次の枠に進む)。
+//
+// Admin Web の確認画面 (GET /api/admin/contests/:id/preparation-plan) と handler は
+// どちらもこの関数だけで作成対象を決める — 判定を 2 箇所に持たない (PR #77)。
+export interface PrepareSlot {
   readonly teamId: TeamId
   readonly teamNumber: number
+  readonly teamName: string
   readonly index: number
+  readonly hostname: string
+  // 作成予定の枠は newInstance と同じ vmidFor、既存枠は occupant の vmid。
+  readonly vmid: number
+  readonly occupant: Instance | null
 }
 
-// Task 9 review round 2 finding 1: failed instances は「desired 枠を消費した
-// が healthy でない」状態なので、running とは区別する。
-//  - failed が枠を占有していると次の未占有 index は無いので slot=null になる。
-//  - しかしそれは「収束済み」ではなく「operator 判断待ち」なので、succeeded
-//    への遷移は「running 数が desired 数に達している」ときだけに絞る (下記
-//    handler 側の allTeamsRunning チェック)。ここでは「まだ enqueue できる
-//    (未占有の) index」を返すだけの責務に留める。
-const nextMissingSlot = (args: {
+export const planPrepareSlots = (args: {
   readonly teams: ReadonlyArray<Team>
   readonly instances: ReadonlyArray<Instance>
-}): Slot | null => {
-  const byTeam = new Map<string, ReadonlyArray<Instance>>()
-  for (const team of args.teams) {
-    byTeam.set(team.id, args.instances.filter((i) => i.teamId === team.id))
-  }
-  const sortedTeams = args.teams.slice().sort((a, b) => a.teamNumber - b.teamNumber)
-  for (const team of sortedTeams) {
-    const teamInstances = byTeam.get(team.id) ?? []
-    const occupiedNonDeleted = new Set(
-      teamInstances.filter((i) => i.status !== "deleted").map((i) => i.index)
+}): ReadonlyArray<PrepareSlot> =>
+  args.teams
+    .slice()
+    .sort((a, b) => a.teamNumber - b.teamNumber)
+    .flatMap((team) =>
+      Array.from({ length: team.desiredInstanceCount }, (_, i): PrepareSlot => {
+        const index = i + 1
+        const occupant =
+          args.instances.find((inst) => inst.teamId === team.id && inst.index === index && inst.status !== "deleted") ??
+          null
+        return {
+          teamId: team.id,
+          teamNumber: team.teamNumber,
+          teamName: team.name,
+          index,
+          hostname: hostnameStemFor(team.teamNumber, index),
+          vmid: occupant?.vmid ?? vmidFor(team.teamNumber, index),
+          occupant
+        }
+      })
     )
-    // 未占有の最小 index (1..desired) を探す。failed も枠を占有しているので、
-    // failed が全 index を占めているチームでは「もう enqueue できない」= 次
-    // team へ進む。
-    for (let i = 1; i <= team.desiredInstanceCount; i++) {
-      if (!occupiedNonDeleted.has(i)) {
-        return { teamId: team.id, teamNumber: team.teamNumber, index: i }
-      }
-    }
-  }
-  return null
+
+export interface PreparationPlan {
+  readonly contestId: ContestId
+  readonly contestMode: typeof ENTER_CONTEST_MODE_TARGETS
+  readonly instanceSlots: ReadonlyArray<PrepareSlot>
 }
+
+// GET /api/admin/contests/:id/preparation-plan: 競技モード切替とインスタンス準備の
+// 確認画面に出す影響対象。DB と domain 定数だけで組み立て、mutation も Proxmox
+// 読み取りもしない (backend の enqueue 時 gate が authoritative)。
+export const getPreparationPlan = (
+  contestId: ContestId
+): Effect.Effect<PreparationPlan, RepoError | ContestNotFound, ContestRepo | TeamRepo | InstanceRepo> =>
+  Effect.gen(function* () {
+    if (Option.isNone(yield* (yield* ContestRepo).findById(contestId))) {
+      return yield* Effect.fail(new ContestNotFound())
+    }
+    const [teams, instances] = yield* Effect.all([
+      (yield* TeamRepo).listByContest(contestId),
+      (yield* InstanceRepo).listByContest(contestId)
+    ])
+    return {
+      contestId,
+      contestMode: ENTER_CONTEST_MODE_TARGETS,
+      instanceSlots: planPrepareSlots({ teams, instances })
+    }
+  })
 
 // review round 2 finding 1: succeeded の条件は「全 team で running 数が
 // desiredInstanceCount 以上」。failed は healthy でないので数に入れない。
@@ -305,7 +353,11 @@ export const makePrepareHandler: Effect.Effect<
         }
       }
 
-      const slot = nextMissingSlot({ teams: teamList, instances: instList })
+      // Task 9 review round 2 finding 1: failed は「desired 枠を消費したが healthy で
+      // ない」状態。failed が枠を占有していると次の未占有枠は無く slot=null になるが、
+      // それは「収束済み」ではなく「operator 判断待ち」なので、succeeded への遷移は
+      // 下の allTeamsRunning (running 数が desired に達している) のときだけに絞る。
+      const slot = planPrepareSlots({ teams: teamList, instances: instList }).find((s) => s.occupant === null) ?? null
       if (slot === null) {
         // review round 2 finding 1: 全 index が「running または failed」で埋まった
         // ときに slot が null になる。succeeded は「全 team で running == desired」の

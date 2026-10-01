@@ -37,6 +37,7 @@ import {
   OperationId,
   OperationWithSteps,
   PollJobResponse,
+  PreparationPlan,
   ReadinessCheck,
   ReconciliationApplyRequest,
   ReconciliationPlan,
@@ -358,6 +359,24 @@ export class InvalidArchiveState extends Schema.TaggedError<InvalidArchiveState>
 export class ResidualManagedResource extends Schema.TaggedError<ResidualManagedResource>()(
   "ResidualManagedResource",
   { hostnames: Schema.Array(Schema.String) },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// POST /api/admin/contests/:contestId/prepare-instances: 競技モード (devvm
+// stopped / benchvm running) を Proxmox inventory で確かめられない。UI は「先に
+// 競技モード切替」を案内する。reason は portal/src/domain/modeVmIds.ts の
+// ContestModeBlocker と同じ固定 key (境界のコピー)。inventory 取得自体の失敗は
+// ProviderUnavailable (503)。
+export class ContestModeNotActive extends Schema.TaggedError<ContestModeNotActive>()(
+  "ContestModeNotActive",
+  {
+    reason: Schema.Literal(
+      "mode_vms_unobservable",
+      "mode_vm_identity_mismatch",
+      "devvm_not_stopped",
+      "benchvm_not_running"
+    )
+  },
   HttpApiSchema.annotations({ status: 409 })
 ) {}
 
@@ -818,6 +837,45 @@ export const operationsGroup = HttpApiGroup.make("operations")
       .addError(OperationalContestConflict)
       .addError(ResidualManagedResource)
       .addError(InvalidContestTransition)
+      .middleware(AdminOnly)
+  )
+  // 競技モード切替 (spec §3) と インスタンス準備 (spec §4) の確認画面用。
+  // enter_contest_mode が止める / 起動する VM と、prepare が作る枠を返す
+  // (mutation 無し、Proxmox も読まない)。
+  .add(
+    HttpApiEndpoint.get(
+      "getPreparationPlan"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/preparation-plan`
+      .addSuccess(PreparationPlan)
+      .addError(NotFound)
+      .middleware(AdminOnly)
+  )
+  // spec §3: enter_contest_mode Operation を enqueue する (devvm guest shutdown →
+  // 停止と memory.free 確認 → benchvm 起動。force stop はしない)。preparing のみ。
+  // return-normal-mode の対。
+  .add(
+    HttpApiEndpoint.post(
+      "requestEnterContestMode"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/enter-contest-mode`
+      .addSuccess(Operation)
+      .addError(NotFound)
+      .addError(InvalidContestTransition)
+      .addError(OperationalContestConflict)
+      .middleware(AdminOnly)
+  )
+  // spec §4: prepare Operation を enqueue する (全 team を desiredInstanceCount まで
+  // 1 台ずつ)。preparing かつ競技モードのみ。draft → preparing の
+  // POST /api/admin/contests/:contestId/prepare (beginContestPreparation) とは別物。
+  .add(
+    HttpApiEndpoint.post(
+      "requestPrepareInstances"
+    )`/api/admin/contests/${HttpApiSchema.param("contestId", ContestId)}/prepare-instances`
+      .addSuccess(Operation)
+      .addError(NotFound)
+      .addError(InvalidContestTransition)
+      .addError(ContestModeNotActive)
+      .addError(ProviderUnavailable)
+      .addError(OperationalContestConflict)
       .middleware(AdminOnly)
   )
   // Task 13: OperationDetail UI 用の Operation 単体取得。step 一覧を ordinal
