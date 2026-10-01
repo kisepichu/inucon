@@ -6,7 +6,6 @@ import {
   CloudflareError,
   ProxmoxError
 } from "../../src/application/ports.js"
-import type { ProxmoxInfrastructureInventory } from "../../src/application/ports.js"
 import type { ResourceBinding } from "../../src/domain/resourceBinding.js"
 import type { Contest } from "../../src/domain/contest.js"
 import type { Instance } from "../../src/domain/instance.js"
@@ -21,6 +20,7 @@ import { makeContest, makeInstance, makeTeam } from "../support/factories.js"
 import type {
   CloudflareInventorySeed,
   CloudflareTestOptions,
+  InfrastructureInventorySeed,
   ProxmoxTestOptions
 } from "../support/inMemory.js"
 import {
@@ -94,7 +94,7 @@ interface ReadinessLayerOptions {
   readonly instances?: ReadonlyArray<Instance>
   readonly teams?: ReadonlyArray<Team>
   readonly bindings?: ReadonlyArray<ResourceBinding>
-  readonly proxmoxInventory?: ProxmoxInfrastructureInventory
+  readonly proxmoxInventory?: InfrastructureInventorySeed
   readonly proxmoxFail?: ProxmoxTestOptions
   readonly cloudflareInventory?: CloudflareInventorySeed
   readonly cloudflareFail?: CloudflareTestOptions
@@ -437,12 +437,14 @@ describe("previous_cleanup", () => {
 })
 
 describe("Proxmox infrastructure inventory", () => {
-  it.effect("inventory 取得失敗は template / team_slots / isolation / memory / benchvm / mode_vm_identity を fail に落とす", () =>
+  it.effect("inventory 取得失敗は template / team_slots / memory / benchvm / mode_vm_identity を fail、isolation を warn に落とす", () =>
     Effect.gen(function* () {
       const checks = yield* computeReadiness(CONTEST_ID)
-      for (const k of ["template", "team_slots", "isolation", "memory", "benchvm", "mode_vm_identity"]) {
+      for (const k of ["template", "team_slots", "memory", "benchvm", "mode_vm_identity"]) {
         expect(findCheck(checks, k).status).toBe("fail")
       }
+      // isolation は「観測不能」であって「分離が壊れている」ではないので warn。
+      expect(findCheck(checks, "isolation").status).toBe("warn")
     }).pipe(
       Effect.provide(
         buildLayer({
@@ -453,6 +455,30 @@ describe("Proxmox infrastructure inventory", () => {
       )
     )
   )
+
+  // D1 回帰 (application 層): isolation の sub-request だけが取得不能になっても、
+  // 他の Proxmox 依存 check は有効値を返す。本番で 1 本の HTTP 400 が 6 check を
+  // 道連れにした事故の再発防止。
+  it.effect("isolation だけが観測不能なら isolation=warn、他の Proxmox check は有効値のまま", () =>
+    Effect.gen(function* () {
+      const checks = yield* computeReadiness(CONTEST_ID)
+      const isolation = findCheck(checks, "isolation")
+      expect(isolation.status).toBe("warn")
+      expect(isolation.summary).toContain("systemctl is-active inucon-team-isolation")
+      for (const k of ["template", "team_slots", "memory", "benchvm", "mode_vm_identity"]) {
+        expect(findCheck(checks, k).status).toBe("pass")
+      }
+    }).pipe(
+      Effect.provide(
+        buildLayer({ proxmoxInventory: { ...healthyInventory, isolationServiceActive: null } })
+      )
+    )
+  )
+
+  it.effect("isolation は observable でないので start required key には含まれない", () => {
+    expect(START_REQUIRED_CHECK_KEYS).not.toContain("isolation")
+    return Effect.void
+  })
 
   it.effect("template が存在しなければ template=fail、team_slots/isolation は独立に判定される", () =>
     Effect.gen(function* () {

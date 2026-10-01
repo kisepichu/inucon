@@ -8,24 +8,57 @@ reconciliation)。本 report は Task 15 Step 12 の deliverable。
 runbook / verification (Task 15 Step 1-3) の完了、および人手フェーズ (Task
 15 Step 4-11) の rollout evidence を残す。
 
+**状態 (2026-09-23):** Step 6 (merge / image import / manifest apply) と
+Step 8 の突合部分までが完了。**Step 4 / Step 5 は実施できなかった**
+(§B-1 / §B-2 — 値を埋めず「実施せず」として確定)。Step 7 の benchvm 側、
+Step 9 / 10 / 11 は未実施。未実施項目には実行コマンドと期待結果を
+書いてあり、`TBD: <human>` は**人手でまだ実施していない値にのみ**残す。
+
+**値の扱い:** 本 report の実測値は 2026-09-22 / 09-23 に実機
+(apphost `192.0.2.20` / eevee `192.0.2.10` / 公開 API
+`http://192.0.2.20:30080`) から取得したもので、各節に再導出コマンドを
+併記した。再導出して値が変わったら、変わったこと自体を追記する。
+
 **Secret handling:** この report に token / API key / Cloudflare secret /
-Access 許可 email / SSH 鍵 / Authorization header / OAuth secret を絶対
-に書き込まない。値はすべて `../nixos-config-private/secrets/*.age`
-(agenix) 側で管理する。commit 前に `grep -E
-'token|secret|password|email|Authorization|Bearer'` で本ファイルを走査
-すること。
+Access 許可 email / SSH 鍵 / Authorization header / OAuth secret / age
+平文を絶対に書き込まない。値はすべて
+`../nixos-config-private/secrets/*.age` (agenix) 側で管理する。
+hostname / VMID / commit hash / SHA-256 / LAN IP / MAC / **Secret の
+キー名**は記載可。commit 前に本ファイルを走査すること:
+
+```sh
+grep -inE 'ghp_|github_pat_|PVEAPIToken=|Bearer |BEGIN [A-Z ]*PRIVATE KEY|@gmail|@users\.noreply|AGE-SECRET-KEY' \
+  docs/superpowers/reviews/2026-08-13-contest-lifecycle-rollout.md
+```
+
+`AGE-SECRET-KEY` は age 秘密鍵 (`AGE-SECRET-KEY-1...`) のプレフィックス。
+上の禁止事項に age 平文を挙げている以上、走査コマンド側にも必ず含める
+(このパターンが漏れていたのを PR #72 review round 3 で指摘され追加した)。
+唯一の想定ヒットはこの走査コマンド自身の行なので、
+`grep -v` で除くか行番号で確認する。
 
 ## 前提
 
-- Task 14 実施状態 (2026-08-18 時点):
-  - Proxmox pool: `inucon-team-vms` (template `9100` 収容)。
+- Task 14 実施状態 (2026-08-18 実施、2026-09-23 に実機再確認):
+  - Proxmox pool: `inucon-team-vms` (comment `INUCON team VMs (Task14)`、
+    member は `vmid 9100` のみ)。
   - users: `inucon-provision@pve`, `inucon-mode@pve` (password なし)。
-  - tokens: 両 user に `portal-2026-08-18a` サフィックスの API token を
-    2 本発行済み。旧 `portal@pve!inucon` は Step 7 の smoke 完了確認まで
-    温存。
+  - tokens: 両 user に `portal-2026-08-18a` (`privsep=0`) を 1 本ずつ。
+    旧 `portal@pve!inucon` は Step 7 の smoke 完了確認まで温存 —
+    **2026-09-23 時点で未 revoke** (Section C 参照)。
+  - custom role: `InuconMode` = `VM.Audit,VM.Config.Options,VM.PowerMgmt`
+    / `InuconNodeAudit` = `Sys.Audit` / `InuconProvisionVm` =
+    `VM.Allocate,VM.Audit,VM.Clone,VM.Config.Cloudinit,VM.Config.Disk,`
+    `VM.Config.Network,VM.Config.Options,VM.GuestAgent.Audit,`
+    `VM.GuestAgent.Unrestricted,VM.PowerMgmt`。
   - storage: **`local-zfs`** (plan 本文の `local-lvm` は誤記、Task 15
-    で修正済み。commit `TBD: <human>` — plan storage fix commit の
-    hash)。
+    で修正済み。commit `0a009d7` = PR #68 squash merge)。実機 ACL も
+    `PVEDatastoreUser on /storage/local-zfs` で一致。
+
+  再導出:
+  ```sh
+  ssh root@192.0.2.10 'pveum pool list; pveum acl list; pveum role list'
+  ```
 
 - sub-agent 担当 (Task 15 Step 1-3, 12):
   - runbook: `docs/runbooks/contest-recovery.md` 新規作成、
@@ -65,8 +98,16 @@ Access 許可 email / SSH 鍵 / Authorization header / OAuth secret を絶対
   への誘導を冒頭に追加)。
 - 更新: `README.md` (主要ドキュメントに recovery runbook を追加)。
 
-commit: `TBD: <human>` — runbook + storage typo fix commit hash
-(`git log --oneline feat/contest-rollout-docs` から)
+commit: `0a009d7` (`docs(contest): recovery runbook + rollout evidence
+template (Task 15 sub-agent scope) (#68)`、2026-08-18)。PR #68 は squash
+merge なので runbook / rollout template / plan storage typo fix
+(`local-lvm` → `local-zfs`) の 3 点すべてがこの 1 commit に入っている。
+
+再導出:
+```sh
+git log --oneline -S 'local-zfs' -- \
+  docs/superpowers/plans/2026-08-13-contest-lifecycle-automation.md
+```
 
 ### A-2. 完全 verification
 
@@ -100,125 +141,566 @@ AMD Ryzen 5 3600X)。実行時刻 (UTC): 2026-08-18T02:11Z 〜 2026-08-18T02:14Z
 
 ### A-3. PR / review
 
-- PR: `TBD: <human>` (`gh pr view <n> --json url,mergeCommit,state`
-  の抜粋。マージ後の develop commit hash を残す)
-- review workflow: `/pr-review claude`
-  - round 1 findings: `TBD: <human>` 件、対応: `TBD: <human>`。
-  - round 2 findings: `TBD: <human>` 件、対応: `TBD: <human>`。
-  - round 3 findings: `TBD: <human>` 件、対応: `TBD: <human>`。
-  - 4 round 目に達した場合: high/critical のみ対応、それ以外は
-    follow-up として PR コメントで受領 (`TBD: <human>` にコメント URL)。
-  - max-turns 失敗時の `@claude review` 再トリガ有無: `TBD: <human>`。
-- develop merge commit: `TBD: <human>`
+- PR: <https://github.com/kisepichu/inucon/pull/68>
+  (`feat/contest-rollout-docs` → `develop`、state `MERGED`、
+  merge commit `0a009d7267e55d87e7648f4b20801adab23b8707`、
+  merged at 2026-08-18T02:53:52Z)
+- review workflow: `/pr-review claude` — 3 round すべて発火し、
+  round ごとに findings → 修正 commit → 再トリガを回した。
+
+  | round | trigger (UTC) | claude 応答 (UTC) | findings | 対応 commit |
+  | --- | --- | --- | --- | --- |
+  | 1 | 2026-08-18T02:16:40Z | 2026-08-18T02:22:14Z | 2 (correctness + accuracy) | `b22b89d` |
+  | 2 | 2026-08-18T02:25:30Z | 2026-08-18T02:34:21Z | 2 (correctness + data residue) | `3b1dab9` |
+  | 3 | 2026-08-18T02:36:34Z | 2026-08-18T02:50:19Z | 2 (accuracy + input validation) | `fed1171` |
+
+  - round 1: (a) §10 migration rollback の WAL/SHM 削除が
+    `kubectl run --rm` で既に消えた pod を `exec` しようとしていた
+    (WAL replay が restore を巻き戻す) → busybox の command に畳んだ。
+    (b) §12 の cancel SQL が `OperationRepo.cancel` の
+    `operation_steps` UPDATE を欠いており「等価」表記が不正確だった。
+  - round 2: (a) §12 の 2 つの UPDATE が非結合で、
+    `blocked` → `running` への race で operations UPDATE が 0 行でも
+    steps UPDATE が走る TOCTOU → `AND (SELECT status FROM operations
+    WHERE id='$OP') = 'canceled'` の subquery guard を追加。
+    (b) §10 の `rm /tmp/portal-restore.db` が `&&` 依存で、
+    `kubectl run` 失敗時に全開催回分の生 DB が apphost `/tmp` に残る →
+    `trap ... EXIT` に変更。
+  - round 3: (a) §5 の「scheduler が `enter_contest_mode` を再 enqueue
+    する」が誤り (`contestScheduler.ts` は `tickFinalize` /
+    `tickRevokeAccess` / `tickCleanup` のみ) → operator が Admin Web から
+    再リクエストする手順に訂正。(b) §12 の `$OP` が shell 展開で SQL に
+    直挿入されるため UUID v4 regex による事前 abort を追加。
+  - 4 round 目には達していない (round cap = 3 で `fed1171` 時点で
+    ループを閉じた)。follow-up コメント URL は発生せず。
+  - max-turns 失敗による `@claude review` 再トリガ: **なし**。3 round
+    すべて 1 回のトリガで完走した。
+- **inline comment は 1 件も投稿されていない** (実測:
+  `gh api repos/kisepichu/inucon/pulls/68/comments` = 0 件)。findings は
+  すべて top-level issue comment として届いた。sentinel 文字列が
+  `CLAUDE_REVIEW: 2 issue(s) -- see inline comments` と inline を名乗る
+  ため紛らわしいが、実体は summary comment である。§C-2 参照。
+- develop merge commit: `0a009d7`
 - release notes / changelog に相当する Contest 変更点: このリポジトリは
   changelog を持たないため PR description に集約。
+
+再導出:
+```sh
+gh pr view 68 -R kisepichu/inucon --json url,state,mergeCommit,mergedAt
+gh pr view 68 -R kisepichu/inucon --json comments \
+  --jq '.comments[] | "[\(.createdAt)] \(.author.login)"'
+gh api repos/kisepichu/inucon/pulls/68/comments --jq 'length'
+```
 
 ---
 
 ## Section B: 人手担当 (Task 15 Step 4-11)
 
-以下は human operator が rollout 実施時に埋める。sub-agent は雛形のみ
-提供する。すべての `TBD: <human>` に値を入れた commit を別途作る。
+実施日: **2026-09-22 〜 2026-09-23** (plan 策定は 2026-08-13、Task 14 は
+2026-08-18)。以下は human operator が実施した結果の記録。
 
-### B-1. Step 4 — Pre-migration off-host snapshot
+**plan からの逸脱・rollout 中に発覚した欠陥のサマリ:**
 
-- ホスト: `TBD: <human>` (WSL 側 `~/backups/inucon/` mode 0700)
-- ファイル名: `portal-before-multi-contest-<UTC>.db` (実際の UTC:
-  `TBD: <human>`)
-- Job 完了時刻 (UTC): `TBD: <human>`
-- SHA-256 (off-host 計算): `TBD: <human>`
-- `PRAGMA integrity_check` 結果: `TBD: <human>` (期待: `ok`)
-- CLI JSON metadata の SHA-256 との一致: `TBD: <human>` (期待: match)
-- backup Job のみ削除・Deployment 未変更を確認: `TBD: <human>`
+| # | 種別 | 内容 | 記録先 |
+| --- | --- | --- | --- |
+| 1 | 逸脱 (重大) | Step 4 の pre-migration snapshot を**取得できなかった** | §B-1 |
+| 2 | 逸脱 (重大) | Step 5 の dry-run migration を**実施できなかった** | §B-2 |
+| 3 | 欠陥 (未発火) | `modeVmIds.ts` の devvm/benchvm VMID が実機と逆 | §B-9 |
+| 4 | 障害 (復旧済) | `inucon.kisen.one` が 35 日間 502 | §B-10 |
+| 5 | 前提崩れ | apphost の LAN IP が `.156` に流れ `PORTAL_URL` と不一致 | §B-11 |
+| 6 | 欠陥 (修復済) | claude-review CI が両 repo で機能していなかった | §C-2 |
 
-### B-2. Step 5 — Dry-run migration の突合
+逸脱 1・2 は同一原因 (§B-1) で、**値を後から埋めることは原理的に不可能**。
+`TBD: <human>` を残さず「実施せず」と確定させる。
 
-- コピー先: `/tmp/inucon-migration-dry-run.<pid>/portal.db`
-- 対象 image / migrator commit: `TBD: <human>`
-- edition1 metadata (Contest 行、edition, name, dates): `TBD: <human>`
-- scores: 1077 / 910 (期待値)、実測 `TBD: <human>`
-- instance status 分布: `TBD: <human>`
-- job counts (queued / running / finished / failed / canceled):
-  `TBD: <human>`
-- `PRAGMA foreign_key_check`: `TBD: <human>` (期待: 空)
-- 差分検知 → 中断有無: `TBD: <human>`
+### B-1. Step 4 — Pre-migration off-host snapshot → **実施せず**
+
+**結論: 取得できなかった。値は存在しない。**
+
+#### 何が起きたか
+
+plan Step 4 は次を前提にしていた (plan L1496、原文):
+
+> build/import the reviewed feature image **without changing the running
+> Deployment**
+
+この前提が構造的に成立しなかった。apphost 側の実体:
+
+| 要素 | 実測値 | 帰結 |
+| --- | --- | --- |
+| Deployment の image 参照 | `ghcr.io/kisepichu/inucon-portal:latest` (`deploy/k8s/deployment.yaml:33`) | **可変 tag** |
+| `imagePullPolicy` | `IfNotPresent` | node 上の同名 tag をそのまま使う |
+| rollout 直前の pod 状態 | `CrashLoopBackOff` (§B-10)、backoff 上限 5 分で再起動を継続 | 数分以内に必ず次の起動が来る |
+| portal 起動時の migration | `MigratorLive` が `HttpLive` / `WorkerLive` の依存 (`portal/src/main.ts:314-462`)、無条件・serve 前に実行 | 起動 = migration 適用 |
+
+`k3s ctr images import` で `:latest` を新 image に差し替えた瞬間、
+Deployment を一切触っていないのに **次の CrashLoop 再起動が新 image で
+立ち上がり、migration 0004-0007 が本番 DB に適用された** (適用時刻
+`2026-09-22 13:38:25`)。Deployment 更新も `kubectl apply` も不要だった。
+
+#### なぜ「import と Deployment 更新を分離する」が破れたのか
+
+分離が成立する条件は「Deployment が指す image 参照を import が変えない」
+こと。**immutable な参照 (digest 固定、または import 専用の別 tag) で
+あれば成立するが、可変 tag `:latest` + `IfNotPresent` の組み合わせでは
+import 自体が Deployment の解決先を書き換える**。さらに pod が
+CrashLoopBackOff で自動再起動を続けていたため、「apply しなければ
+再起動しない」という暗黙の前提も同時に崩れていた。plan はこの 2 点を
+どちらも明示していない。
+
+#### 次回この手順を踏む人への回避策 (いずれか必須)
+
+1. **import 前に `kubectl -n inucon scale deploy/inucon-portal
+   --replicas=0`**。backup Job は DB PVC を直接 mount するので portal が
+   0 replica でも取得できる (むしろ SQLite の排他上そのほうが安全)。
+   snapshot と dry-run が終わってから `--replicas=1` に戻す。
+2. **import は検証用の別 tag で行う** (`:8771812-verify` 等)。
+   Deployment が指す `:latest` を上書きしない限り、既存 pod が
+   何度再起動しても旧 image のままになる。
+3. **恒久対策: Deployment の image をタグではなく digest で固定する**
+   (`ghcr.io/kisepichu/inucon-portal@sha256:...`)。可変 tag を production
+   Deployment が参照している限り、import は常に deploy と等価である。
+
+plan / runbook 側に 1 か 2 を明文化するのが follow-up (§C-3 #1)。
+
+#### 代償措置 (実施済)
+
+migration 前に戻れない以上、「migration 後の状態を独立に検証して固定
+する」ことに切り替えた。
+
+- migration 適用**後**の snapshot を即時取得し、on-PVC + off-host の
+  2 箇所に保持 (§B-3-2)
+- off-host コピーに対して live DB とは独立に `PRAGMA integrity_check` /
+  `PRAGMA foreign_key_check` / 全テーブル件数照合を実行 (§B-5)
+- 公開 API 経由で edition1 の metadata と score が期待値どおりである
+  ことを確認 (§B-5)
+
+#### 残存リスク
+
+- **migration 前の状態へ戻す手段が無い。** `docs/runbooks/contest-recovery.md`
+  §10 (migration rollback) は pre-migration snapshot の存在を前提として
+  いるため、**edition1 に対しては発動できない**。0004-0007 に起因する
+  データ欠損が後から見つかっても復元できない。
+- 緩和: 現時点の検証 (integrity / FK / 件数 / score / metadata) がすべて
+  期待どおりであることと、edition1 が `finished` で以後 write されない
+  ことにより、実害が顕在化する経路は限定的。ただし**これは検出であって
+  復旧手段ではない**。
+- 次回 (edition2 以降) の migration では §B-1 の回避策 1 か 2 を
+  必ず適用し、Step 4/5 を本来の順序で実施する。
+
+### B-2. Step 5 — Dry-run migration の突合 → **実施せず**
+
+**結論: 実施できなかった。値は存在しない。**
+
+理由は §B-1 と同一。dry-run の入力である pre-migration snapshot が
+存在せず、本番 DB は既に 0004-0007 適用済だったため、「migration 前の
+コピーに migration を当てて差分を見る」という手順が**事後に再現不可能**に
+なった。`/tmp/inucon-migration-dry-run.<pid>/portal.db` は作成していない。
+
+plan が dry-run で検証しようとしていた各項目は、代わりに
+**本番適用後の実測**として §B-5 に記録した。これは「適用前に止める」
+という dry-run 本来の目的 (plan L1500: *"Any mismatch stops rollout
+before production DB or deployment changes"*) を**満たさない**:
+差分を検知しても既に production DB は変更済で、止める先が無い。
+
+| plan Step 5 の検証項目 | dry-run | 事後実測での代替 |
+| --- | --- | --- |
+| exact row counts | 実施せず | §B-5 件数表 (live / off-host 一致) |
+| edition1 metadata | 実施せず | §B-5 (公開 API + DB 直読) |
+| scores 1077 / 910 | 実施せず | §B-5 (実測一致) |
+| instance status | 実施せず | §B-5 (`vmid=1101` / `running` 1 行) |
+| job counts | 実施せず | §B-5 (`finished` 4 / `failed` 2) |
+| `PRAGMA foreign_key_check` | 実施せず | §B-5 (空) |
+| 差分検知 → rollout 中断 | **不可能** | — (止める先が無い) |
 
 ### B-3. Step 6 — Merge / manifest apply / image import
 
-- INUCON PR (feature): `TBD: <human>` (URL + merge commit)
-- INUCON PR (develop → main): `TBD: <human>` (URL + merge commit)
-- `nixos-config-private` credential PR: `TBD: <human>`
-- main commit for image build: `TBD: <human>`
-- image digest (apphost `k3s ctr images list` 側):
-  `TBD: <human>` (`sha256:...`)
-- rollout status: `TBD: <human>` (`kubectl -n inucon rollout status
-  deployment/inucon-portal`)
-- backup PVC apply 確認: `TBD: <human>` (Bound, mount path
-  `/backups`)
+#### B-3-1. Merge
+
+| 対象 | PR | base | merge commit | 内容 |
+| --- | --- | --- | --- | --- |
+| INUCON | [#68](https://github.com/kisepichu/inucon/pull/68) | develop | `0a009d7` | Task 15 runbook + rollout template + plan `local-lvm`→`local-zfs` 訂正 |
+| INUCON | [#69](https://github.com/kisepichu/inucon/pull/69) | develop | `acab772` | VMID 反転修正 + fail-closed name 検証 (§B-9) |
+| INUCON | [#70](https://github.com/kisepichu/inucon/pull/70) | **main** | `8771812` | release: develop → main |
+| INUCON | [#71](https://github.com/kisepichu/inucon/pull/71) | develop | `a33d964` | CI: allowlist から `find` 除去 + turn 予算 80 (§C-2) |
+| nixos-config-private | #35 | main | `6b34f25` | Task 14 agenix credential 管理 (2026-08-18 merge) |
+| nixos-config-private | #36 | main | `775ae7d` | `eevee-mode.sh` の ProxyJump 既定を LAN 直結化 + 共有 lib 抽出 |
+| nixos-config-private | #37 | main | `46eadbf` | claude-review に `allowedTools` + concurrency を job level へ (§C-2) |
+| nixos-config-private | #38 | main | `6848e77` | claude-review の turn 予算 80 (§C-2) |
+
+実装フェーズ (Task 1-13) の PR: #55 (Task 1) / #56 (Task 2+3 atomic) /
+#57 (Task 4) / #59 (Task 5) / #60 (Task 6) / #61 (Task 7) / #62 (Task 8) /
+#63 (Task 9) / #64 (Task 10) / #65 (Task 11) / #66 (Task 12) /
+#67 (Task 13)。すべて `develop` に merge 済。
+
+- main commit for image build: **`8771812`** (`Merge pull request #70 from
+  kisepichu/develop`)
+- 本 report 作成時の develop tip: `a33d964`
+
+#### B-3-2. Image build / 配布
+
+- image ID: `sha256:cc7e687da9b1627e71bbdcc9b1c78dd1a0260b757a7d451db5aac0793d690234`
+- arch `amd64/linux`、node v22.23.2
+- size: workstation の docker 計上 `302879029` bytes / apphost node の
+  containerd 計上 `314905688` bytes (**同一 image**。docker と containerd
+  で層サイズの数え方が違うだけ。同一性の根拠は image ID の一致)
+- tag: `ghcr.io/kisepichu/inucon-portal:latest` および `:8771812`
+  (同一 image ID に 2 tag)
+- **registry は使っていない。** `docker save | gzip` → `scp` →
+  `sudo k3s ctr images import`。転送 tarball
+  `/tmp/inucon-portal.tar.gz` は 109400740 bytes (105 MiB)、SHA-256
+  `d1e2167ea92306ce852fdb894978293095f38236a98a2b268440d4f433773a21`。
+  import 時点で workstation 側と apphost 側の一致を確認済。
+  apphost 側の copy は import 後に削除済のため、現在は workstation 側
+  (`/tmp/inucon-portal.tar.gz`) でのみ再計算できる。
+- この可変 tag `:latest` への import が §B-1 の逸脱を引き起こした。
+
+#### B-3-3. Manifest apply
+
+適用順序が重要:
+
+1. `deploy/k8s/backup-pvc.yaml` (新規、`inucon-portal-backups` 5Gi
+   `local-path` RWO)
+2. `deploy/k8s/deployment.yaml`
+
+`deployment.yaml` は `/backups` mount を要求する
+(`deploy/k8s/deployment.yaml:54-55,79-81`) ので、**PVC を先に作らないと
+Pod が Pending で詰まる**。
+
+#### B-3-4. Rollout 結果 (2026-09-23 実測)
+
+| 項目 | 実測 |
+| --- | --- |
+| pod | `inucon-portal-85657d8678-svcwv` **1/1 Running、restarts 0** |
+| pod 起動時刻 | 2026-09-22T13:43:13Z |
+| node | apphost (10.42.0.23) |
+| container image (解決後) | `ghcr.io/kisepichu/inucon-portal:8771812` |
+| container imageID | `sha256:cc7e687da9b1627e71bbdcc9b1c78dd1a0260b757a7d451db5aac0793d690234` |
+| PVC `inucon-portal-data` | Bound (1Gi) |
+| PVC `inucon-portal-backups` | Bound (5Gi, `pvc-404bd3d5-797c-45c9-a1fe-8572f90fea13`) |
+| `BACKUP_PATH` | `/backups` (注入確認済) |
+| `/backups` mount | 確認済 (`portal-post-migration-0007-20260922T134215Z.db` 212992 bytes) |
+
+再導出:
+```sh
+ssh kise@192.0.2.20 'kubectl -n inucon get deploy,pod,pvc -o wide
+  kubectl -n inucon get pod inucon-portal-85657d8678-svcwv \
+    -o jsonpath="{.status.containerStatuses[0].imageID}"
+  kubectl -n inucon exec deploy/inucon-portal -- printenv BACKUP_PATH
+  kubectl -n inucon exec deploy/inucon-portal -- ls -l /backups'
+```
+
+#### B-3-5. Migration 適用結果
+
+すべて `2026-09-22 13:38:25` に適用 (pod 起動 13:43:13 の直前、
+CrashLoop 再起動での適用):
+
+| id | name |
+| --- | --- |
+| 4 | `contest_lifecycle` |
+| 5 | `multi_contest` |
+| 6 | `operations` |
+| 7 | `runner_agent_revision_text` |
+
+既存分: 1 `initial` (2026-07-10) / 2 `selfservice` / 3
+`failed_reserves_slot` (いずれも 2026-07-18)。計 7 行。
+
+live DB の検証 (2026-09-23 再実測):
+
+| check | 結果 |
+| --- | --- |
+| `PRAGMA integrity_check` | `ok` |
+| `PRAGMA foreign_key_check` | 空 (0 行) |
+| `journal_mode` | `wal` |
+| `page_size` | 4096 |
+
+再導出:
+```sh
+ssh kise@192.0.2.20 'kubectl -n inucon exec -i deploy/inucon-portal -- node -' <<'EOF'
+const D=require("/app/node_modules/.pnpm/better-sqlite3@12.11.1/node_modules/better-sqlite3")
+const db=new D("/data/portal.db",{readonly:true})
+console.log(JSON.stringify(db.prepare(
+  "SELECT * FROM effect_sql_migrations ORDER BY migration_id").all()))
+console.log(JSON.stringify(db.pragma("integrity_check")),
+            JSON.stringify(db.pragma("foreign_key_check")))
+EOF
+```
+
+#### B-3-6. Post-migration snapshot
+
+Step 4 が実施できなかった代償措置 (§B-1) として取得。
+
+| 項目 | 値 |
+| --- | --- |
+| on-PVC | `/backups/portal-post-migration-0007-20260922T134215Z.db` |
+| off-host | `/home/kise/backups/inucon/portal-post-migration-0007-20260922T134215Z.db` |
+| off-host ディレクトリ mode | `0700` |
+| SHA-256 | `4eee004cb35a3645296f709a199ea41e372a712dacf6d9c1cb53289fb91b24ca` |
+| sizeBytes | `212992` |
+| 3 者一致 | backup CLI の JSON metadata / on-PVC 実体 / off-host コピーで SHA-256 一致を確認 |
+
+- 取得手段: `ghcr.io/kisepichu/inucon-portal:8771812` からの一発 Job
+  (`node portal/dist/cli/backup.js --source /data/portal.db --destination
+  ...`)。portal main / migrator には非依存。Job は完了後に削除、PVC は保持。
+- **ファイル名の訂正:** 当初 plan Step 4 が `--destination` に指定する
+  リテラル (plan L1496: `portal-before-multi-contest-<UTC timestamp>.db`)
+  をそのまま使ったが、実態は migration **後**の snapshot であり名前と
+  逆で監査上危険なため `portal-post-migration-0007-...` に改名した。
+  backup CLI は名前を生成せず `--destination` を必須引数として受け取る
+  (`portal/src/cli/backup.ts:34,48-53`) ので、これは operator 側の
+  手順ミスであって CLI の挙動ではない。
+
+再導出:
+```sh
+sha256sum /home/kise/backups/inucon/portal-post-migration-0007-20260922T134215Z.db
+stat -c '%a %n' /home/kise/backups/inucon
+ssh kise@192.0.2.20 'kubectl -n inucon exec deploy/inucon-portal -- ls -l /backups'
+```
 
 ### B-4. Step 7 — Nix secret deploy と旧資格情報の retire
 
-- apphost `nixos-rebuild switch` (人手): `TBD: <human>` (時刻 UTC)
-- k3s Secret `inucon-portal-env` の **キー名のみ** 一覧
-  (`kubectl -n inucon get secret inucon-portal-env -o jsonpath='{.data}'
-  | jq keys`): `TBD: <human>` (値を書かない)
-- portal health: `TBD: <human>` (`curl -s -o /dev/null -w '%{http_code}\n'
-  https://inucon.kisen.one/api/health` = 200)
-- Proxmox provision credential read-only inventory 実行結果:
-  `TBD: <human>`
-- Proxmox mode credential read-only inventory 実行結果:
-  `TBD: <human>`
-- Smoke Operation (canary VMID `TBD: <human>`) 結果:
-  absent → clone → observe → delete → absent すべて `TBD: <human>`
-- Mode credential smoke (onboot re-write on 9200 / 9300): `TBD: <human>`
-- `pveum acl list` 差分 (Task 14 前後): `TBD: <human>`
-- `/etc/pve/user.cfg` snapshot 保存先 (mode 0700 off-host):
-  `TBD: <human>`
-- 旧 token `portal@pve!inucon` の revoke 実施 (人手, `pveum user token
-  remove`): `TBD: <human>`
-- 旧平文 EnvironmentFile 削除 (`/home/kise/.inucon/runner-env` 等):
-  `TBD: <human>`
+**状態: apphost 側は完了、benchvm 側と旧資格情報の retire は未実施。**
+
+#### B-4-1. 実施済 (apphost)
+
+- apphost `nixos-rebuild switch`: 実施済 (2026-08-18)。この switch が
+  k3s Secret `inucon-portal-env` を旧 2 変数から split 4 変数へ
+  置き換えたことが §B-10 の 502 の直接の引き金になった。
+- k3s Secret `inucon-portal-env` の **キー名のみ** (値は一切記載しない、
+  2026-09-23 実測 16 キー):
+
+  ```
+  ADMIN_GITHUB_LOGINS      BASE_URL
+  CF_ACCOUNT_ID            CF_API_TOKEN
+  CF_TUNNEL_ID             CF_ZONE_ID
+  GITHUB_CLIENT_ID         GITHUB_CLIENT_SECRET
+  PROXMOX_API_URL          PROXMOX_TLS_FINGERPRINT
+  PROXMOX_MODE_TOKEN_ID    PROXMOX_MODE_TOKEN_SECRET
+  PROXMOX_PROVISION_TOKEN_ID  PROXMOX_PROVISION_TOKEN_SECRET
+  RUNNER_MAX_AGE_MILLIS    RUNNER_TOKEN
+  ```
+
+  旧 `PROXMOX_TOKEN_ID` / `PROXMOX_TOKEN_SECRET` は**存在しない**
+  (Task 14 で削除済)。これが §B-10 の根拠。
+- portal health: `https://inucon.kisen.one/` → **200**、
+  `https://inucon.kisen.one/api/health` → **200** (2026-09-23 実測)
+- `pveum acl list` (2026-09-23 実測、Task 14 後の状態):
+
+  | path | role | user | propagate |
+  | --- | --- | --- | --- |
+  | `/` | `Administrator` | `terraform@pve` | 1 |
+  | `/` | `InuconPortal` | `portal@pve` | 1 (**旧・未 revoke**) |
+  | `/nodes/eevee` | `InuconNodeAudit` | `inucon-mode@pve` | 1 |
+  | `/nodes/eevee` | `InuconNodeAudit` | `inucon-provision@pve` | 1 |
+  | `/pool/inucon-team-vms` | `InuconProvisionVm` | `inucon-provision@pve` | 1 |
+  | `/storage/local-zfs` | `PVEDatastoreUser` | `inucon-provision@pve` | 1 |
+  | `/vms/9200` | `InuconMode` | `inucon-mode@pve` | 1 |
+  | `/vms/9300` | `InuconMode` | `inucon-mode@pve` | 1 |
+
+- 権限分離の実機検証 (2026-08-18 実施): provision は `/vms/9200` に
+  ACL を持たずアクセス不可、mode は `VM.Audit` / `VM.Config.Options` /
+  `VM.PowerMgmt` のみ。上の ACL 表と role 定義 (§前提) が裏付けになる。
+- Smoke Operation (canary VMID) / mode credential smoke
+  (onboot re-write on 9200 / 9300): 2026-08-18 に実施済。
+  個別の実行 ID / 時刻は当時記録していない — `TBD: <human>`
+  (再実施するなら Admin Web の Operations タブから同じ smoke を
+  回して Operation ID を残す)。
+
+#### B-4-2. 未実施
+
+| # | 作業 | 実行コマンド | 期待結果 |
+| --- | --- | --- | --- |
+| 1 | benchvm 起動 | `cd ~/repos/nixos-config-private && ./scripts/eevee-mode.sh contest` | devvm graceful shutdown → benchvm start。PR #36 以降は環境変数なしで LAN 直結 |
+| 2 | benchvm `nixos-rebuild` | benchvm 上で `sudo nixos-rebuild switch --flake .#benchvm` | runner / cloudflared が agenix 経由の env に切替 |
+| 3 | benchvm 上の旧平文 EnvironmentFile 削除 | `rm /root/.inucon-tunnel-env /home/kise/.inucon/runner-env` | 両ファイルが存在しないこと |
+| 4 | 旧 Proxmox token revoke | `ssh root@192.0.2.10 'pveum user token remove portal@pve inucon'` 後に `pveum acl delete / --user portal@pve --role InuconPortal` | `pveum user token list portal@pve` が空、ACL から `portal@pve` 行が消える |
+
+**#1 は devvm (12288 MB) の graceful shutdown を伴う。** eevee の
+`MemAvailable` 実測は 1277-1985 MiB (2026-09-23 時点で 1985568 kB)
+であり、benchvm の必要量 (4096 + 1024 MiB host reserve = 5120 MiB) に
+届かない。したがって **devvm 停止は省略できない**。
+`eevee-mode.sh` はこの memory guard を実装しており、不足時は起動しない。
+
+**#4 は #1-#3 の smoke 完了後に行う。** 先に revoke すると旧 image への
+rollback 経路が消える。
+
+- `/etc/pve/user.cfg` snapshot 保存先 (mode 0700 off-host): `TBD: <human>`
+  (#4 の直前に `ssh root@192.0.2.10 'cat /etc/pve/user.cfg'` を
+  `/home/kise/backups/inucon/` 配下へ保存する)
 
 ### B-5. Step 8 — Edition1 の突合と archive
 
-- pre-migration との公開 API 差分: `TBD: <human>` (期待: 差分なし)
-- Instance 台帳の team1-1 が残っているか (reconciliation 用):
-  `TBD: <human>`
-- Archive Operation ID: `TBD: <human>`
-- scoreboard JSON SHA-256: `TBD: <human>`
-- scoreboard CSV SHA-256: `TBD: <human>`
-- DB snapshot artifact SHA-256: `TBD: <human>`
-- off-host download 先 (mode 0700): `TBD: <human>`
-- provider mutation が発生していない確認: `TBD: <human>`
+**状態: 突合は完了、archive Operation は未実施。**
 
-### B-6. Step 9 — 初回 reconciliation apply
+#### B-5-1. edition1 metadata (2026-09-23 実測)
 
-- Refresh 後 plan 内容 (要約):
-  - team1-1: missing Proxmox VM + Cloudflare cleanup (期待)、実測
-    `TBD: <human>`
-  - team2-1: unmanaged Cloudflare orphan blocked (期待)、実測
-    `TBD: <human>`
-  - catch-all / portal / 無関係 resource: no action (期待)、実測
-    `TBD: <human>`
-- 選択した adopt hostname: `inucon-team2-1.kisen.one`
+```
+contestId        = 1ed9ebf6-a6fe-412c-a923-364fea1837b3
+edition          = 1
+name             = INUCON
+problemKey       = private-isu
+problemRevision  = legacy-2026-07-08
+templateVmid     = 9100
+status           = finished
+instanceQuota    = 3
+revision         = 1
+scheduledStartAt / scheduledEndAt / accessClosesAt / cleanupAt /
+accessClosedAt / cleanupCompletedAt / startedAt / finalizingAt /
+finishedAt / canceledAt = すべて null
+```
+
+**`status=finished` なのに全 timestamp が null なのは正常。**
+`finishContest` (`portal/src/domain/contest.ts:96-103`) は
+`finalizing → finished` で `finishedAt` を刻む設計なので一見
+データ不整合に見えるが、edition1 は Phase-2 の legacy 行であり
+**そもそも scheduler / Operation の管理下を一度も通っていない**。
+migration 0004 はこれらを back-fill せず意図的に null のまま移行する
+(`portal/src/infrastructure/sql/migrations/0004_contest_lifecycle.ts:19-25`)。
+
+> Phase-2 の legacy 行はどれも scheduler の管理下になかったので、closed
+> timestamps を back-fill せず null のまま残す
+
+安全性の根拠も同 migration のコメントにある: scheduler の due 述語は
+`accessClosesAt <= now AND accessClosedAt IS NULL` であり、
+`accessClosesAt=NULL` の時点で偽になる。したがって Task 12 の
+`revoke_access` / `cleanup` tick が edition1 を誤って掴むことはない。
+
+**この行の timestamp を手で埋めてはならない。** データ破損ではないので、
+補完すると逆に scheduler の due 判定に引っかかり、`finished` の
+edition1 に対して access 剥奪や cleanup が走りうる。
+
+#### B-5-2. score (2026-09-23 実測)
+
+| team | bestScore | latestScore | latestAt |
+| --- | --- | --- | --- |
+| team1 | **1077** | **910** | `1784382401155` |
+| team2-test-name | null | null | null |
+
+plan Step 5 の期待値 (1077 / 910) と一致。互換 endpoint
+`/api/scoreboard` と contest-scoped `/api/contests/<id>/scoreboard` は
+同一 JSON を返す。互換 endpoint `/api/contest` と `/api/contests` も
+同一 Contest を返す。
+
+#### B-5-3. テーブル件数
+
+live DB (2026-09-23) と off-host snapshot
+(`portal-post-migration-0007-20260922T134215Z.db`) の独立照合:
+
+| table | live (09-23) | off-host snapshot (09-22) |
+| --- | --- | --- |
+| contests | 1 | 1 |
+| teams | 2 | 2 |
+| team_members | 2 | 2 |
+| team_invites | 0 | 0 |
+| instances | 1 | 1 |
+| bench_jobs | 6 | 6 |
+| bench_job_logs | 6 | 6 |
+| users | 2 | 2 |
+| sessions | **4** | **3** |
+| operations | 0 | 0 |
+| operation_steps | 0 | 0 |
+| resource_bindings | 0 | 0 |
+| contest_artifacts | 0 | 0 |
+| runner_agents | 0 | 0 |
+| effect_sql_migrations | 7 | 7 |
+
+`sessions` のみ 3 → 4 に増えているが、これは snapshot 取得後の
+admin ログインによるもので、**contest データではない**。他の全テーブルは
+一致する。
+
+#### B-5-4. 内容の突合
+
+- **teams**: team1 (`team_number=1`, `desired_instance_count=1`) /
+  team2-test-name (`team_number=2`, `desired_instance_count=0`)。
+  plan Task 2 の「非 deleted Instance 数を quota で cap」仕様どおり。
+- **instances**: 1 行のみ、`vmid=1101`, `status=running`。
+  設計監査で把握済の「DB と実体の不一致 1 件」がそのまま保存されている。
+  reconciliation (§B-6) の対象として**意図的に残す**。
+- **bench_jobs**: `finished` 4 / `failed` 2、**全件 `purpose='competition'`**。
+  plan Task 2 の backfill 仕様どおり (`purpose` 列は 0004 で追加され、
+  既存行は `competition` で埋まる)。
+
+#### B-5-5. off-host snapshot の独立検証
+
+live DB とは別プロセス (workstation の python3 `sqlite3`) で実行:
+
+| check | 結果 |
+| --- | --- |
+| `PRAGMA integrity_check` | `ok` |
+| `PRAGMA foreign_key_check` | 空 |
+| migrations | 7 行、id 4-7 が `2026-09-22 13:38:25` |
+| edition1 metadata | live と一致 |
+| bestScore | 1077 (live と一致) |
+| 全テーブル件数 | `sessions` を除き live と一致 (上表) |
+
+これが §B-1 の代償措置の中核。**pre-migration snapshot の代わりには
+ならない** (戻せない) が、「適用後の状態が破損していないこと」は
+独立に確定している。
+
+#### B-5-6. 未実施
+
+| 項目 | 実行方法 | 期待結果 |
+| --- | --- | --- |
+| Archive Operation ID | Admin Web → edition1 → Archive | Operation が `succeeded` |
+| scoreboard JSON SHA-256 | artifact ダウンロード後 `sha256sum` | `TBD: <human>` |
+| scoreboard CSV SHA-256 | 同上 | `TBD: <human>` |
+| DB snapshot artifact SHA-256 | 同上 | `TBD: <human>` |
+| off-host download 先 (mode 0700) | `/home/kise/backups/inucon/` | `TBD: <human>` |
+| provider mutation が発生していない確認 | archive 前後で `qm list` / Cloudflare DNS を比較 | 差分なし |
+
+Archive Operation は §B-4-2 #1-#3 (benchvm 起動と agenix 切替) の後に
+readiness を確認してから実行する。
+
+再導出 (突合部分):
+```sh
+curl -sS http://192.0.2.20:30080/api/contests
+curl -sS http://192.0.2.20:30080/api/contests/1ed9ebf6-a6fe-412c-a923-364fea1837b3/scoreboard
+curl -sS http://192.0.2.20:30080/api/scoreboard   # 互換 endpoint
+curl -sS http://192.0.2.20:30080/api/contest      # 互換 endpoint
+python3 -c "import sqlite3;d=sqlite3.connect('file:/home/kise/backups/inucon/portal-post-migration-0007-20260922T134215Z.db?mode=ro',uri=True);print(d.execute('PRAGMA integrity_check').fetchall())"
+```
+
+### B-6. Step 9 — 初回 reconciliation apply → **未実施**
+
+`inucon-team*` の実体 (Proxmox VM / Cloudflare DNS) に触る唯一の
+step であり、§B-4-2 #1-#3 (benchvm 起動 + agenix 切替) が前提。
+
+- 実行方法: Admin Web → Reconciliation → Refresh → plan 確認 → Apply
+- 期待される plan:
+  - team1-1: missing Proxmox VM + Cloudflare cleanup、実測 `TBD: <human>`
+  - team2-1: unmanaged Cloudflare orphan **blocked**、実測 `TBD: <human>`
+  - catch-all / portal / 無関係 resource: no action、実測 `TBD: <human>`
+- 選択する adopt hostname: `inucon-team2-1.kisen.one` (明示 adopt)
 - apply Operation ID: `TBD: <human>`
 - step 遷移: `TBD: <human>` (queued → running → succeeded の時刻)
 - apply Operation 最終 status: `TBD: <human>` (期待: succeeded)
 
-### B-7. Step 10 — Post-cleanup 状態
+**apply 前に必ず確認する**: catch-all / portal / 無関係リソースに
+action が出ていないこと。1 件でも出ていたら apply せず
+`docs/runbooks/contest-recovery.md` §1 (stale plan) に従う。
 
-- 再 reconciliation plan: `TBD: <human>` (期待: 差分なし)
-- edition1 active Instance 数: `TBD: <human>` (期待: 0)
-- Proxmox `inucon-team*` VM 数: `TBD: <human>` (期待: 0)
-- Cloudflare `inucon-team*` DNS 数: `TBD: <human>` (期待: 0)
-- Cloudflare `inucon-team*` tunnel ingress 数: `TBD: <human>`
-  (期待: 0)
-- Cloudflare `inucon-team*` Access app 数: `TBD: <human>` (期待: 0)
-- catch-all record が残存: `TBD: <human>` (期待: 残っている)
-- edition1 score 不変: `TBD: <human>` (期待: rollout 前と一致)
-- portal `/api/health`: `TBD: <human>` (期待: 200)
+### B-7. Step 10 — Post-cleanup 状態 → **未実施**
 
-### B-8. Step 11 — Edition2 draft
+§B-6 の後に実施する再監査。
+
+| 項目 | 確認方法 | 期待 | 実測 |
+| --- | --- | --- | --- |
+| 再 reconciliation plan | Admin Web → Refresh | 差分なし | `TBD: <human>` |
+| edition1 active Instance 数 | Admin Web / DB `instances` | 0 | `TBD: <human>` |
+| Proxmox `inucon-team*` VM 数 | `ssh root@192.0.2.10 'qm list'` | 0 | `TBD: <human>` |
+| Cloudflare `inucon-team*` DNS 数 | Admin Web inventory | 0 | `TBD: <human>` |
+| Cloudflare `inucon-team*` tunnel ingress 数 | 同上 | 0 | `TBD: <human>` |
+| Cloudflare `inucon-team*` Access app 数 | 同上 | 0 | `TBD: <human>` |
+| catch-all record 残存 | 同上 | 残っている | `TBD: <human>` |
+| edition1 score 不変 | `curl .../api/scoreboard` | 1077 / 910 | `TBD: <human>` |
+| portal `/api/health` | `curl -o /dev/null -w '%{http_code}' https://inucon.kisen.one/api/health` | 200 | `TBD: <human>` |
+
+現状の baseline (cleanup 前、2026-09-23 実測): active Instance **1**
+(`vmid=1101`, `running`)、edition1 score 1077 / 910、`/api/health` 200。
+
+### B-8. Step 11 — Edition2 draft → **未実施**
+
+**実開催日程が決まるまで着手しない** (plan Step 11 の条件)。
 
 - edition2 の入力値:
   - team 数: 1 (team1 slot)
@@ -230,35 +712,543 @@ AMD Ryzen 5 3600X)。実行時刻 (UTC): 2026-08-18T02:11Z 〜 2026-08-18T02:14Z
     `TBD: <human>` (約 7 日)
 - 保存後 Contest ID: `TBD: <human>`
 - Readiness 初回チェック: `TBD: <human>` (devvm 保存 + 全 pass 前は
-  `preparing` に上げない)
+  `preparing` に上げない)。`mode_vm_identity` check (§B-9) が
+  start-required key に含まれる点に注意。
+
+### B-9. deploy 前に修正した VMID 反転バグ (INUCON PR #69)
+
+**plan には無い作業。rollout 直前の実機確認で発覚し、deploy をブロック
+して修正した。**
+
+#### B-9-1. 実機実測値 (eevee、2026-09-22 / 2026-09-23 に再確認)
+
+| VM | VMID | name | memory | onboot | status |
+| --- | --- | --- | --- | --- | --- |
+| bench runner | **9200** | `benchvm` | 4096 | 0 | stopped |
+| 開発サーバ | **9300** | `devvm` | 12288 | 1 | running |
+
+再導出:
+```sh
+ssh root@192.0.2.10 'qm list; qm config 9200; qm config 9300'
+```
+
+#### B-9-2. 欠陥の内容
+
+`portal/src/domain/modeVmIds.ts` が `DEVVM_VMID=9200` /
+`BENCHVM_VMID=9300` と、実機と**完全に逆**に定義していた。
+
+結果として新 portal は次の動作をする状態だった:
+
+| 操作 | 意図 | 実際に起きること |
+| --- | --- | --- |
+| `enter_contest_mode` の devvm 停止 step | 開発サーバ (9300) を止める | **bench runner benchvm (9200) を止める** |
+| `enter_contest_mode` の benchvm 起動 step | bench runner (9200) を起動 | **開発サーバ devvm (9300) を起動する** |
+| `return_normal_mode` | 上の逆 | 同様に反転 |
+| readiness の `benchvm` / `memory` 判定 | benchvm の状態を見る | devvm の状態を見て誤判定 |
+
+実害の形: コンテストモードに入ろうとすると **ベンチ実行に必要な
+benchvm が止まり、止めるべき開発サーバ devvm が起動したまま**に
+なる。`memory` check も 4096 と 12288 を取り違えるため、
+メモリ不足の判定が通ってしまう。
+
+#### B-9-3. なぜ未発火だったか
+
+**本番で稼働していた image が Task 8 以前 (旧 image) だったため。**
+皮肉なことに §B-10 の 502 障害 (旧 image が起動できず CrashLoop) が、
+この欠陥コードが本番で一度も実行されない状態を作っていた。
+mode 切替は human が Admin Web から明示的に叩く操作なので、
+deploy 後に誰かが `enter_contest_mode` を押すまでは発火しない。
+**deploy 前に修正できたのは幸運であって、設計上の防御ではない。**
+
+#### B-9-4. 根本原因
+
+**設計 spec に VMID → 名前の mapping が記載されていなかった。**
+`docs/superpowers/specs/2026-08-13-contest-lifecycle-automation-design.md`
+は「devvm を停止して benchvm を起動する」という*名前*での記述に
+終始し、どちらがどの VMID かを書いていない。Task 8 の実装時に
+VMID を**推測**で埋め、レビューでも実機と突き合わせる根拠が
+spec 側に無かったため、その推測がそのまま通った。
+
+裏付けはすべて repo 内に存在していた (実装時に参照されなかっただけ):
+
+| 根拠 | 内容 |
+| --- | --- |
+| `nixos-config-private/scripts/eevee-mode.sh:265-271` | `expected exactly one devvm VM named devvm with VMID 9300` / `...benchvm... with VMID 9200` |
+| `nixos-config-private` commit `9314e96` | `feat(benchvm): add INUCON bench VM (vmid 9200)` |
+| `deploy/README.md:261` | benchvm の IP 確認手順が `qm guest cmd 9200 network-get-interfaces` |
+
+#### B-9-5. 修正内容 (PR #69 → `acab772`)
+
+1. **定数訂正**: `DEVVM_VMID=9300` / `BENCHVM_VMID=9200`。
+2. **observed name による fail-closed 検証** (`modeVmIdentityMismatch`)。
+   power 操作 (`setVmOnBoot` / `shutdownVm` / `startVm`) の**直前**に
+   inventory を再観測し、observed name が期待名 (`devvm` / `benchvm`)
+   と一致しない限り `blocked` にして **retry しない**。
+   呼び出し箇所: `modeOperation.ts:75`、`cleanup.ts:837`、
+   `readiness.ts:304`。
+3. 判定材料は **observed name のみ**。VMID から name を推定・上書き
+   するような逆方向の実装にはしない (それでは mapping のズレを検出
+   できない)。mismatch summary は provider raw response / credential を
+   一切含まない固定文。
+4. readiness に start-required な `mode_vm_identity` check を追加
+   (`readiness.ts:55,289-311`)。名前不一致は `fail`。
+5. `docs/runbooks/contest-recovery.md` §5 / §7 の VMID と参照行番号を
+   訂正し、単発 `qm start` ではなく `eevee-mode.sh {status|normal|contest}`
+   を使うよう変更。
+
+diff 規模: 11 files, +361 / -55。誤 mapping 前提の fixture を実機値に
+訂正したのは `test/support/inMemory.ts` / `readiness.test.ts` /
+`cleanup.test.ts` / `proxmox.test.ts` の 4 ファイル。
+
+検証 (2026-09-23 に `a33d964` で再実行、PR #69 の記載と一致):
+
+| package | 結果 |
+| --- | --- |
+| portal | **713 passed / 2 skipped** (51 files) |
+| portal/web | 33 passed (3 files) |
+| runner | 14 passed (2 files) |
+| 合計 | 760 passed / 2 skipped |
+
+#### B-9-6. 教訓
+
+> **VMID のような外部識別子は、名前で裏取りして fail closed にする。**
+
+外部システムの数値 ID (Proxmox VMID、Cloudflare record ID、zone ID 等)
+は、コード内の定数と実体の対応が**静かにズレうる**。ズレても型は通り、
+テストも fixture が同じ定数を使う限り green になる。防御は次の 2 段:
+
+1. 定数を single source of truth に置く (`domain/modeVmIds.ts`)。
+2. **mutation の直前に、ID ではなく人間可読な名前で実体を再観測し、
+   不一致なら止める。** retry もしない (再観測しても同じ結果なので
+   retry は無意味かつ危険)。
+
+`eevee-mode.sh` は**最初からこの形になっていた** — `qm list` を
+名前で走査し (`:238-250`)、`devvm`=9300 / `benchvm`=9200 が
+ちょうど 1 つずつ見つからなければ即 `exit`
+(`:265-271`)。VMID を決め打ちで `qm shutdown` に渡す実装には
+していない。portal 側が同じ思想を持っていれば、この欠陥は
+「動くが間違っている」ではなく「起動時に止まる」になっていた。
+PR #69 の修正は shell script 側の既存パターンを portal に移植した
+だけである。
+
+### B-10. 復旧した 35 日間の 502
+
+#### B-10-1. 事象
+
+`https://inucon.kisen.one` が **約 35 日間 502** を返していた。
+
+| 項目 | 実測 |
+| --- | --- |
+| 障害中の ReplicaSet | `inucon-portal-5f454478c7` (created 2026-08-18T03:52:35Z) |
+| 復旧後の ReplicaSet | `inucon-portal-85657d8678` (created 2026-09-22T13:43:13Z) |
+| 間隔 | **35 日 9 時間 51 分** |
+| pod 状態 | `CrashLoopBackOff`、restarts 9902 まで到達 |
+| 現在 | `curl -o /dev/null -w '%{http_code}' https://inucon.kisen.one/` → **200** |
+
+restarts 9902 は障害対応時 (2026-09-22) の観測値で、当該 pod は既に
+削除されているため**再導出できない**。CrashLoopBackOff の backoff 上限
+5 分から 35 日で約 10080 回という上界が出るので、値としては整合する。
+ReplicaSet の作成時刻差は現在も再導出可能で、こちらが 35 日という
+期間の一次証拠である。
+
+```
+Error: (Missing data at PROXMOX_TOKEN_ID:
+  "Expected PROXMOX_TOKEN_ID to exist in the process context")
+```
+
+#### B-10-2. 原因
+
+| 側 | 状態 |
+| --- | --- |
+| 稼働していた image | Task 8 **以前**のもの。旧 `PROXMOX_TOKEN_ID` / `PROXMOX_TOKEN_SECRET` を**必須**として読む |
+| k3s Secret `inucon-portal-env` | Task 14 (PR #35、2026-08-18 merge) の agenix 化で旧 2 変数を**削除**し、split 4 変数 (`PROXMOX_{MODE,PROVISION}_TOKEN_{ID,SECRET}`) に置換 |
+
+旧 image は起動時に旧変数名を要求するが、新 Secret にはそれが存在
+しない → 起動失敗 → CrashLoopBackOff。**新 image を deploy して初めて
+整合する状態**を、image を deploy しないまま Secret 側だけ先に作って
+しまった。
+
+#### B-10-3. これは構造的な問題である
+
+この障害の本質は「設定ミス」ではなく、**image と secret の更新順序に
+依存する互換性の窓**である:
+
+```
+旧 image + 旧 env  → 動く
+旧 image + 新 env  → 起動不能   ← 35 日間ここに居た
+新 image + 旧 env  → 起動不能
+新 image + 新 env  → 動く
+```
+
+env 変数の**リネーム**は、image と Secret を**同時に**切り替えない
+限り必ず不整合期間を作る。しかも両者は別リポジトリ
+(`inucon` / `nixos-config-private`) の別 PR で管理されており、
+アトミックに切り替える手段が無い。
+
+回避策 (いずれか):
+
+1. **移行期間を作る**: 新 image が旧変数名も fallback として受理する
+   期間を設け、Secret 切替 → image 切替 → fallback 削除 の 3 段で回す。
+2. **Secret を追加のみにする**: 旧 2 変数を削除せず新 4 変数を
+   *追加*し、image 切替後に旧 2 変数を消す。今回はこれをしていれば
+   障害は起きなかった。
+3. **起動失敗を検知する**: `CrashLoopBackOff` が 35 日間誰にも
+   気づかれなかったこと自体が別の問題。外形監視が無い。
+
+現状は 2 も 3 も未実装 (§C-3)。
+
+#### B-10-4. 切り分け結果
+
+**502 は portal pod 単独の問題**で、tunnel 側とは無関係だった。
+
+- apphost の cloudflared は正常稼働 (deployment `cloudflared` 2/2
+  Running、age 100d、直近 restart は 66 日前)。sshd も正常。
+- `inucon.kisen.one` は **apphost のローカル ingress 経由**。
+  benchvm の tunnel はチーム SSH 用であり、この経路には関与しない。
+- したがって benchvm が停止していたことは 502 の原因ではない。
+
+再導出:
+```sh
+ssh kise@192.0.2.20 'kubectl -n inucon get rs \
+  -o custom-columns=NAME:.metadata.name,AGE:.metadata.creationTimestamp
+  kubectl -n cloudflared get deploy,pod -o wide
+  kubectl -n inucon get secret inucon-portal-env \
+    -o go-template="{{range \$k,\$v := .data}}{{\$k}}{{\"\n\"}}{{end}}"'
+curl -sS -o /dev/null -w '%{http_code}\n' https://inucon.kisen.one/
+```
+
+### B-11. apphost の IP 固定 (Step 7 の前提条件)
+
+#### B-11-1. 問題
+
+apphost は NetworkManager の DHCP で `192.0.2.156` を掴んでいた。
+一方:
+
+- docs 全体が `192.0.2.20` 前提
+- `nixos-config-private/secrets/runner-env.age` の `PORTAL_URL` が
+  `http://192.0.2.20:30080` を**焼き込んでいる**
+
+結果、**benchvm の runner が portal に到達できない**状態だった。
+§B-4-2 #1-#2 (benchvm 起動 + agenix 切替) を実行しても runner が
+機能しないため、先に解消する必要があった。
+
+#### B-11-2. 対処 — ルータ側 DHCP 予約 (採用)
+
+選択肢は (a) apphost 側で static IP を設定 / (b) ルータで DHCP 予約。
+**(b) を採用**。apphost は NixOS 管理下だが NetworkManager の DHCP を
+使っており、host 側を static にすると nixos-config 側の変更が必要で
+`nixos-rebuild` の失敗が即ネットワーク断に直結する。ルータ側の
+予約なら apphost の設定を一切触らずに済む。
+
+OpenWrt 25.12.5 (`192.0.2.1`, mediatek/filogic) に UCI で静的リースを
+追加:
+
+```
+dhcp.@host[1].name='apphost'
+dhcp.@host[1].mac='bc:24:11:16:d5:52'
+dhcp.@host[1].ip='192.0.2.20'
+dhcp.@host[1].dns='1'
+```
+
+dnsmasq への反映 (`/var/etc/dnsmasq.conf*` line 26):
+
+```
+dhcp-host=bc:24:11:16:d5:52,192.0.2.20,apphost
+```
+
+- `.20` は DHCP プール (`dhcp.lan.start=100`, `limit=150` →
+  `.100`-`.249`) の**外**なので動的割当と衝突しない。
+  投入前に ping 無応答 / ARP INCOMPLETE / 既存リース無しで空きを確認。
+- `dns='1'` により `apphost.lan` → `192.0.2.20` が解決する
+  (実測: `getent hosts apphost.lan` → `192.0.2.20 apphost.lan`)。
+- リース更新により `.20` へ移行完了。`ssh kise@192.0.2.20` の
+  `hostname` が `apphost` を返すことを確認。
+
+再導出:
+```sh
+ssh root@192.0.2.1 'uci show dhcp | grep @host; uci show dhcp.lan'
+getent hosts apphost.lan
+ssh kise@192.0.2.20 hostname
+```
+
+#### B-11-3. 構造的な脆さ
+
+`PORTAL_URL` が **IP アドレスを age envelope の中に焼き込んでいる**
+ことが問題の本体。DHCP 予約はその症状を押さえただけで、次の性質は
+残っている:
+
+- IP を変えたくなったら **age envelope の再封入が必要**
+  (`secrets/runner-env.age` の再暗号化 + benchvm の `nixos-rebuild`)。
+  ルータの予約を消すだけで runner が黙って壊れる。
+- 依存関係が「ルータの DHCP 予約」という**リポジトリ外の状態**に
+  あり、コードレビューでは検出できない。
+  `nixos-config-private/docs/devvm-operations.md:52-55` に注意書きは
+  あるが、強制力は無い。
+
+#### B-11-4. 改善案 (未実施)
+
+`PORTAL_URL` を **`http://apphost.lan:30080`** にする。
+
+- 利点: IP 変更に影響されない。`dns='1'` により `apphost.lan` は
+  既に解決可能 (§B-11-2 で実測確認済) なので、名前解決の準備は
+  完了している。
+- 必要作業: age envelope の再封入 (`secrets/runner-env.age`) と
+  benchvm の `nixos-rebuild switch`。
+- 残る依存: `apphost.lan` の解決も結局ルータの dnsmasq に依存する。
+  ただし **IP という「変わる値」ではなく name という「変えない値」に
+  依存先が移る**点が改善。
+- 未実施の理由: age 再封入は benchvm 停止中には検証できず、
+  §B-4-2 #1-#2 と同時に実施するのが安全なため。
 
 ---
 
-## Section C: 残っている human check
+## Section C: 残っている human check / 未解決事項
 
-| 項目 | 誰が | 期日 |
+### C-1. 残っている human check
+
+| 項目 | 誰が | 期日 | 状態 (2026-09-23) |
+| --- | --- | --- | --- |
+| benchvm 起動 (`eevee-mode.sh contest`) | operator (kisepichu) | 次の作業単位の先頭 | 未実施 (§B-4-2 #1) |
+| benchvm `nixos-rebuild switch --flake .#benchvm` | operator | benchvm 起動直後 | 未実施 (§B-4-2 #2) |
+| benchvm 上の旧平文 `/root/.inucon-tunnel-env` / `/home/kise/.inucon/runner-env` 削除 | operator | Step 7 完了直後 | 未実施 (§B-4-2 #3) |
+| 旧 `portal@pve!inucon` token revoke + ACL 削除 | operator | Step 7 smoke 完了直後 | 未実施 (§B-4-2 #4) |
+| edition1 の archive Operation | operator | readiness 全 pass 後 | 未実施 (§B-5-6) |
+| 初回 reconciliation apply | operator | archive 後 | 未実施 (§B-6) |
+| cleanup 後の再監査 | operator | reconciliation 後 | 未実施 (§B-7) |
+| edition2 draft 作成 | operator | 実開催日程の決定後 | 未実施 (§B-8) |
+| 参加者ブラウザでの実 Access 認証 | operator | edition2 preparing → running の直前 | 未実施 |
+| off-host snapshot の 3 世代保管 | operator | rollout 完了後継続 | 1 世代のみ保持 (§B-3-6) |
+| plan の Task checkbox を最終確定 | operator | 本 report の全 TBD 埋め後 | 未実施 |
+
+### C-2. claude-review CI の修理 (rollout の副産物)
+
+rollout 中に `nixos-config-private` の claude-review CI が
+**一度も成功したことがなかった**ことが判明した。
+
+#### C-2-1. 影響
+
+claude[bot] の出力が存在する PR (2026-09-23 実測):
+
+| PR | claude[bot] inline comment | claude[bot] issue comment |
 | --- | --- | --- |
-| 旧 `portal@pve!inucon` token revoke | operator (kisepichu) | Step 7 smoke 完了直後 |
-| 旧平文 `/home/kise/.inucon/runner-env` 削除 | operator | Step 7 完了直後 |
-| 参加者ブラウザでの実 Access 認証 | operator | edition2 preparing → running の直前 |
-| off-host snapshot の 3 世代保管 | operator | rollout 完了後継続 |
-| plan (`docs/superpowers/plans/2026-08-13-contest-lifecycle-automation.md`) の Task checkbox を最終確定 | operator | 本 report の全 TBD 埋め後 |
+| #26 / #27 / #29 / #30 / #32 / #36 | 0 | 0 |
+| #35 (Task 14 credential) | 0 | 2 (**いずれも 2026-09-23 の事後 run**) |
+| #38 | 0 | 1 |
+
+含意: **Task 14 の credential PR #35 は merge 時点 (2026-08-18) に
+機械レビューを受けていない。** Proxmox token の発行スクリプトと
+agenix envelope という、最も secret 事故を起こしやすい変更が
+人手レビューのみで入った。
+
+#### C-2-2. 原因 2 件
+
+1. **`--allowedTools` が完全欠落。** これが無いと
+   `github_inline_comment` / `github_comment` の MCP サーバが
+   provision されず、さらに upstream 既定で Bash が全拒否されるため
+   毎 turn が denial になり turn を食い潰して `error_max_turns` に至る。
+   実測が 1:1 で一致する (下表)。
+2. **`concurrency` が workflow レベルにあった。** workflow-level の
+   concurrency は `if` gate の評価**前**に効くため、claude[bot] 自身が
+   投稿したコメントが `pull_request_review_comment` を発火させ、
+   `cancel-in-progress: true` で**実行中の自分自身を kill** していた。
+   PR #37 で job level へ移動。
+
+#### C-2-3. 修正前後の実測
+
+| run | 日時 (UTC) | 対象 | subtype | turns | permission_denials | job 結果 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `35735668024` | 2026-09-22T13:46Z | PR #36 | `error_max_turns` | 41 | **26** | failure (`Reached maximum number of turns (40)`) |
+| `35738486845` | 2026-09-22T14:10Z | PR #36 | `success` | 41 | **41** | failure (`successful result after 41 turns, exceeding the configured maximum of 40`) |
+| `35839011031` | 2026-09-23T08:46Z | PR #35 (merged) | `success` | 53 | 10 | failure (`53 turns, exceeding ... 50`) — #37 適用後 |
+| `35840316631` | 2026-09-23T08:59Z | PR #38 (open) | `success` | 7 | **0** | **success** — #38 適用後 |
+
+`35738486845` は Claude 側は `success` を返しているが denial が全 41
+turn に及んでおり、実質何も読めていない。`--allowedTools` 欠落の
+影響がこの 2 run で最も明確に出ている。
+
+sentinel (`CLAUDE_REVIEW: ...`) の出力状況: 修正前は 2 run とも出力
+なし。`35839011031` は summary comment 内に出力。`35840316631` は
+`CLAUDE_REVIEW: no issues found` を正しく出力。
+
+再導出:
+```sh
+gh run view <id> -R kisepichu/nixos-config-private --log \
+  | grep -oE '"permission_denials_count": [0-9]+|"num_turns": [0-9]+|"subtype": "[a-z_]+"'
+```
+
+#### C-2-4. 運用上の注意: merged PR では inline comment が出ない
+
+`35839011031` (merged PR #35) では、Claude が完走して findings も
+出したにもかかわらず inline comment を 1 件も投稿できず、
+`MCP inline-comment tool unavailable` として summary comment に
+フォールバックした。merged PR に対しては SDK options に `mcpServers`
+が入らないためで、**`allowedTools` に列挙していても効かない**。
+
+> **CI の動作確認は必ず open PR で行う。**
+> merged PR #35 を検証対象に選んだのは手順の誤りだった。
+> merged PR で確認できるのは「Claude が完走するか」までで、
+> 「inline comment が投稿されるか」は確認できない。
+
+#### C-2-5. INUCON 側 allowlist の `find` 穴
+
+INUCON 側の workflow にも別の欠陥があった。
+`--disallowedTools "Edit,Write,Agent"` で書き込みを禁じていたが、
+allowlist に `Bash(find:*)` が含まれており、**`find -exec` /
+`find -delete` 経由で任意の書き込み・削除が可能**だった。
+allowlist 方式では列挙されたものだけが通るので、この 1 エントリが
+実質的な権限境界になっていた。
+
+PR #71 (`a33d964`) で:
+
+- `find` を allowlist から除去し、read-only な組込み `Grep` / `Glob`
+  に置換。
+- prompt 内の tool 列挙も同期。**prompt と実 allowlist がずれると、
+  Claude が拒否される呼び出しを試して turn を浪費する**
+  (C-2-3 の denial 数がまさにこの症状)。
+- `--max-turns` を 80 に (50 では Task 6/7 の大きめ PR #60 / #61 で
+  不足していた)。
+
+現在の INUCON 側設定 (`.github/workflows/claude-review.yml:85-87`):
+`--max-turns 80` / allowlist は `Read,Grep,Glob,WebFetch,WebSearch` +
+read-only な `Bash(...)` 群 / `--disallowedTools "Edit,Write,Agent"`。
+
+#### C-2-6. 未解決
+
+- **inline comment 経路は INUCON 側で「未証明」ではなく「壊れている」
+  ことが確定した。** 本 report の PR (#72) の review round 1 が決定的な
+  反例になった:
+
+  | 条件 | 状態 |
+  | --- | --- |
+  | PR | **open** (merged ではない → MCP 不可の言い訳が立たない) |
+  | allowlist | `mcp__github_inline_comment__create_inline_comment` を**明示的に含む** (`.github/workflows/claude-review.yml:86`) |
+  | prompt | `Post each concrete finding as an INLINE review comment on the exact line(s) it concerns` と明示 (`:114-115`) |
+  | run | `35843378352`、subtype `success`、turns 22、denials 1、`total_cost_usd` 0.861 |
+  | findings | **1 件** (§B-5-1 の null timestamp 指摘) |
+  | 投稿された inline comment | **0 件** |
+  | 実際の投稿先 | top-level issue comment |
+  | sentinel | `CLAUDE_REVIEW: 1 issue(s) -- see inline comments` — **inline を名乗るが実体は無い** |
+
+  すなわち「open PR」「tool が allowlist 済」「prompt が inline を要求」
+  「findings が存在」がすべて揃っても inline comment は投稿されない。
+  §C-2-4 で疑った merged PR 固有の問題ではなく、
+  **INUCON 側では恒常的に inline 経路が機能していない**。
+
+  - `nixos-config-private`: #38 / #35 は findings が summary comment
+    として届いた (#35 は merged PR のため MCP 不可、#38 は
+    findings ゼロ)。こちらは依然として未証明のまま。
+  - INUCON: #55-#71 に加え **#72 でも inline 0 件**。#72 では
+    **findings が出た round が 2 回** (round 1 = run `35843378352`
+    turns 22 / denials 1、round 3 = run `35844733378` turns 34 /
+    denials 2) あり、どちらも inline 0 件で top-level に落ちた。
+    単発の事故ではなく再現する。
+  - **運用上の帰結:** sentinel の `-- see inline comments` を信用しては
+    ならない。findings は top-level comment 側を読む。
+    レビュー結果を機械的に集計する仕組みを作るなら
+    `pulls/<n>/comments` ではなく `issues/<n>/comments` を見る。
+  - **原因の切り分け (進行中):** run `35843378352` の `init` message には
+    `message` と `model` しか無く、**`mcp_servers` フィールドが存在しない**。
+    workflow 側は `enableAllProjectMcpServers: true` を設定し
+    settings の allowlist にも tool 名を載せている
+    (log: `Updated settings with enableAllProjectMcpServers: true`) にも
+    かかわらず、である。log 中に現れる
+    `mcp__github_inline_comment__create_inline_comment` 8 箇所は
+    すべて `claude_args` / prompt / settings の**エコー**で、
+    実際の tool 呼び出しではない。
+    → **MCP サーバがそもそも provision されていない** と見るのが自然
+    (ただし `permission_denials_count: 1` が何の denial だったかは
+    log から特定できておらず、断定はしない)。
+  - 次の一手: `anthropics/claude-code-action` が inline comment MCP を
+    provision する条件を upstream 側で確認する。
+    `nixos-config-private` #35 の
+    `MCP inline-comment tool unavailable` という Claude 自身の申告
+    (§C-2-4) と症状が一致するため、両 repo で同一原因の可能性が高い。
+- **PR #35 の findings 2 件が未対応。** 事後 run
+  (`35839011031`) が実際に指摘を出している:
+
+  | # | 深刻度 | 内容 |
+  | --- | --- | --- |
+  | 1 | Medium | `scripts/provision-inucon-proxmox-credentials.sh:326-348` — `pve_stream_token_secret` が Proxmox 上に token を作った後、`jq` / `seal_secret` が失敗すると `set -euo pipefail` により `created_tokens+=` の**前**に exit する。`cleanup_on_fail` の EXIT trap が空配列を舐めるので token が orphan 化し、`pveum` は secret を一度しか返さないため**復旧不能**。次の `--apply` は `token already exists` で失敗する。修正: `created_tokens+=` を pipeline の**前**に移す |
+  | 2 | Low | 同 `:203-204` — `check_token_absent` が SSH 失敗時に silently success を返す。`set -e` は `if` 条件内の失敗で abort しないため、`pve pveum user list` が落ちると guard がスキップされる |
+
+  secret handling 自体は OK と判定されている (age ciphertext のみ commit、
+  `LoadCredential` が `/run/agenix/` の runtime path を使用、
+  `seal_secret` が平文を disk に書かない、`secrets.nix` の recipients と
+  `owner` が consumer と一致)。
+
+### C-3. 未解決の構造的課題
+
+| # | 課題 | 根拠 | 提案 |
+| --- | --- | --- | --- |
+| 1 | production Deployment が可変 tag `:latest` を参照しており、image import が deploy と等価になる | §B-1 | Deployment の image を digest 固定にする。最低でも plan / `deploy/README.md` に「import 前に `--replicas=0`」または「検証は別 tag で」を明記 |
+| 2 | env 変数のリネームが image / Secret の更新順序に依存し、不整合期間を必ず作る | §B-10-3 | Secret は「追加のみ → image 切替 → 旧キー削除」の 3 段に分ける |
+| 3 | `CrashLoopBackOff` が 35 日間検知されなかった (外形監視が無い) | §B-10-1 | `https://inucon.kisen.one/api/health` の外形監視を追加する |
+| 4 | pre-migration snapshot が存在せず、edition1 に対して recovery runbook §10 が発動不能 | §B-1 残存リスク | edition2 以降で Step 4/5 を本来の順序で実施。§C-3 #1 が前提 |
+| 5 | `PORTAL_URL` が IP を age envelope に焼き込んでおり、ルータの DHCP 予約という repo 外の状態に依存する | §B-11-3 | `http://apphost.lan:30080` に変更 (§B-11-4) |
+| 6 | 設計 spec に外部識別子 (VMID) の mapping が無い | §B-9-4 | spec に mapping 表を追加。実装は名前で fail-closed 検証する (§B-9-6) |
+| 7 | claude-review の inline comment が **INUCON 側で恒常的に投稿されない** (open PR + allowlist 済 + findings ありでも 0 件)。`nixos-config-private` 側は未証明のまま | §C-2-6 | upstream の MCP provision 条件を確認。当面は sentinel の `-- see inline comments` を信用せず `issues/<n>/comments` を読む |
+| 8 | `nixos-config-private` PR #35 の Medium / Low findings 2 件が未対応 | §C-2-6 | `provision-inucon-proxmox-credentials.sh` の修正 PR を立てる |
+| 9 | off-host snapshot が 1 世代のみ | §B-3-6 / §C-1 | 3 世代ローテーションを運用に入れる |
 
 ---
 
 ## Section D: Commit history (このリポジトリ側)
 
-`TBD: <human>` — 人手記入。以下のフォーマットで並べる:
+フォーマット: `<short hash> <ISO date> <one-line subject> [role]`
+
+### D-1. INUCON (`kisepichu/inucon`) — Task 15 以降
 
 ```
-<short hash> <ISO date> <one-line subject> [role: sub-agent | human]
+a33d964  2026-09-23  fix(ci): claude-review の allowlist から find を外し turn 予算を 80 にする (#71)  [sub-agent]
+8771812  2026-09-22  Merge pull request #70 from kisepichu/develop                                    [human]
+acab772  2026-09-22  fix(ops): correct inverted devvm/benchvm VMIDs and verify VM names (#69)       [sub-agent]
+0a009d7  2026-08-18  docs(contest): recovery runbook + rollout evidence template (Task 15 sub-agent scope) (#68)  [sub-agent]
 ```
 
-含めるべき commit (期待):
-- runbook + plan storage typo fix (sub-agent)
-- rollout report template (本ファイル、sub-agent)
-- rollout report を埋めた commit (human)
-- `nixos-config-private` 側 commit hash 参照 (human、sibling repo)
+`0a009d7` は squash merge のため、A-1 の runbook 差分 / 本ファイルの
+template / plan storage typo fix (`local-lvm` → `local-zfs`) が 1 commit に
+同居する。PR #68 のブランチ上では `b22b89d` (review round 1 対応) /
+`3b1dab9` (round 2) / `fed1171` (round 3) に分かれていた。
+
+実装フェーズ (Task 1-13) の merge commit:
+
+```
+26254b6  Task 13  feat(web): add contest operations console (#67)
+63cd977  Task 12  feat(ops): automate contest resource closeout (#66)
+fc21cc7  Task 11  feat(contest): finalize schedules and archive results (#65)
+b4ed076  Task 10  feat(contest): add rehearsal and guarded start (#64)
+06e063d  Task 9   feat(ops): converge contest instances and access (#63)
+51043ab  Task 8   feat(ops): add safe contest mode switching (#62)
+9b5c304  Task 7   feat(ops): reconcile provider resources (#61)
+2f90edb  Task 6   feat(ops): add durable operation worker (#60)
+fe9ffd1  Task 5   feat(admin): add contest setup wizard (#59)
+586c66a  Task 4   feat(portal): expose contest archives (#57)
+e5c602a  Task 2+3 feat(portal): scope repositories by contest (atomic) (#56)
+38a2837  Task 1   feat(contest): define multi-edition lifecycle (#55)
+51bc72d  —        docs: 複数開催回・運営自動化の設計スペックと実装計画 (#51)
+```
+
+本 report を埋めた commit: このファイルの変更を含む commit (human /
+sub-agent 協働)。`git log --oneline -- docs/superpowers/reviews/2026-08-13-contest-lifecycle-rollout.md`
+で追える。
+
+### D-2. `kisepichu/nixos-config-private` (sibling repo) の参照 commit
+
+```
+6848e77  2026-09-23  fix(ci): claude-review の turn 予算を 80 に上げる (#38)
+46eadbf  2026-09-23  fix(ci): claude-review に allowedTools を与え concurrency を job level へ移す (#37)
+775ae7d  2026-09-22  fix(eevee): eevee-mode.sh の ProxyJump 既定を LAN 直結にする (#36)
+6b34f25  2026-08-18  feat(inucon): manage runtime credentials with agenix (Task 14) (#35)
+9314e96  —           feat(benchvm): add INUCON bench VM (vmid 9200)     ← §B-9-4 の裏付け
+```
+
+再導出:
+```sh
+gh pr list -R kisepichu/inucon --state all --limit 25 \
+  --json number,title,state,mergeCommit,baseRefName
+gh pr list -R kisepichu/nixos-config-private --state all --limit 15 \
+  --json number,title,mergeCommit,mergedAt
+```
 
 ---
 
@@ -270,3 +1260,9 @@ AMD Ryzen 5 3600X)。実行時刻 (UTC): 2026-08-18T02:11Z 〜 2026-08-18T02:14Z
 - Ops runbook: `docs/runbooks/contest-operations.md`
 - Deploy runbook: `deploy/README.md`
 - Final Verification Matrix: plan 末尾 (§Final Verification Matrix)
+- VMID single source of truth: `portal/src/domain/modeVmIds.ts`
+- mode VM の名前検証 (先行実装): `../nixos-config-private/scripts/eevee-mode.sh:238-271`
+- apphost の IP 前提: `../nixos-config-private/docs/devvm-operations.md:52-55`
+- backup CLI: `portal/src/cli/backup.ts`
+- backup PVC: `deploy/k8s/backup-pvc.yaml`
+- claude-review workflow: `.github/workflows/claude-review.yml`
