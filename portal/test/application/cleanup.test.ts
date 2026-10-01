@@ -1,5 +1,6 @@
 import { it } from "@effect/vitest"
 import type { Contest } from "../../src/domain/contest.js"
+import type { Team } from "../../src/domain/team.js"
 import { Effect, Exit, Layer, Option } from "effect"
 import { describe, expect } from "vitest"
 import { ContestId, InstanceId, ResourceBindingId, TeamId, UserId } from "../../src/domain/ids.js"
@@ -148,6 +149,7 @@ interface FixtureOptions {
   readonly cloudflareRoutes?: ReadonlyArray<{ hostname: string; dnsRecordIds: ReadonlyArray<string>; ingressServices: ReadonlyArray<string> }>
   readonly cloudflareApps?: ReadonlyArray<{ hostname: string; appIds: ReadonlyArray<string>; policyShape: "owned_exact" | "unknown"; emailSetHash: string }>
   readonly instances?: ReadonlyArray<Instance>
+  readonly teams?: ReadonlyArray<Team>
   readonly bindings?: ReadonlyArray<ResourceBinding>
   readonly cloudflareFailWith?: Partial<Record<"removeAccessApp" | "removeInstanceRoute", CloudflareError>>
   readonly proxmoxFailWith?: Partial<{ stopAndDestroyVm: ProxmoxError }>
@@ -181,7 +183,7 @@ const makeFixture = (opts: FixtureOptions = {}) => {
       TransactionRunnerTest,
       makeContestRepoTest(opts.contests ?? [finishedContest]),
       makeInstanceRepoTest(opts.instances ?? [instance1_1]),
-      makeTeamRepoTest({ teams: [team1], memberships: [] }),
+      makeTeamRepoTest({ teams: opts.teams ?? [team1], memberships: [] }),
       bindingsLayer,
       proxmox.layer,
       cloudflare.layer,
@@ -395,6 +397,236 @@ describe("cleanupContestResources", () => {
       expect(Exit.isFailure(exit)).toBe(true)
     })
   )
+})
+
+// --- cleanup 対象選択の到達性 (2026-10-01 本番 edition1 の回帰) ---------------
+//
+// 本番で踏んだデッドロック: finished な Contest に「DB 上は running だが Proxmox に
+// 実体が無い Instance」が残ると、Instance を deleted へ落とす経路が UI から消える。
+// readiness の previous_cleanup (finished/canceled の全 Contest について
+// status != 'deleted' の Instance が 0 件) が永久に fail し、次回開催の Contest が
+// draft から preparing に上がれなくなる。
+//
+// 再現状態 (本番 edition1, 2026-10-01):
+//   teams      : team1 (teamNumber=1, desired 1) / team2 (teamNumber=2, desired 0)
+//   instances  : 1 行 (index=1, vmid=1101, running) — 実体の VM は無い
+//   bindings   : 0 行
+//   Proxmox    : inucon-team* VM は 0 件
+//   Cloudflare : inucon-team1-1 / inucon-team2-1 に DNS + ingress + Access app
+const TEAM2_ID = TeamId.make("team2-cleanup")
+
+const team2 = makeTeam({
+  id: TEAM2_ID,
+  contestId: CONTEST_ID,
+  teamNumber: 2,
+  name: "team2-test-name",
+  desiredInstanceCount: 0
+})
+
+const instance1_1Deleted = new Instance({ ...instance1_1, status: "deleted", updatedAt: 2000 })
+
+// 本番そのまま: VM と binding は消えているが CF resource は両 hostname に残る。
+const prodCloudflareRoutes = [
+  { hostname: "inucon-team1-1", dnsRecordIds: ["dns-1"], ingressServices: ["ssh://10.100.1.11:22"] },
+  { hostname: "inucon-team2-1", dnsRecordIds: ["dns-2"], ingressServices: ["ssh://10.100.2.11:22"] }
+] as const
+
+const prodCloudflareApps = [
+  { hostname: "inucon-team1-1", appIds: ["app-1"], policyShape: "owned_exact", emailSetHash: "h1" },
+  { hostname: "inucon-team2-1", appIds: ["app-2"], policyShape: "owned_exact", emailSetHash: "h2" }
+] as const
+
+// reconcile apply (adopt=inucon-team2-1) 完了後: CF resource も binding も消えたが、
+// makeReconciliationHandler は InstanceRepo に依存しないので Instance は running で
+// 取り残される。この状態が本番で詰んでいた入口。
+const afterReconcileFixture = (instances: ReadonlyArray<Instance> = [instance1_1]) =>
+  makeFixture({
+    teams: [team1, team2],
+    proxmoxVms: [],
+    bindings: [],
+    instances,
+    cloudflareRoutes: [],
+    cloudflareApps: []
+  })
+
+const summarize = (entries: ReadonlyArray<{ hostname: string; classification: string; action: string; reason: string }>) =>
+  entries
+    .map((e) => ({ hostname: e.hostname, classification: e.classification, action: e.action, reason: e.reason }))
+    .sort((x, y) => (x.hostname < y.hostname ? -1 : 1))
+
+describe("cleanup 対象選択の到達性", () => {
+  it.effect("前提: 本番状態の plan は team1-1=missing/cleanup と team2-1=unmanaged_orphan/blocked", () => {
+    const fixture = makeFixture({
+      teams: [team1, team2],
+      proxmoxVms: [],
+      bindings: [],
+      cloudflareRoutes: prodCloudflareRoutes,
+      cloudflareApps: prodCloudflareApps
+    })
+    return Effect.gen(function* () {
+      const plan = yield* planReconciliation({ contestId: CONTEST_ID, adoptHostnames: [] })
+      expect(summarize(plan.entries)).toEqual([
+        { hostname: "inucon-team1-1", classification: "missing", action: "cleanup", reason: "vm_missing" },
+        {
+          hostname: "inucon-team2-1",
+          classification: "unmanaged_orphan",
+          action: "blocked",
+          reason: "requires_adopt_confirmation"
+        }
+      ])
+    }).pipe(Effect.provide(fixture.layer))
+  })
+
+  it.effect("未 adopt の unmanaged_orphan が居る間は AmbiguousReconciliation (adopt 確認 gate)", () => {
+    const fixture = makeFixture({
+      teams: [team1, team2],
+      proxmoxVms: [],
+      bindings: [],
+      cloudflareRoutes: prodCloudflareRoutes,
+      cloudflareApps: prodCloudflareApps
+    })
+    return Effect.gen(function* () {
+      const plan = yield* planReconciliation({ contestId: CONTEST_ID, adoptHostnames: [] })
+      const result = yield* Effect.either(
+        cleanupContestResources({
+          contestId: CONTEST_ID,
+          planDigest: plan.planDigest,
+          actorUserId: ADMIN_USER
+        })
+      )
+      expect(result._tag).toBe("Left")
+      if (result._tag === "Left") {
+        expect(result.left._tag).toBe("AmbiguousReconciliation")
+      }
+    }).pipe(Effect.provide(fixture.layer))
+  })
+
+  it.effect("missing/noop/missing_clean_pending_db を cleanup 対象に拾う (admin apply)", () => {
+    const fixture = afterReconcileFixture()
+    return Effect.gen(function* () {
+      const plan = yield* planReconciliation({ contestId: CONTEST_ID, adoptHostnames: [] })
+      // team2-1 は desired も観測も無くなったので hostname key 自体が生成されない。
+      expect(summarize(plan.entries)).toEqual([
+        {
+          hostname: "inucon-team1-1",
+          classification: "missing",
+          action: "noop",
+          reason: "missing_clean_pending_db"
+        }
+      ])
+      const op = yield* cleanupContestResources({
+        contestId: CONTEST_ID,
+        planDigest: plan.planDigest,
+        actorUserId: ADMIN_USER
+      })
+      const steps = yield* (yield* OperationRepo).listSteps(op.id)
+      expect(steps.map((s) => s.stepKey)).toEqual([
+        cleanupStepKeyFor("inucon-team1-1"),
+        CLEANUP_MARK_COMPLETED_STEP_KEY
+      ])
+    }).pipe(Effect.provide(fixture.layer))
+  })
+
+  it.effect("missing/noop/missing_clean_pending_db を cleanup 対象に拾う (scheduler 経路)", () => {
+    const fixture = afterReconcileFixture()
+    return Effect.gen(function* () {
+      const op = yield* scheduleContestCleanup({ contestId: CONTEST_ID })
+      expect(op.actor).toEqual({ kind: "scheduler" })
+      const steps = yield* (yield* OperationRepo).listSteps(op.id)
+      expect(steps.map((s) => s.stepKey)).toEqual([
+        cleanupStepKeyFor("inucon-team1-1"),
+        CLEANUP_MARK_COMPLETED_STEP_KEY
+      ])
+    }).pipe(Effect.provide(fixture.layer))
+  })
+
+  it.effect("Instance が deleted なら拾わない (空 Operation の無限生成を防ぐ)", () => {
+    const fixture = afterReconcileFixture([instance1_1Deleted])
+    return Effect.gen(function* () {
+      const plan = yield* planReconciliation({ contestId: CONTEST_ID, adoptHostnames: [] })
+      expect(summarize(plan.entries)).toEqual([
+        {
+          hostname: "inucon-team1-1",
+          classification: "in_sync",
+          action: "noop",
+          reason: "managed_orphan_clean"
+        }
+      ])
+      const applyResult = yield* Effect.either(
+        cleanupContestResources({
+          contestId: CONTEST_ID,
+          planDigest: plan.planDigest,
+          actorUserId: ADMIN_USER
+        })
+      )
+      expect(applyResult._tag).toBe("Left")
+      if (applyResult._tag === "Left") {
+        expect(applyResult.left._tag).toBe("NothingToReconcile")
+      }
+      const schedulerResult = yield* Effect.either(scheduleContestCleanup({ contestId: CONTEST_ID }))
+      expect(schedulerResult._tag).toBe("Left")
+      if (schedulerResult._tag === "Left") {
+        expect(schedulerResult.left._tag).toBe("NothingToReconcile")
+      }
+    }).pipe(Effect.provide(fixture.layer))
+  })
+
+  it.effect("収束: cleanup → Instance deleted → mark_completed → 次 cleanup は NothingToReconcile", () => {
+    const fixture = afterReconcileFixture()
+    return Effect.gen(function* () {
+      const plan = yield* planReconciliation({ contestId: CONTEST_ID, adoptHostnames: [] })
+      yield* cleanupContestResources({
+        contestId: CONTEST_ID,
+        planDigest: plan.planDigest,
+        actorUserId: ADMIN_USER
+      })
+
+      // VM も CF resource も binding も無い hostname でも handler は冪等に成功し、
+      // Instance を deleted まで落とす。
+      const registry = yield* makeCleanupHandler
+      const hostnameOutcome = yield* registry.run(
+        stepOf(cleanupStepKeyFor("inucon-team1-1"), {
+          hostname: "inucon-team1-1",
+          contestId: CONTEST_ID
+        })
+      )
+      expect(hostnameOutcome.status).toBe("succeeded")
+      const instances = yield* InstanceRepo
+      const afterCleanup = yield* instances.listByContest(CONTEST_ID)
+      expect(afterCleanup.find((i) => i.id === INSTANCE_1_1)?.status).toBe("deleted")
+      // 実体が無いので destroy は 1 度も呼ばれない (fail-closed を崩さずに冪等)。
+      const proxmoxState = yield* fixture.proxmox.getState
+      expect(proxmoxState.destroyedVmids).toEqual([])
+
+      const markOutcome = yield* registry.run(stepOf(CLEANUP_MARK_COMPLETED_STEP_KEY, { contestId: CONTEST_ID }))
+      expect(markOutcome.status).toBe("succeeded")
+      const contests = yield* ContestRepo
+      const contestAfter = yield* contests.findById(CONTEST_ID)
+      expect(Option.isSome(contestAfter) && Option.isSome(contestAfter.value.cleanupCompletedAt)).toBe(true)
+
+      // 収束後の次 plan は clean。ここをもう一度拾うと空 Operation を無限に作る。
+      const nextPlan = yield* planReconciliation({ contestId: CONTEST_ID, adoptHostnames: [] })
+      expect(summarize(nextPlan.entries)).toEqual([
+        {
+          hostname: "inucon-team1-1",
+          classification: "in_sync",
+          action: "noop",
+          reason: "managed_orphan_clean"
+        }
+      ])
+      const again = yield* Effect.either(
+        cleanupContestResources({
+          contestId: CONTEST_ID,
+          planDigest: nextPlan.planDigest,
+          actorUserId: ADMIN_USER
+        })
+      )
+      expect(again._tag).toBe("Left")
+      if (again._tag === "Left") {
+        expect(again.left._tag).toBe("NothingToReconcile")
+      }
+    }).pipe(Effect.provide(fixture.layer))
+  })
 })
 
 // --- returnNormalMode -------------------------------------------------------

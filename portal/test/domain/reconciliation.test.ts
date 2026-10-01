@@ -6,6 +6,7 @@ import {
   computePlanDigest,
   type HostnameDesired,
   type HostnameObservation,
+  needsCleanupOperation,
   type ReconciliationEntry
 } from "../../src/domain/reconciliation.js"
 
@@ -228,6 +229,99 @@ describe("classifyHostname", () => {
     expect(entry.classification).toBe("missing")
     expect(entry.action).toBe("noop")
     expect(entry.reason).toBe("missing_clean_pending_db")
+  })
+})
+
+// cleanup Operation (Task 12) の対象選択。判定は classifyHostname の分岐順に
+// 依存する (classification === "missing" ⇒ Instance は deleted でない) ため、
+// entry は手で組まず必ず classifyHostname を通して作る。
+describe("needsCleanupOperation", () => {
+  const cleanObservation: HostnameObservation = {
+    hostname: "inucon-team1-1",
+    proxmoxVm: Option.none(),
+    cloudflareRouteCount: 0,
+    cloudflareIngressCount: 0,
+    cloudflareAppCount: 0
+  }
+
+  // 2026-10-01 本番 edition1 の回帰: 実体は全部消えたが Instance が running で
+  // 残っている = cleanup が deleted へ落とす仕事がまだある。
+  it("missing + noop + Instance running → true (Instance 遷移が残っている)", () => {
+    const desired: HostnameDesired = {
+      hostname: "inucon-team1-1",
+      contestId: CONTEST,
+      teamId: Option.some(TEAM_1),
+      instanceId: Option.some(INSTANCE_1_1),
+      instanceStatus: Option.some("running"),
+      cloudflareBindingIds: [],
+      proxmoxBindingIds: []
+    }
+    const entry = classifyHostname({ observation: cleanObservation, desired, adopted: false })
+    expect(entry.reason).toBe("missing_clean_pending_db")
+    expect(needsCleanupOperation(entry)).toBe(true)
+  })
+
+  // 収束条件。ここで true を返すと空 Operation を無限に作り続ける。
+  it("Instance deleted + 実体も binding も無し → false (空 Operation の無限生成を防ぐ)", () => {
+    const desired: HostnameDesired = {
+      hostname: "inucon-team1-1",
+      contestId: CONTEST,
+      teamId: Option.some(TEAM_1),
+      instanceId: Option.some(INSTANCE_1_1),
+      instanceStatus: Option.some("deleted"),
+      cloudflareBindingIds: [],
+      proxmoxBindingIds: []
+    }
+    const entry = classifyHostname({ observation: cleanObservation, desired, adopted: false })
+    expect(entry.reason).toBe("managed_orphan_clean")
+    expect(needsCleanupOperation(entry)).toBe(false)
+  })
+
+  it("Proxmox VM だけ残っている → true (VM destroy が残っている)", () => {
+    const desired: HostnameDesired = {
+      hostname: "inucon-team1-1",
+      contestId: CONTEST,
+      teamId: Option.some(TEAM_1),
+      instanceId: Option.some(INSTANCE_1_1),
+      instanceStatus: Option.some("running"),
+      cloudflareBindingIds: [],
+      proxmoxBindingIds: []
+    }
+    const entry = classifyHostname({
+      observation: { ...cleanObservation, proxmoxVm: Option.some({ vmid: 1101, status: "running" }) },
+      desired,
+      adopted: false
+    })
+    expect(entry.reason).toBe("drifted_awaiting_reprovision")
+    expect(needsCleanupOperation(entry)).toBe(true)
+  })
+
+  // fail-closed: blocked には実体が残っていても触らない (呼び出し元は先に
+  // AmbiguousReconciliation で止める契約だが、判定側でも塞ぐ)。
+  it("未 adopt の unmanaged_orphan (blocked) → CF resource が残っていても false", () => {
+    const entry = classifyHostname({
+      observation: {
+        hostname: "inucon-team2-1",
+        proxmoxVm: Option.some({ vmid: 1201, status: "running" }),
+        cloudflareRouteCount: 1,
+        cloudflareIngressCount: 1,
+        cloudflareAppCount: 1
+      },
+      desired: undefined,
+      adopted: false
+    })
+    expect(entry.action).toBe("blocked")
+    expect(needsCleanupOperation(entry)).toBe(false)
+  })
+
+  it("desired 無し + 観測 0 (unmanaged_clean) → false", () => {
+    const entry = classifyHostname({
+      observation: { ...cleanObservation, hostname: "inucon-team2-1" },
+      desired: undefined,
+      adopted: false
+    })
+    expect(entry.reason).toBe("unmanaged_clean")
+    expect(needsCleanupOperation(entry)).toBe(false)
   })
 })
 

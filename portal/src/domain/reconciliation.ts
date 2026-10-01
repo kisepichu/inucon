@@ -252,6 +252,49 @@ export const classifyHostname = (args: {
   }
 }
 
+// cleanup Operation (Task 12) がこの hostname に対して実際に行う仕事があるか。
+// 「reconciliation の action」とは別概念であることが要点: action は reconcile
+// apply が消せるもの = Cloudflare 側の resource/binding だけを見て決まるので、
+// cleanup 固有の仕事 (Proxmox VM destroy / Proxmox binding 削除 / Instance を
+// deleted へ遷移) は action に現れない。action だけで cleanup 対象を選ぶと
+// 取りこぼす。
+//
+// 2026-10-01 の本番 edition1 で踏んだ穴がこれ: VM も CF resource も binding も
+// 落ちきった後の missing + noop + missing_clean_pending_db (Instance だけ running
+// で取り残された状態) が対象 0 件になり、Instance を deleted にする経路が UI から
+// 消えた。readiness の previous_cleanup (finished/canceled の全 Contest について
+// status != 'deleted' の Instance が 0 件) が永久に fail し、次回開催の Contest が
+// draft から preparing に上がれなくなった。
+//
+// 判定は cleanup の最終 step (runMarkCleanupCompleted) の residual 判定と同じ
+// 問いである: 「VM / CF resource / binding / 非 deleted Instance のいずれかが
+// 残っているか」。残っているものが無くなった時点で false を返さなければならない
+// — true を返し続けると apply が空 Operation を無限に作る (operator UI 上
+// endless successful-but-empty)。
+//
+// 「Instance がまだ deleted でない」は classifyHostname の分岐順に依存する:
+// instanceDeleted の検査は missing / drifted / in_sync より前に短絡するので、
+// classification === "missing" なら Instance は deleted ではないことが保証される。
+// 逆に deleted な Instance は managed_orphan (cleanup work あり → 下の observation
+// / binding 条件で拾う) か in_sync + managed_orphan_clean (拾わない) に落ちる。
+// この不変条件があるため判定は classifyHostname と同じ module に置く — 分岐順を
+// 変えるときに必ずここも一緒に目に入る必要がある。
+export const needsCleanupOperation = (entry: ReconciliationEntry): boolean => {
+  // blocked (ambiguous / 未 adopt の unmanaged_orphan) には触らない。呼び出し元は
+  // 先に blocked を見て AmbiguousReconciliation で止める契約だが、ここでも
+  // fail-closed にして「blocked を黙って撤収する」経路を作らない。
+  if (entry.action === "blocked") return false
+  return (
+    entry.proxmoxVmObserved ||
+    entry.cloudflareRouteCount > 0 ||
+    entry.cloudflareIngressCount > 0 ||
+    entry.cloudflareAppCount > 0 ||
+    entry.bindingIds.length > 0 ||
+    // 実体は全て撤収済みで、台帳の Instance を deleted に落とすだけが残っている。
+    (entry.classification === "missing" && Option.isSome(entry.instanceId))
+  )
+}
+
 // canonical plan digest。entries は (hostname, classification, action) を key に
 // sort し、adoptHostnames も sort。JSON.stringify で決定的なバイト列にしてから
 // SHA-256 hex にする。contestId と contestRevision も digest 材料に含めるので、

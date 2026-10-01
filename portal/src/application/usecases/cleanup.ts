@@ -3,9 +3,13 @@ import { Contest } from "../../domain/contest.js"
 import { InvalidContestTransition } from "../../domain/errors.js"
 import type { ContestId, ResourceBindingId, UserId } from "../../domain/ids.js"
 import { beginDeleting, Instance, markDeleted } from "../../domain/instance.js"
-import type { NewOperation, Operation, OperationStep } from "../../domain/operation.js"
-import { stemOfHostname } from "../../domain/reconciliation.js"
-import type { HostnameDesired, HostnameObservation } from "../../domain/reconciliation.js"
+import type { NewOperation, NewOperationStep, Operation, OperationStep } from "../../domain/operation.js"
+import { needsCleanupOperation, stemOfHostname } from "../../domain/reconciliation.js"
+import type {
+  HostnameDesired,
+  HostnameObservation,
+  ReconciliationEntry
+} from "../../domain/reconciliation.js"
 import { ResourceBinding } from "../../domain/resourceBinding.js"
 import type { Team } from "../../domain/team.js"
 import { modeVmIdentityMismatch } from "../../domain/modeVmIds.js"
@@ -139,7 +143,43 @@ export type CleanupRequestError =
   | ProxmoxError
   | CloudflareError
 
-// admin の explicit apply が呼ぶ入口 (scheduler は下記 buildScheduledCleanup で
+// cleanup Operation の step 列を組む。admin apply (cleanupContestResources) と
+// scheduler (scheduleContestCleanup) は完全に同じ対象選択 + 同じ step 構成を
+// 使う。以前は同じコードを 2 箇所に複製しており、対象選択条件が片側だけ更新
+// される drift の温床だった (2026-10-01 の本番デッドロックはこの複製が原因)。
+//
+// 対象が 0 件なら空配列を返す。呼び出し元は NothingToReconcile に落とす
+// — mark_completed だけの Operation を積んでも何も撤収しないため。
+const buildCleanupSteps = (args: {
+  readonly contestId: ContestId
+  readonly entries: ReadonlyArray<ReconciliationEntry>
+}): ReadonlyArray<NewOperationStep> => {
+  // entries は hostname 単位で一意 (collectPlan が hostname 集合から作る)。
+  const hostnames = args.entries
+    .filter(needsCleanupOperation)
+    .map((e) => e.hostname)
+    .sort()
+  if (hostnames.length === 0) return []
+  const steps: Array<NewOperationStep> = hostnames.map((hostname, i) => ({
+    stepKey: cleanupStepKeyFor(hostname),
+    ordinal: i,
+    inputSummary: JSON.stringify({ hostname, contestId: args.contestId }),
+    // spec §Step 4: per-hostname は continueOnError=true。1 hostname の
+    // provider 失敗が他の独立 hostname を止めない。
+    continueOnError: true
+  }))
+  steps.push({
+    stepKey: CLEANUP_MARK_COMPLETED_STEP_KEY,
+    ordinal: hostnames.length,
+    inputSummary: JSON.stringify({ contestId: args.contestId }),
+    // 最終 step は失敗を halt にする — reconciliation が clean でなければ
+    // Operation を failed にして operator 判断を待つ。
+    continueOnError: false
+  })
+  return steps
+}
+
+// admin の explicit apply が呼ぶ入口 (scheduler は下記 scheduleContestCleanup で
 // planDigest を計算する)。reconciliation apply と同型に「planDigest 一致 +
 // blocked=0 + actionable>=1」を検証し、cleanup の per-hostname step +
 // mark_completed 最終 step を Operation として enqueue する。
@@ -166,45 +206,10 @@ export const cleanupContestResources = (args: {
     if (blocked.length > 0) {
       return yield* Effect.fail(new AmbiguousReconciliation({ hostnames: blocked }))
     }
-    // cleanup は「消す実体があるもの」に加えて desired 有り (=Instance/binding 有り) も
-    // 対象にする — reconciliation の in_sync/noop でも Proxmox VM 実体が残る間は
-    // cleanup Operation が touch する必要がある。ここでは entry が cleanup /
-    // adopt_cleanup のもの、および「in_sync だが desired 有り」を hostname として拾う。
-    const targetHostnames = new Set<string>()
-    for (const e of plan.entries) {
-      if (e.action === "cleanup" || e.action === "adopt_cleanup") {
-        targetHostnames.add(e.hostname)
-      }
-    }
-    // desired 有りだが in_sync (VM + CF resource すべて健在) な hostname も
-    // cleanup 対象に含める。plan.entries には in_sync でも proxmoxVmObserved
-    // が判断できるように bindingIds が乗っているので、そこから抽出する。
-    for (const e of plan.entries) {
-      if (e.classification === "in_sync" && (e.bindingIds.length > 0 || e.proxmoxVmObserved)) {
-        targetHostnames.add(e.hostname)
-      }
-    }
-    if (targetHostnames.size === 0) {
+    const steps = buildCleanupSteps({ contestId: args.contestId, entries: plan.entries })
+    if (steps.length === 0) {
       return yield* Effect.fail(new NothingToReconcile())
     }
-
-    const sorted = Array.from(targetHostnames).sort()
-    const steps = sorted.map((hostname, i) => ({
-      stepKey: cleanupStepKeyFor(hostname),
-      ordinal: i,
-      inputSummary: JSON.stringify({ hostname, contestId: args.contestId }),
-      // spec §Step 4: per-hostname は continueOnError=true。1 hostname の
-      // provider 失敗が他の独立 hostname を止めない。
-      continueOnError: true
-    }))
-    steps.push({
-      stepKey: CLEANUP_MARK_COMPLETED_STEP_KEY,
-      ordinal: sorted.length,
-      inputSummary: JSON.stringify({ contestId: args.contestId }),
-      // 最終 step は失敗を halt にする — reconciliation が clean でなければ
-      // Operation を failed にして operator 判断を待つ。
-      continueOnError: false
-    })
 
     const operations = yield* OperationRepo
     return yield* operations.enqueue({
@@ -236,29 +241,10 @@ export const scheduleContestCleanup = (args: {
     if (blocked.length > 0) {
       return yield* Effect.fail(new AmbiguousReconciliation({ hostnames: blocked }))
     }
-    const targetHostnames = new Set<string>()
-    for (const e of plan.entries) {
-      if (e.action === "cleanup" || e.action === "adopt_cleanup") targetHostnames.add(e.hostname)
-      else if (e.classification === "in_sync" && (e.bindingIds.length > 0 || e.proxmoxVmObserved)) {
-        targetHostnames.add(e.hostname)
-      }
-    }
-    if (targetHostnames.size === 0) {
+    const steps = buildCleanupSteps({ contestId: args.contestId, entries: plan.entries })
+    if (steps.length === 0) {
       return yield* Effect.fail(new NothingToReconcile())
     }
-    const sorted = Array.from(targetHostnames).sort()
-    const steps = sorted.map((hostname, i) => ({
-      stepKey: cleanupStepKeyFor(hostname),
-      ordinal: i,
-      inputSummary: JSON.stringify({ hostname, contestId: args.contestId }),
-      continueOnError: true
-    }))
-    steps.push({
-      stepKey: CLEANUP_MARK_COMPLETED_STEP_KEY,
-      ordinal: sorted.length,
-      inputSummary: JSON.stringify({ contestId: args.contestId }),
-      continueOnError: false
-    })
     const operations = yield* OperationRepo
     return yield* operations.enqueue({
       contestId: args.contestId,
