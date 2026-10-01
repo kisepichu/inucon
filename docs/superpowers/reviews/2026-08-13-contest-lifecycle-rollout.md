@@ -8,13 +8,14 @@ reconciliation)。本 report は Task 15 Step 12 の deliverable。
 runbook / verification (Task 15 Step 1-3) の完了、および人手フェーズ (Task
 15 Step 4-11) の rollout evidence を残す。
 
-**状態 (2026-09-23):** Step 6 (merge / image import / manifest apply) と
-Step 8 の突合部分までが完了。**Step 4 / Step 5 は実施できなかった**
-(§B-1 / §B-2 — 値を埋めず「実施せず」として確定)。Step 7 の benchvm 側、
-Step 9 / 10 / 11 は未実施。未実施項目には実行コマンドと期待結果を
-書いてあり、`TBD: <human>` は**人手でまだ実施していない値にのみ**残す。
+**状態 (2026-10-01):** Step 6 (merge / image import / manifest apply)、
+Step 7 (benchvm 起動 / agenix 切替 / 旧 token revoke)、Step 8 (突合 +
+archive Operation) が完了。**Step 4 / Step 5 は実施できなかった**
+(§B-1 / §B-2 — 値を埋めず「実施せず」として確定)。Step 9 / 10 / 11 は
+未実施。未実施項目には実行コマンドと期待結果を書いてあり、
+`TBD: <human>` は**人手でまだ実施していない値にのみ**残す。
 
-**値の扱い:** 本 report の実測値は 2026-09-22 / 09-23 に実機
+**値の扱い:** 本 report の実測値は 2026-09-22 / 09-23 / 10-01 に実機
 (apphost `192.0.2.20` / eevee `192.0.2.10` / 公開 API
 `http://192.0.2.20:30080`) から取得したもので、各節に再導出コマンドを
 併記した。再導出して値が変わったら、変わったこと自体を追記する。
@@ -196,8 +197,9 @@ gh api repos/kisepichu/inucon/pulls/68/comments --jq 'length'
 
 ## Section B: 人手担当 (Task 15 Step 4-11)
 
-実施日: **2026-09-22 〜 2026-09-23** (plan 策定は 2026-08-13、Task 14 は
-2026-08-18)。以下は human operator が実施した結果の記録。
+実施日: **2026-09-22 〜 2026-09-23**、および **2026-10-01** (Step 8 archive と
+readiness 修正)。plan 策定は 2026-08-13、Task 14 は 2026-08-18。以下は human
+operator が実施した結果の記録。
 
 **plan からの逸脱・rollout 中に発覚した欠陥のサマリ:**
 
@@ -209,6 +211,8 @@ gh api repos/kisepichu/inucon/pulls/68/comments --jq 'length'
 | 4 | 障害 (復旧済) | `inucon.kisen.one` が 35 日間 502 | §B-10 |
 | 5 | 前提崩れ | apphost の LAN IP が `.156` に流れ `PORTAL_URL` と不一致 | §B-11 |
 | 6 | 欠陥 (修復済) | claude-review CI が両 repo で機能していなかった | §C-2 |
+| 7 | 欠陥 (修復済) | readiness 6 件が一律 fail — provider inventory の sub-request 1 件の失敗が全体を道連れにしていた (他 3 原因と併せ PR #74) | §B-12 |
+| 8 | 欠陥 (未発火・修復済) | Task 14 の role 分割で `SDN.Use` / `VM.Config.CDROM` が欠落し、edition2 の team VM 作成が失敗する状態だった | §B-13 |
 
 逸脱 1・2 は同一原因 (§B-1) で、**値を後から埋めることは原理的に不可能**。
 `TBD: <human>` を残さず「実施せず」と確定させる。
@@ -637,27 +641,93 @@ live DB とは別プロセス (workstation の python3 `sqlite3`) で実行:
 ならない** (戻せない) が、「適用後の状態が破損していないこと」は
 独立に確定している。
 
-#### B-5-6. 未実施
+#### B-5-6. Archive Operation → **実施済 (2026-10-01)**
 
-| 項目 | 実行方法 | 期待結果 |
+Admin Web → edition1 → Overview タブ → 確認チェックボックス →
+「archive 再生成」で実行。
+
+| 項目 | 実測 |
+| --- | --- |
+| Operation ID | `48a138ae-8c85-471c-a5d6-be293823a633` |
+| kind / 最終 status | `backup` / `succeeded` |
+| plan digest | `backup:c1ed9ebf6-a6fe-412c-a923-364fea1837b3:r1` |
+| contest revision | 1 |
+| actor | admin (`cbdb4dd2-843c-4043-982e-a80cc9953165`) |
+| 作成 → 開始 → 終了 (JST) | 13:58:36 → 13:58:36 → 13:58:38 (所要 2 秒) |
+
+step は 3 件すべて attempt 1 で成功 (retry 無し):
+
+| # | step | bytes | SHA-256 |
+| --- | --- | --- | --- |
+| 0 | `write_scoreboard_json` | 261 | `ba648beb473f50293f49caf1251ad2a0fe160e83083a3a598c2caaffc697f201` |
+| 1 | `write_scoreboard_csv` | 169 | `da79dae41b29fe6556799f7690eda1e218aea216e08a5cf3b4b0d6def17c7e4e` |
+| 2 | `write_db_snapshot` | 212992 | `d5052c67b54ae37d9635ba1d8a17f919b2d4079f9689ef645bffab5c4dcec9fb` |
+
+##### off-host 取得と独立検証
+
+`/home/kise/backups/inucon/` (mode 0700) に `e1-scoreboard.json` /
+`e1-scoreboard.csv` / `e1-snapshot.sqlite` として取得。3 件とも
+`sha256sum` が上表 (= `contest_artifacts` 列の記録値) と完全一致。
+
+snapshot を live とは別プロセス (workstation の python3 `sqlite3`) で検証:
+
+| check | 結果 |
+| --- | --- |
+| `PRAGMA integrity_check` | `ok` |
+| `PRAGMA foreign_key_check` | 空 |
+| contests | 1 行 (`edition=1` / `finished` / `templateVmid=9100` / `legacy-2026-07-08` / `revision=1`) |
+| bestScore | 1077 |
+| 件数 | teams 2 / instances 1 / bench_jobs 6 / users 2 / operations 1 / contest_artifacts 2 |
+
+scoreboard JSON / CSV の内容も live と一致 (team1 `bestScore=1077` /
+`latestScore=910` / `latestAt=1784382401155`、team2-test-name は全 null)。
+CSV の列順は `teamId,teamName,bestScore,latestScore,latestAt`。
+
+**WAL の扱い**: snapshot は WAL journal mode なので `mode=ro` で開くと
+`-shm` / `-wal` が生成される。`immutable=1` で開くこと。生成して
+しまった場合も `-wal` が 0 bytes なら main file は無改変
+(本作業で生成 → SHA-256 一致を確認 → 側ファイル削除まで実施済)。
+
+##### 契約の確認 — archive は状態を変えない
+
+| 項目 | archive 前 | archive 後 |
 | --- | --- | --- |
-| Archive Operation ID | Admin Web → edition1 → Archive | Operation が `succeeded` |
-| scoreboard JSON SHA-256 | artifact ダウンロード後 `sha256sum` | `TBD: <human>` |
-| scoreboard CSV SHA-256 | 同上 | `TBD: <human>` |
-| DB snapshot artifact SHA-256 | 同上 | `TBD: <human>` |
-| off-host download 先 (mode 0700) | `/home/kise/backups/inucon/` | `TBD: <human>` |
-| provider mutation が発生していない確認 | archive 前後で `qm list` / Cloudflare DNS を比較 | 差分なし |
+| contest status / revision | `finished` / 1 | `finished` / 1 |
+| bench_jobs | finished 4 / failed 2 (全 `competition`) | 同一 |
+| bestScore | 1077 | 1077 |
+| Proxmox VM 一覧 | 100 / 9000 / 9100 / 9200 / 9300 (`inucon-team*` 無し) | 同一 |
+| Cloudflare Access apps | 10 件 (うち `inucon-team*` 2) | 同一 |
+| Cloudflare tunnel ingress | 3 件 (team1-1 / team2-1 / catch-all 404) | 同一 |
+| Cloudflare DNS | 32 件 (うち `inucon-team*` 2) | 同一 |
 
-Archive Operation は §B-4-2 #1-#3 (benchvm 起動と agenix 切替) の後に
-readiness を確認してから実行する。
+##### 未了 (人手)
 
-再導出 (突合部分):
+snapshot artifact の `off_host_status` は `pending`。Archive タブで
+SHA-256 を再入力して verified 化する。scoreboard 2 件は
+`not_applicable` (公開経路のため off-host 検証の対象外) で操作不要。
+
+再導出:
 ```sh
+# artifact の記録値 / off_host_status / 不変条件
+ssh kise@192.0.2.20 'kubectl -n inucon exec -i deploy/inucon-portal -- node -' <<'EOF'
+const D = require("/app/node_modules/.pnpm/better-sqlite3@12.11.1/node_modules/better-sqlite3")
+const db = new D("/data/portal.db", { readonly: true })
+console.log(db.prepare("SELECT kind,sha256,size_bytes,off_host_status FROM contest_artifacts").all())
+console.log(db.prepare("SELECT edition,status,revision FROM contests").all())
+console.log(db.prepare("SELECT status,purpose,COUNT(*) c FROM bench_jobs GROUP BY 1,2").all())
+console.log(db.prepare("SELECT MAX(score) b FROM bench_jobs").get())
+EOF
+
+# off-host 側の独立検証 (側ファイルを作らない)
+sha256sum /home/kise/backups/inucon/e1-*
+python3 -c "import sqlite3;d=sqlite3.connect('file:/home/kise/backups/inucon/e1-snapshot.sqlite?immutable=1',uri=True);print(d.execute('PRAGMA integrity_check').fetchall())"
+
+# 突合部分 (公開 API)
 curl -sS http://192.0.2.20:30080/api/contests
 curl -sS http://192.0.2.20:30080/api/contests/1ed9ebf6-a6fe-412c-a923-364fea1837b3/scoreboard
 curl -sS http://192.0.2.20:30080/api/scoreboard   # 互換 endpoint
 curl -sS http://192.0.2.20:30080/api/contest      # 互換 endpoint
-python3 -c "import sqlite3;d=sqlite3.connect('file:/home/kise/backups/inucon/portal-post-migration-0007-20260922T134215Z.db?mode=ro',uri=True);print(d.execute('PRAGMA integrity_check').fetchall())"
+python3 -c "import sqlite3;d=sqlite3.connect('file:/home/kise/backups/inucon/portal-post-migration-0007-20260922T134215Z.db?immutable=1',uri=True);print(d.execute('PRAGMA integrity_check').fetchall())"
 ```
 
 ### B-6. Step 9 — 初回 reconciliation apply → **未実施**
@@ -666,17 +736,54 @@ python3 -c "import sqlite3;d=sqlite3.connect('file:/home/kise/backups/inucon/por
 step であり、§B-4-2 #1-#3 (benchvm 起動 + agenix 切替) が前提。
 
 - 実行方法: Admin Web → Reconciliation → Refresh → plan 確認 → Apply
-- 期待される plan:
-  - team1-1: missing Proxmox VM + Cloudflare cleanup、実測 `TBD: <human>`
-  - team2-1: unmanaged Cloudflare orphan **blocked**、実測 `TBD: <human>`
-  - catch-all / portal / 無関係 resource: no action、実測 `TBD: <human>`
-- 選択する adopt hostname: `inucon-team2-1.kisen.one` (明示 adopt)
+
+#### B-6-1. 事前登録した期待 plan (2026-10-01)
+
+**UI の出力を後から正当化しないため、押す前にコードと実測 inventory から
+導出した期待値を固定しておく。**
+
+plan の hostname key は **FQDN ではなく stem**
+(`MANAGED_HOSTNAME_PATTERN = /^inucon-team\d+-\d+$/`)。desired 側は
+`inucon-team{team_number}-{instance.idx}`、observation 側は Cloudflare
+hostname / Proxmox VM 名の先頭ラベル。
+
+導出の入力 (すべて 2026-10-01 実測):
+
+| 源 | 実測 |
+| --- | --- |
+| DB `teams` | team1 (`team_number=1`, desired 1) / team2-test-name (`team_number=2`, desired 0) |
+| DB `instances` | 1 行 (`idx=1`, `vmid=1101`, `running`, team1) |
+| DB `resource_bindings` | 0 行 |
+| Proxmox `listManagedVms` | 0 件 (`qm list` は 100 / 9000 / 9100 / 9200 / 9300 のみ) |
+| CF routes (DNS + tunnel ingress) | `inucon-team1-1` / `inucon-team2-1` 各 1 |
+| CF Access apps | `inucon-team1-1` / `inucon-team2-1` 各 1 |
+
+`classifyHostname` に通すと entry は **2 件だけ**生成される:
+
+| hostname | desired | VM 観測 | route/ingress/app | classification | action | reason |
+| --- | --- | --- | --- | --- | --- | --- |
+| `inucon-team1-1` | あり (`idx=1`, `running`) | **無し** | 1 / 1 / 1 | `missing` | `cleanup` | `vm_missing` |
+| `inucon-team2-1` | 無し | 無し | 1 / 1 / 1 | `unmanaged_orphan` | `blocked` → adopt 後 `adopt_cleanup` | `requires_adopt_confirmation` → `adopted_for_cleanup` |
+
+catch-all / `inucon` (portal) / `miniflux` / `dawarich` / `rss` /
+`devvm` は `MANAGED_HOSTNAME_PATTERN` に当たらないため
+**entry 自体が生成されない** (「action なしの行が出る」のではなく不在)。
+
+route / ingress / app がいずれも 1 なので `duplicated` 判定
+(いずれか > 1) には落ちない。したがって `ambiguous` は出ない。
+
+#### B-6-2. 実測
+
+- 実測 plan (entry 一覧): `TBD: <human>`
+- 選択した adopt: `inucon-team2-1` (stem)。UI の `requiredAdopt` は plan の
+  entry から導出されるため、operator が hostname 文字列を入力する余地は
+  無い (FQDN を渡す経路が存在しない)
 - apply Operation ID: `TBD: <human>`
 - step 遷移: `TBD: <human>` (queued → running → succeeded の時刻)
 - apply Operation 最終 status: `TBD: <human>` (期待: succeeded)
 
-**apply 前に必ず確認する**: catch-all / portal / 無関係リソースに
-action が出ていないこと。1 件でも出ていたら apply せず
+**apply 前に必ず確認する**: 上表の 2 件以外に entry が出ていないこと。
+1 件でも増えていたら apply せず
 `docs/runbooks/contest-recovery.md` §1 (stale plan) に従う。
 
 ### B-7. Step 10 — Post-cleanup 状態 → **未実施**
@@ -1000,6 +1107,118 @@ ssh kise@192.0.2.20 hostname
 - 未実施の理由: age 再封入は benchvm 停止中には検証できず、
   §B-4-2 #1-#2 と同時に実施するのが安全なため。
 
+### B-12. readiness 6 件の一律 fail (2026-10-01、修復済)
+
+Step 8 の archive 実行前に readiness を確認したところ、13 項目のうち
+**6 件が同一文面 `Proxmox inventory unreadable` で fail**、さらに
+`cloudflare_inventory` が `Cloudflare inventory read failed` で fail して
+いた。本番で切り分けた結果、独立した 4 原因だった。
+
+| # | 症状 | 根本原因 | 影響していた check |
+| --- | --- | --- | --- |
+| D1 | Proxmox inventory 全体が読めない | PVE 9.2.3 の `GET /nodes/:node/services/:service/state` はカスタム unit 名を**固定 enum で検証**し、404 ではなく **HTTP 400** を返す。実装は 404 だけを畳んでいたため 400 が inventory 全体に伝播 | `template` / `team_slots` / `isolation` / `memory` / `benchvm` / `mode_vm_identity` |
+| D2 | `team_slots` が fail | `team1` / `team2` は Proxmox SDN の vnet (zone=inucon, type=simple) なので `/nodes/:node/network` には現れない (実測: `nic0` / `nic1` / `nic2` / `vmbr0` / `wlp4s0` の 5 件のみ) | `team_slots` |
+| D3 | `template` が確認できない | template 9100 は `/pool/inucon-team-vms` 所属で、mode credential の ACL では `qm list` に出ない | `template` |
+| D4 | Cloudflare inventory が読めない | `/accounts/:id/access/apps` に `per_page=5000` を渡すと **HTTP 400** (`12091 access.api.error.invalid_url_parameter_value`)。実測で `100` / `500` / `1000` は 200、`101` と `5000` は 400 (各 3 回、完全に再現) | `cloudflare_inventory` |
+
+#### 修正 (PR #74 → develop `771e381` → main `25d87bb`)
+
+- inventory の各フィールドを `Option` 化し、**sub-request 1 件の失敗を
+  当該 check だけに閉じ込める**。reader は厳格なまま (非 2xx/404 は
+  `ProxmoxError`)、集約側の `optionalSubRead` が `None` に畳む。
+- `team_slots` は classic bridge と SDN vnet (`/cluster/sdn/vnets`) の
+  **和集合**を取り、従来どおり benchvm の VM config の bridge と積集合。
+- `template` は provision credential 経由で確認 (本番 ACL は広げない)。
+- Cloudflare は `per_page=100` + `result_info.total_pages` の
+  ページネーション。**途中のページで 0 件が返ったら fail-closed**
+  (黙って打ち切ると reconciliation が resource を見落として誤った plan を
+  出す)。これは Claude review round 1 の指摘で追加した。
+
+#### 設計判断: `isolation` を required gate から外した
+
+PVE 9 ではカスタム unit の状態を API から観測する手段が無い:
+`GET /nodes/:node/services` の一覧も `PVE::API2::Services` の
+`$service_list` という同じ固定リストしか返さず、分離の実体は生の
+iptables FORWARD ルールなので Datacenter Firewall API にも現れない。
+
+観測不能な条件を `START_REQUIRED_CHECK_KEYS` に残すと start が**恒久的に
+ブロック**されるため、「観測できたとき (2xx / 404) だけ pass / fail、
+観測不能 (400 等) なら **warn**」に落とした。代償として
+`infra/docs/team-isolation.md` の開催前チェックリストに手動確認を 1 項目
+追加した:
+
+```sh
+ssh root@192.0.2.10 "systemctl is-active inucon-team-isolation && \
+  iptables -C FORWARD -s 10.100.0.0/16 -d 10.100.0.0/16 -j DROP && echo OK"
+```
+
+#### 検証
+
+`pnpm -r typecheck` green、`pnpm -r test` green (portal 724 passed /
+2 skipped、runner 14、web 33)。D1 / D2 / D4 は **mutation で実測** —
+修正を巻き戻すと対応するテストが落ちることを確認した
+(D1: 400 を 404 と同様に畳む → `isolation service state が 400 でも
+inventory 全体は落ちず…` が fail / D2: SDN vnet 読み取りを空配列化 →
+`team bridge が SDN vnet にしか無くても…` が fail / D4:
+`CF_PAGE_SIZE` を 5000 に戻す → ページネーション 3 件が fail)。
+
+### B-13. Proxmox role 分割時の priv 欠落 (2026-10-01、修復済・未発火)
+
+§B-12 D2 の修正は**コードだけでは効かなかった**。PVE の
+`/cluster/sdn/vnets` の index は SDN ACL でフィルタされ、**権限が無いと
+403 ではなく空配列**を返す。両 token で実測すると `HTTP 200 n=0`。
+
+付与先を決めるため Task 14 で分割した role 群を旧 `InuconPortal`
+(Phase 3 spike で実際の API 呼び出しから削り込んだ最小権限) と突き合わせた
+ところ、**2 priv が欠落**していた。
+
+| priv | 旧 `InuconPortal` | Task 14 後 | 必要な理由 |
+| --- | --- | --- | --- |
+| `SDN.Use` | あり | **無し** | team VM の NIC を SDN vnet (`team1` / `team2`) に接続する |
+| `VM.Config.CDROM` | あり | **無し** | cloud-init ISO を ide2 に設定する (`qm start` が `generating cloud-init ISO` を出す経路) |
+
+いずれも **edition2 の provisioning で初めて顕在化する潜伏バグ**で、
+readiness にも archive にも出ない。今回 SDN 調査の副産物として発見した。
+
+#### 実施した変更 (eevee、このリポジトリ外)
+
+```sh
+# readiness の vnet 可視性 (mode は read-only で足りるので SDN.Audit のみの custom role)
+pveum role add InuconSdnAudit --privs SDN.Audit
+pveum acl modify /sdn/zones/inucon --roles InuconSdnAudit --user inucon-mode@pve
+
+# provision は inventory 読み取り + vnet 接続の両方が要る
+pveum acl modify /sdn/zones/inucon --roles PVESDNUser --user inucon-provision@pve
+
+# cloud-init ISO 用 priv の parity 回復
+pveum role modify InuconProvisionVm --privs "VM.Allocate,VM.Audit,VM.Clone,VM.Config.CDROM,VM.Config.Cloudinit,VM.Config.Disk,VM.Config.Network,VM.Config.Options,VM.GuestAgent.Audit,VM.GuestAgent.Unrestricted,VM.PowerMgmt"
+```
+
+変更前の `pveum acl list` / `pveum role list` / `/etc/pve/user.cfg` は
+`eevee:/root/acl-sdn-20261001T063921Z/` (mode 0700) に保存済。
+
+#### 変更後の ACL (全体)
+
+| path | role | user |
+| --- | --- | --- |
+| `/nodes/eevee` | `InuconNodeAudit` | mode / provision |
+| `/pool/inucon-team-vms` | `InuconProvisionVm` | provision |
+| `/sdn/zones/inucon` | `InuconSdnAudit` | mode |
+| `/sdn/zones/inucon` | `PVESDNUser` | provision |
+| `/storage/local-zfs` | `PVEDatastoreUser` | provision |
+| `/vms/9200`, `/vms/9300` | `InuconMode` | mode |
+
+#### 効果の実測
+
+| path | 変更前 | 変更後 |
+| --- | --- | --- |
+| `/cluster/sdn/vnets` (mode) | `200 n=0` | `200 n=2` (`team1`, `team2`) |
+| `/cluster/sdn/vnets` (provision) | `200 n=0` | `200 n=2` |
+| `/cluster/sdn/zones` (両方) | `200 n=0` | `200 n=1` (`inucon`) |
+
+`/nodes/eevee/network` は変更後も token では 4 件 (`vmbr0` が見えない)
+ままだが、§B-12 D2 の和集合により `team_slots` の判定には影響しない。
+
 ---
 
 ## Section C: 残っている human check / 未解決事項
@@ -1189,6 +1408,8 @@ read-only な `Bash(...)` 群 / `--disallowedTools "Edit,Write,Agent"`。
 | 7 | claude-review の inline comment が **INUCON 側で恒常的に投稿されない** (open PR + allowlist 済 + findings ありでも 0 件)。`nixos-config-private` 側は未証明のまま | §C-2-6 | upstream の MCP provision 条件を確認。当面は sentinel の `-- see inline comments` を信用せず `issues/<n>/comments` を読む |
 | 8 | `nixos-config-private` PR #35 の Medium / Low findings 2 件が未対応 | §C-2-6 | `provision-inucon-proxmox-credentials.sh` の修正 PR を立てる |
 | 9 | off-host snapshot が 1 世代のみ | §B-3-6 / §C-1 | 3 世代ローテーションを運用に入れる |
+| 10 | `getInstanceInventory` が managed app 1 件ごとに `getPolicies` を呼ぶが、得られる `policyShape` / `emailSetHash` は**どの判定にも表示にも使われていない** (`classifyHostname` は受け取らない。client.ts の「planner は emailSetHash で drift を検出できる」は未実装の願望)。plan refresh ごとに team 数の CF API call を無駄に払っており、CF は 429 を踏みやすい | 2026-10-01 のコード走査 (`policyShape` / `emailSetHash` を `portal/src` `portal/web` `shared/src` から検索し、消費箇所がゼロ) | drift 検出を実装するか、inventory から policy 取得を外す。どちらかに決める |
+| 11 | Proxmox role / ACL が repo 外 (eevee のローカル状態) にしか無く、Task 14 の分割時に旧 `InuconPortal` から `SDN.Use` / `VM.Config.CDROM` が落ちたことが**どの検証にも引っかからなかった** | §B-13 | `pveum role list` / `pveum acl list` の期待値を `nixos-config-private` 側に置き、`eevee-ops-test.sh` 相当で突合する |
 
 ---
 
