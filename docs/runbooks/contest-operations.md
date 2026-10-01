@@ -99,13 +99,26 @@ scoreboard は開催回ごとに分離される。手順の全体像:
    Admin Web の即時 finalize (`POST /api/admin/contests/:id/finalize`) を
    使う。
 6. `finalizing → finished` 遷移で archive Operation が自動 enqueue され、
-   scoreboard JSON/CSV + DB snapshot artifact が生成される。Artifacts
-   タブから SHA-256 verify を実行し、off-host に取り出して確認する
+   scoreboard JSON/CSV + DB snapshot artifact が生成される。**Archive**
+   タブで DB snapshot を download し、off-host で SHA-256 を照合してから
+   同タブに checksum を再入力して verified に上げる
    (`docs/superpowers/reviews/2026-08-13-contest-lifecycle-rollout.md`
-   に off-host 検証結果を記録)。
-7. 後片付けは Contests → 該当開催 → **Return normal mode** (devvm
-   復帰) と **Cleanup** Operation (managed 外部 resource の撤収) を
-   Admin Web から実行する。
+   に off-host 検証結果を記録)。scoreboard JSON/CSV は公開経路のため
+   `off_host_status` は `not_applicable` で、verify 操作は不要。
+7. 後片付けは **順序が決まっている**。それぞれ前 gate を持つので、
+   飛ばすと後段が blocked になる:
+
+   | # | 操作 | 前 gate | 飛ばすとどうなるか |
+   | --- | --- | --- | --- |
+   | 7-1 | **Reconciliation** タブ → Refresh → 未 adopt の orphan があれば adopt して apply | — | Cleanup が `AmbiguousReconciliation` で拒否される。Cleanup は常に `adoptHostnames: []` で plan を取り直すため、**Cleanup 側から orphan を adopt する経路は無い** |
+   | 7-2 | **Cleanup** Operation (managed 外部 resource の撤収 + Instance を `deleted` に遷移) | blocked entry が 0 件 | Return normal mode が `ResidualManagedResource` (409) で拒否される。また Instance が `deleted` に落ちないため、次回開催の readiness `previous_cleanup` が fail し続け **draft から `preparing` に上がれない** |
+   | 7-3 | **Return normal mode** (benchvm 停止 → devvm 復帰) | managed VM が Proxmox に残っていない | handler の `verify_no_managed_vms` で blocked |
+
+   7-1 で adopt を要求されるのは「命名規約に合致する hostname の
+   Cloudflare resource があるが、DB 側に対応する Instance / binding が
+   無い」場合 (`unmanaged_orphan`)。portal が作ったものではない可能性が
+   あるため、**明示 adopt なしには絶対に消さない**設計になっている。
+   adopt する前に対象 hostname が本当に過去開催の残骸かを確認する。
 
 **古い制約 (第1回時点) は撤廃済み**: 「同じ DB で次回を開催するには pod を
 止めて `portal.db` を消して seed し直す」「contest 行の status を SQL で

@@ -93,6 +93,14 @@ unmanaged_orphan の adopt 未確認、または CF Access policy が INUCON 用
    478 行) の場合は **リロードして plan 再取得** で解決する。競合状態が
    仕様通り検知された結果なので upgrade path は不要。
 
+**Cleanup Operation も同じ 422 を出す**。こちらは
+`cleanupContestResources` / `scheduleContestCleanup` が常に
+`adoptHostnames: []` で plan を取り直すため、**Cleanup 側から adopt する
+経路は存在しない**。未 adopt の orphan がある状態で Cleanup を押すと必ず
+422 になるので、先に上記 1 の手順で Reconciliation タブから adopt +
+apply を済ませる。順序は
+`docs/runbooks/contest-operations.md` の「次回開催を作る」§7 の表に従う。
+
 **復帰確認**: Reconciliation タブで対象 hostname が一覧から消える。
 apply Operation が succeeded。Cloudflare 側 dashboard で app / DNS が
 消えていることを目視確認 (dash 変更は一切しないこと)。
