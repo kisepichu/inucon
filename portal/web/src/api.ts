@@ -198,6 +198,9 @@ export const api = {
   // getAdminOperation は steps を含む OperationWithSteps を返す。
   getAdminOperation: (operationId: OperationId) =>
     request<OperationWithSteps>(`/api/admin/operations/${operationId}`),
+  // queued / failed / blocked の Operation を canceled にする (それ以外は 409)。
+  cancelAdminOperation: (operationId: OperationId) =>
+    request<Operation>(`/api/admin/operations/${operationId}/cancel`, { method: "POST" }),
   listContestOperations: (contestId: ContestId, limit?: number) =>
     request<Array<Operation>>(
       `/api/admin/contests/${contestId}/operations${limit === undefined ? "" : `?limit=${limit}`}`

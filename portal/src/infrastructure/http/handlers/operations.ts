@@ -1,5 +1,5 @@
 import { HttpApiBuilder } from "@effect/platform"
-import { Effect, Option } from "effect"
+import { Clock, Effect, Option } from "effect"
 import {
   AmbiguousReconciliation,
   api,
@@ -8,6 +8,7 @@ import {
   ContestRevisionConflict,
   InstanceNotFound,
   InvalidContestTransition,
+  InvalidOperationTransition,
   NotFound,
   NothingToReconcile,
   OperationalContestConflict,
@@ -330,6 +331,31 @@ export const OperationsLive = HttpApiBuilder.group(api, "operations", (handlers)
           }))
         }
       }).pipe(Effect.orDie)
+    )
+    // 遷移規則 (queued / failed / blocked のみ、running step があれば拒否) は
+    // OperationRepo.cancel が単一 tx で判定する。repo は不在 id を defect にする
+    // 呼び出し規約なので、先に findById で 404 を返す (retry と同じ)。
+    .handle("cancelAdminOperation", ({ path }) =>
+      Effect.gen(function* () {
+        const ops = yield* OperationRepo
+        if (Option.isNone(yield* ops.findById(path.operationId))) {
+          return yield* Effect.fail(new NotFound())
+        }
+        const now = yield* Clock.currentTimeMillis
+        return yield* ops.cancel(path.operationId, now)
+      }).pipe(
+        Effect.map((op) => ({
+          ...op,
+          sanitizedError: Option.getOrNull(op.sanitizedError),
+          startedAt: Option.getOrNull(op.startedAt),
+          finishedAt: Option.getOrNull(op.finishedAt)
+        })),
+        Effect.catchTags({
+          InvalidOperationTransition: (e) =>
+            Effect.fail(new InvalidOperationTransition({ from: e.from, to: e.to }))
+        }),
+        Effect.orDie
+      )
     )
     // Task 13: ContestAdmin の Operations タブ用一覧。limit は 20 既定 / 100 上限。
     // Contest 存在チェックはリスト応答が空 [] と区別が付かなくなるのを避けるため

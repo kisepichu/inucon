@@ -35,6 +35,7 @@ import {
   Me,
   Operation,
   OperationId,
+  OperationStatus,
   OperationWithSteps,
   PollJobResponse,
   PreparationPlan,
@@ -377,6 +378,15 @@ export class ContestModeNotActive extends Schema.TaggedError<ContestModeNotActiv
       "benchvm_not_running"
     )
   },
+  HttpApiSchema.annotations({ status: 409 })
+) {}
+
+// POST /api/admin/operations/:operationId/cancel: queued / failed / blocked 以外
+// (running / succeeded / canceled) からの cancel 要求。domain の cancelOperation /
+// OperationRepo.cancel が返す遷移エラーをそのまま写す。
+export class InvalidOperationTransition extends Schema.TaggedError<InvalidOperationTransition>()(
+  "InvalidOperationTransition",
+  { from: OperationStatus, to: OperationStatus },
   HttpApiSchema.annotations({ status: 409 })
 ) {}
 
@@ -888,6 +898,18 @@ export const operationsGroup = HttpApiGroup.make("operations")
     )`/api/admin/operations/${HttpApiSchema.param("operationId", OperationId)}`
       .addSuccess(OperationWithSteps)
       .addError(NotFound)
+      .middleware(AdminOnly)
+  )
+  // Operation を canceled にして global lock を外す。cancel できるのは
+  // queued / failed / blocked だけで、判定は OperationRepo.cancel が単一 tx で行う。
+  // 実行済み step が作った外部 resource は巻き戻さない。
+  .add(
+    HttpApiEndpoint.post(
+      "cancelAdminOperation"
+    )`/api/admin/operations/${HttpApiSchema.param("operationId", OperationId)}/cancel`
+      .addSuccess(Operation)
+      .addError(NotFound)
+      .addError(InvalidOperationTransition)
       .middleware(AdminOnly)
   )
   // Task 13: ContestAdmin の Operations タブ用一覧。createdAt DESC + limit。

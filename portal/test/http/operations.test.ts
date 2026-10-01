@@ -10,6 +10,8 @@ import type { ContestStatus } from "../../src/domain/contest.js"
 import { ContestId, InstanceId, OperationId, ResourceBindingId, TeamId } from "../../src/domain/ids.js"
 import { Instance } from "../../src/domain/instance.js"
 import { BENCHVM_VM_NAME, BENCHVM_VMID, DEVVM_VM_NAME, DEVVM_VMID } from "../../src/domain/modeVmIds.js"
+import { sanitizeOperationError } from "../../src/domain/operation.js"
+import type { OperationStatus } from "../../src/domain/operation.js"
 import { ResourceBinding } from "../../src/domain/resourceBinding.js"
 import type { InfrastructureInventorySeed } from "../support/inMemory.js"
 import { login } from "../support/login.js"
@@ -1060,6 +1062,144 @@ describe("GET /api/admin/contests/:contestId/operations (Task 13)", () => {
         headers: { cookie }
       })
       expect(res.status).toBe(200)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+})
+
+// POST /api/admin/operations/:operationId/cancel (AdminOnly)。遷移規則
+// (queued / failed / blocked のみ) は OperationRepo.cancel が持つので、ここでは
+// 認可・status ごとの可否・cancel で global lock が外れることを境界で確かめる。
+describe("POST /api/admin/operations/:operationId/cancel", () => {
+  const CANCEL_CONTEST_ID = ContestId.make("c-cancel")
+
+  // Operation を worker と同じ repo 遷移で指定 status まで進める。
+  const seedOperation = (status: OperationStatus) =>
+    Effect.gen(function* () {
+      const contests = yield* ContestRepo
+      yield* contests.create(
+        makeContest({ id: CANCEL_CONTEST_ID, edition: 2, status: "preparing", revision: 1 })
+      )
+      const ops = yield* OperationRepo
+      const op = yield* ops.enqueue({
+        contestId: CANCEL_CONTEST_ID,
+        kind: "enter_contest_mode",
+        actor: { kind: "scheduler" },
+        planDigest: "digest-cancel",
+        contestRevision: 1,
+        steps: [{ stepKey: "step-a", ordinal: 0, inputSummary: "{}", continueOnError: false }]
+      })
+      if (status === "canceled") yield* ops.cancel(op.id, 1)
+      if (status !== "queued" && status !== "canceled") {
+        const stepId = Option.getOrThrow(yield* ops.claimNext(1)).id
+        const err = sanitizeOperationError({ _tag: "ProxmoxError" })
+        if (status === "succeeded") yield* ops.completeStep(stepId, "ok", 2)
+        if (status === "failed") yield* ops.failStep(stepId, err, Option.none(), 2)
+        if (status === "blocked") yield* ops.blockStep(stepId, err, 2)
+      }
+      expect(yield* statusOf(op.id)).toBe(status)
+      return op.id
+    })
+
+  const statusOf = (id: OperationId) =>
+    OperationRepo.pipe(
+      Effect.flatMap((ops) => ops.findById(id)),
+      Effect.map((op) => Option.getOrThrow(op).status)
+    )
+
+  const postCancel = (cookie: string | null, id: string) =>
+    Effect.gen(function* () {
+      const client = yield* HttpClient.HttpClient
+      return yield* client.post(
+        `/api/admin/operations/${id}/cancel`,
+        cookie === null ? {} : { headers: { cookie } }
+      )
+    })
+
+  it.effect("未認証は 401 で、Operation は blocked のまま", () =>
+    Effect.gen(function* () {
+      const id = yield* seedOperation("blocked")
+      const res = yield* postCancel(null, id)
+      expect(res.status).toBe(401)
+      expect(yield* statusOf(id)).toBe("blocked")
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("非 admin は 403 で、Operation は blocked のまま", () =>
+    Effect.gen(function* () {
+      const id = yield* seedOperation("blocked")
+      const { cookieHeader } = yield* login({ githubLogin: "u-cancel-nonadmin", githubId: 8300 })
+      const res = yield* postCancel(cookieHeader, id)
+      expect(res.status).toBe(403)
+      expect(yield* statusOf(id)).toBe("blocked")
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("存在しない Operation は 404", () =>
+    Effect.gen(function* () {
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const res = yield* postCancel(cookie, "op-missing")
+      expect(res.status).toBe(404)
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  for (const status of ["queued", "failed", "blocked"] as const) {
+    it.effect(`${status} は 200 で canceled の Operation を返し、DB も canceled になる`, () =>
+      Effect.gen(function* () {
+        const id = yield* seedOperation(status)
+        const { cookieHeader: cookie } = yield* asAdmin()
+        const res = yield* postCancel(cookie, id)
+        expect(res.status).toBe(200)
+        const body = Schema.decodeUnknownSync(Operation)(yield* res.json)
+        expect(body.id).toBe(id)
+        expect(body.status).toBe("canceled")
+        expect(body.finishedAt).not.toBeNull()
+        expect(yield* statusOf(id)).toBe("canceled")
+      }).pipe(Effect.provide(OperationsTestLayer))
+    )
+  }
+
+  for (const status of ["running", "succeeded", "canceled"] as const) {
+    it.effect(`${status} は 409 InvalidOperationTransition で拒否し、状態を変えない`, () =>
+      Effect.gen(function* () {
+        const id = yield* seedOperation(status)
+        const { cookieHeader: cookie } = yield* asAdmin()
+        const res = yield* postCancel(cookie, id)
+        expect(res.status).toBe(409)
+        expect(yield* res.json).toEqual({ _tag: "InvalidOperationTransition", from: status, to: "canceled" })
+        expect(yield* statusOf(id)).toBe(status)
+      }).pipe(Effect.provide(OperationsTestLayer))
+    )
+  }
+
+  // runbook / UI の「running は lease 切れを待っても cancel できない」の根拠。
+  // resumeExpired は step だけを queued に戻し、Operation は running のまま残る。
+  it.effect("running は lease 切れで step が queued に戻っても 409 のまま", () =>
+    Effect.gen(function* () {
+      const id = yield* seedOperation("running")
+      const ops = yield* OperationRepo
+      expect(yield* ops.resumeExpired(Number.MAX_SAFE_INTEGER)).toBe(1)
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const res = yield* postCancel(cookie, id)
+      expect(res.status).toBe(409)
+      expect(yield* statusOf(id)).toBe("running")
+    }).pipe(Effect.provide(OperationsTestLayer))
+  )
+
+  it.effect("blocked を cancel すると global lock が外れ、同じ Contest で次の Operation を enqueue できる", () =>
+    Effect.gen(function* () {
+      const id = yield* seedOperation("blocked")
+      const { cookieHeader: cookie } = yield* asAdmin()
+      const startPath = `/api/admin/contests/${CANCEL_CONTEST_ID}/start`
+
+      const locked = yield* postJson(cookie, startPath, { expectedRevision: 1 })
+      expect(locked.status).toBe(409)
+      expect(yield* locked.json).toEqual({ _tag: "OperationalContestConflict" })
+
+      expect((yield* postCancel(cookie, id)).status).toBe(200)
+
+      const res = yield* postJson(cookie, startPath, { expectedRevision: 1 })
+      expect(res.status).toBe(200)
+      expect(yield* res.json).toMatchObject({ kind: "start", status: "queued", contestId: CANCEL_CONTEST_ID })
     }).pipe(Effect.provide(OperationsTestLayer))
   )
 })

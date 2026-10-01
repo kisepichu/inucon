@@ -13,7 +13,9 @@
 - **Admin Web**: https://inucon.kisen.one/admin 。復旧操作の第一選択。
 - **Operation**: `portal` の永続 worker が実行する durable step 群。状態は
   `queued → running → succeeded|failed|blocked|canceled`。**global で
-  同時 1 本**(SQLite の partial unique index が強制する)。
+  同時 1 本**(SQLite の partial unique index が強制する)。`failed` /
+  `blocked` も lock を掴んだままなので、残っている間は次の Operation を
+  enqueue できない。外すには cancel する (§13「Operation の cancel」)。
 - **ResourceBinding**: portal が所有権を主張している外部 resource
   (Proxmox VM / Cloudflare DNS/Access/tunnel ingress) の台帳。
 - **plan digest**: reconciliation plan の SHA-256。UI に表示されたものが
@@ -204,9 +206,8 @@ runner を止める」**。portal 側は power 操作の前に observed name を
 2. できないなら eevee で **`qm shutdown 9300`** をもう一度発行
    (guest ACPI shutdown。`qm stop` は絶対に使わない — force stop 禁止
    は `application/ports.ts` の `ProxmoxPort` 定義のコメントと設計制約)。
-3. `qm status 9300` が `stopped` になったら対象 Operation を **cancel**
-   する。Admin Web に cancel UI は無いので §12 「Contest stuck in
-   `finalizing`」手順 2 の SQL で canceled 化する。**cancel だけでは
+3. `qm status 9300` が `stopped` になったら対象 Operation を OperationDetail
+   から **cancel** する (§13「Operation の cancel」)。**cancel だけでは
    再開しない**: `contestScheduler` の tick は `tickFinalize` /
    `tickRevokeAccess` / `tickCleanup` の 3 種しか無く
    (`portal/src/infrastructure/worker/contestScheduler.ts`)、
@@ -272,7 +273,7 @@ Operation が succeeded で終わり、`benchvm (9200)` が `running` になる
 
 **復旧手順**:
 1. 明らかに 5-10 分待てば KSM で下がる状況なら、該当 Operation を
-   **cancel** し (Admin Web に cancel UI は無いので §12 手順 2 の SQL)、
+   OperationDetail から **cancel** し (§13「Operation の cancel」)、
    5-10 分後に再度 apply / start / mode 遷移 / インスタンス準備をリクエスト
    (mode 遷移とインスタンス準備は ContestAdmin → Overview のボタン)。
    インスタンス準備は既に running の枠を作り直さず、残りの枠から 1 台ずつ
@@ -286,7 +287,7 @@ Operation が succeeded で終わり、`benchvm (9200)` が `running` になる
 4. 恒久的に足りないなら quota / desiredInstanceCount を下げる
    (Contest 設定変更 → Reconciliation タブで診断 → 適用)。
 5. `return_normal_mode` が blocked の場合、devvm を当面使わないなら
-   cancel して contest mode に戻す。この時点で benchvm / devvm とも停止・
+   cancel (§13) して contest mode に戻す。この時点で benchvm / devvm とも停止・
    onboot 0 なので、次回開催を preparing に上げてから ContestAdmin →
    **Overview** の **「競技モード切替」** (`contest-operations.md` 手順 3-2)
    を押す。devvm 側の step は即成功し、memory_check → benchvm の onboot=1
@@ -382,14 +383,17 @@ Cleanup 欄) から enqueue された cleanup Operation が terminal で `failed
    `attempt` が `maxAttempts` に達したら次項へ。
 2. **`blocked` (operator 判断待ち)**:
    - adopt 未確認 → §2 「Ambiguous Cloudflare policy」に従い adopt 指定
-     を追加。cleanup Operation は cancel してから Reconciliation を
+     を追加。cleanup Operation は cancel (§13) してから Reconciliation を
      再 apply し、完了後に「診断」→ Cleanup 欄から cleanup を再実行。
    - `hostname_adopted_concurrently` → plan 再取得。
    - shutdown timeout → §5。
-3. **`failed`**: 一度 cancel し、Reconciliation タブで「診断」→ 差分と
+3. **`failed`**: 一度 cancel (§13) し、Reconciliation タブで「診断」→ 差分と
    Cleanup 欄の対象 hostname / VMID を確認してから「cleanup 実行」で
    投入し直す (idempotent。DB 側の ResourceBinding は残るので二重実行
-   しても外部側の作業は増えない)。
+   しても外部側の作業は増えない)。`cleanupAt` を過ぎていれば、cancel 後
+   の scheduler tick (5 秒間隔) が cleanup を自動で積み直すことがある。
+   Operations タブに新しい cleanup が出ていれば手動の投入は不要 (押すと
+   `OperationalContestConflict (409)`)。
 
 **復帰確認**: 再投入した Operation が succeeded、Reconciliation 差分が
 消える。§10 「Post-cleanup 状態の検証」を実施 (rollout Step 10 相当)。
@@ -509,84 +513,165 @@ Operations タブに 1 本の Operation が `blocked` で残っている。sched
 **復旧手順**:
 1. まず OperationDetail の指示に従って **物理条件を直す**
    (shutdown timeout なら §5、memory なら §6、CF ambiguous なら §2)。
-2. Operation を **cancel** する。canonical な経路は Admin Web
-   だが、Task 15 時点で cancel UI 未実装 (`shared/src/api.ts` に cancel
-   endpoint 無し、`OperationDetail.tsx` にもボタン無し) のため、当面は
-   **portal pod 内から SQL 直叩き** で対象 Operation を canceled 化する。
-   `OperationRepo.cancel` (`portal/src/infrastructure/sql/repos/operationRepo.ts`
-   623-691 行) が実際にやっているのは以下 3 段: (a) running な
-   `operation_steps` 行が無いことの pre-check、(b) `operations` を
-   `canceled` に UPDATE、(c) 残っている `queued` step を `failed` +
-   `sanitized_error='{"code":"canceled",...}'` に落として terminal 化
-   (queued step を残すと `listSteps` の UI が「実行可能に見えるが絶対に
-   実行されない」ゴミ行を返し続ける)。同じ 3 段を SQL でそのまま再現する:
-   ```sh
-   # 対象 Operation の id は Admin Web の OperationDetail URL から取得。
-   # NOW=<現在 epoch ms>。復旧目的の 1 回限りの介入で、通常フローには
-   # 現れない (通常フローは Admin Web から実行し切る)。
-   # $OP は shell 展開で SQL 文字列に埋め込む。paste 事故で余計な '
-   # や ; が入るとステートメント境界が崩れうる。実行前に UUID 形式
-   # (`crypto.randomUUID()` の v4 出力、例: 0193e5a8-9c1d-4abc-8f01-23456789abcd)
-   # であることを目視確認し、以下の正規表現でも一度弾いておく:
-   OP=<opId>
-   NOW=$(node -e 'console.log(Date.now())')
-   printf '%s\n' "$OP" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
-     || { echo "OP is not a UUID: $OP" >&2; return 1 2>/dev/null || exit 1; }
-
-   # (a) running step が残っていないことを先に確認 (残っていたら abort。
-   #     外部 mutation の結果を失うため、operator が先に片付けるべき)。
-   #     ただしこの SELECT と後段の UPDATE の間に別トランザクションが状態
-   #     を書き換える TOCTOU は残るため、後段の UPDATE 側も条件で守る
-   #     (別 admin の Retry で running に戻った場合に queued step だけ
-   #     canceled 化して operation は running のまま、という壊れ方を防ぐ)。
-   ssh apphost.kisen.one "kubectl -n inucon exec deploy/inucon-portal -- \
-     sqlite3 /data/portal.db \
-       \"SELECT id, status FROM operation_steps \
-          WHERE operation_id='$OP' AND status='running';\""
-   # → 0 行を確認。1 行でも返ったら SQL 実行を中止し §5 / §9 に戻る。
-
-   # (b)+(c) を単一 sqlite3 セッションでトランザクションにまとめる。
-   #        - operations 側の WHERE は `OperationRepo.cancel` と同じ集合
-   #          で、in-flight な `running` は絶対に触らない。
-   #        - operation_steps 側は「operations が canceled になっていれば
-   #          そのときのみ queued を canceled 化」というサブクエリガード
-   #          で TOCTOU を閉じる。operations UPDATE が 0 行だと subquery
-   #          は前状態を返し (`running` / `succeeded` / `canceled` 以外)、
-   #          steps UPDATE も 0 行 no-op に落ちる。この形が
-   #          `OperationRepo.cancel` (operationRepo.ts:623-691) の
-   #          「単一 tx 内で running check + operations UPDATE + steps
-   #          UPDATE」atomicity と等価。
-   ssh apphost.kisen.one "kubectl -n inucon exec -i deploy/inucon-portal -- \
-     sqlite3 /data/portal.db <<'SQL'
-   BEGIN IMMEDIATE;
-   UPDATE operations
-     SET status='canceled', finished_at=$NOW
-     WHERE id='$OP' AND status IN ('queued','failed','blocked');
-   UPDATE operation_steps
-     SET status='failed', finished_at=$NOW,
-         sanitized_error='{\"code\":\"canceled\",\"summary\":\"operation was canceled before this step ran\",\"details\":{}}'
-     WHERE operation_id='$OP' AND status='queued'
-       AND (SELECT status FROM operations WHERE id='$OP') = 'canceled';
-   COMMIT;
-   SELECT id, status, finished_at FROM operations WHERE id='$OP';
-   SELECT ordinal, status FROM operation_steps WHERE operation_id='$OP' ORDER BY ordinal;
-   SQL"
-   ```
-   復帰確認は上の SELECT が `operations.status='canceled'` と、`operation_steps`
-   に `queued` が **1 件も残っていない** ことを示すこと。もし `operations`
-   側の UPDATE が 0 行だった (= `status` が既に `succeeded` / `canceled` /
-   `running`) 場合は operation_steps 側も subquery guard で 0 行になり
-   状態が壊れない。もし SELECT が `running` を返したなら状況が変わって
-   いるので触らず OperationDetail を読み直す。
+2. Operation を **cancel** する (§13「Operation の cancel」)。
 3. cancel が成立すると `idx_operations_single_unfinished` が空になり、
    `contestScheduler` の次 tick で `tickFinalize` (`contestScheduler.ts`
-   70-108 行) が `finish` Operation を enqueue する。tick 周期内 (数十秒)
-   で自動復帰する。
+   70-108 行) が `finish` Operation を enqueue する。tick は 5 秒間隔なので
+   すぐに自動復帰する。
 
 **復帰確認**: Contest 状態が `finalizing → finished` に遷移。Operations
 タブの一覧に新規 `finish` Operation が `succeeded` で載る。Archive
 Operation が enqueue され scoreboard JSON/CSV + DB snapshot artifact が
 生成される。§8 rollout report で SHA-256 を off-host verify。
+
+---
+
+## 13. Operation の cancel
+
+**症状**: prepare / start / finish / cleanup / mode 遷移 / reconciliation
+apply の enqueue が `OperationalContestConflict (409)` ではじかれる。
+ContestAdmin の Operations タブに `failed` / `blocked` の Operation が 1 本
+残っている (誤って enqueue した `queued` の場合もある)。global lock
+(`idx_operations_single_unfinished`、`status NOT IN ('succeeded','canceled')`、
+`portal/src/infrastructure/sql/migrations/0006_operations.ts`) は `failed` /
+`blocked` でも外れない。
+
+**前提の確認**:
+- OperationDetail で失敗 step と summary を読み、先に物理条件を直す必要が
+  あるか判断する (§2 / §5 / §6 / §9)。cancel は Operation を打ち切るだけで、
+  原因は直さない。
+- **`running` は cancel できない** (API は `InvalidOperationTransition (409)`)。
+  worker が step を進め、Operation が `blocked` / `failed` に落ちる (または
+  `succeeded` で終わる) まで待つ。portal pod の再起動などで step の lease
+  (既定 60 秒、`OPERATION_LEASE_DURATION_MILLIS`) が切れても状況は変わらない。
+  `resumeExpired` が戻すのは step だけで、worker は同じ tick でその step を
+  再 claim して再実行する。Operation は `running` のままなので、lease 切れを
+  待っても cancel できるようにはならない。
+
+**cancel で起きること / 起きないこと** (`OperationRepo.cancel`、
+`portal/src/infrastructure/sql/repos/operationRepo.ts`):
+- Operation が `canceled` になって `finished_at` が刻まれ、global lock が外れる。
+- `queued` の step は実行されずに `failed` (sanitizedError の code `canceled`)
+  で閉じる。`succeeded` / `failed` / `blocked` の step はそのまま残る。
+- **実行済み step の外部 resource は巻き戻さない** (Proxmox VM の作成・電源・
+  onboot、Cloudflare DNS / Access / tunnel ingress、ResourceBinding)。必要なら
+  Reconciliation / cleanup / mode 遷移で収束させる。
+- 自動では再開しない。例外は scheduler が自分で積む 3 種で、期限を過ぎて
+  いれば次の tick (5 秒間隔) で積み直す:
+  - `finish`: Contest が running / finalizing で scheduledEndAt を過ぎている。
+  - `revoke_access`: accessClosesAt を過ぎていて、まだ close していない。
+  - `cleanup`: cleanupAt を過ぎていて、まだ完了していない (plan に blocked
+    entry があれば積まない)。
+
+  それ以外は積み直されないので、cancel 後に Admin Web から改めてリクエスト
+  する: enter_contest_mode は Overview の「競技モード切替」、prepare は
+  「インスタンス準備」、start は「開始」、return_normal_mode は「通常モード
+  復帰」、backup は「archive 再生成」、reconcile は Reconciliation タブの
+  「適用」。
+
+**復旧手順**:
+1. Admin Web → ContestAdmin → **Operations** タブから対象 Operation の
+   OperationDetail (`/admin/operations/<operationId>`) を開く。
+2. 画面下の **「Operation の cancel」** で Operation kind、対象 Contest、
+   未完了 step の一覧を確認する。**「影響を確認しました」** に check を入れ、
+   **「Operation を cancel」** を押す。ボタンが出るのは `queued` / `failed` /
+   `blocked` のときだけで、`running` では cancel できない理由だけが出る。
+3. 「状態が変わったため cancel できませんでした」が出たら、確認している間に
+   status が変わっている (例: `queued` を worker が claim した)。表示は最新に
+   更新されるので、`running` になっていれば前提の確認に戻って待つ。
+
+**復帰確認**: OperationDetail の status が「キャンセル」になり、終了時刻が
+入る。step 一覧に「待機中」(queued) が残っていない。次の Operation を
+enqueue しても 409 にならない。
+
+### Admin Web に入れないとき (break-glass)
+
+GitHub OAuth の障害などで Admin Web にログインできず、それでも lock を外す
+必要があるとき (例: §12 の finalizing 詰まりを scheduler に再開させたい)
+**だけ** 使う。portal pod 内の node + better-sqlite3 で、`OperationRepo.cancel`
+と同じ遷移を 1 トランザクションで行う。portal image に `sqlite3` CLI は無い
+(2026-10-01 に本番 pod で実測)。script は `BEGIN IMMEDIATE` で先に write lock
+を取り、その中で status と running step を確かめてから更新する。そのため
+確認から更新までの間に worker が状態を変えることはない。拒否条件は
+`OperationRepo.cancel` と同じ (`queued` / `failed` / `blocked` 以外、または
+running の step がある)。
+
+1. 手元に script を置く (pod には書き込まない。毎回 stdin で渡す):
+
+```sh
+cat > /tmp/inucon-cancel-operation.cjs <<'JS'
+// usage: node - list                 未完了 Operation と step を表示 (read-only)
+//        node - cancel <operationId>  OperationRepo.cancel と同じ遷移を 1 tx で行う
+// pod の cwd は /app。better-sqlite3 は /app/portal/node_modules から解決する。
+const Database = require("node:module").createRequire(`${process.cwd()}/portal/`)("better-sqlite3")
+const [mode, op] = process.argv.slice(2)
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+if (!(mode === "list" || (mode === "cancel" && UUID.test(op ?? "")))) {
+  throw new Error("usage: node - list | node - cancel <operationId (UUID)>")
+}
+const db = new Database(process.env.DB_PATH, { fileMustExist: true, readonly: mode === "list" })
+const show = (id) => {
+  console.log(db.prepare("SELECT id, contest_id, kind, status, finished_at FROM operations WHERE id = ?").get(id))
+  console.table(
+    db
+      .prepare("SELECT ordinal, step_key, status, attempt FROM operation_steps WHERE operation_id = ? ORDER BY ordinal")
+      .all(id)
+  )
+}
+if (mode === "list") {
+  for (const { id } of db.prepare("SELECT id FROM operations WHERE status NOT IN ('succeeded','canceled')").all()) {
+    show(id)
+  }
+} else {
+  const now = Date.now()
+  const result = db
+    .transaction(() => {
+      const row = db.prepare("SELECT status FROM operations WHERE id = ?").get(op)
+      if (row === undefined) return "not found"
+      const runningStep = db
+        .prepare("SELECT 1 FROM operation_steps WHERE operation_id = ? AND status = 'running'")
+        .get(op)
+      if (!["queued", "failed", "blocked"].includes(row.status) || runningStep !== undefined) {
+        return `refused: status=${row.status}${runningStep === undefined ? "" : " (running step あり)"}`
+      }
+      db.prepare(
+        "UPDATE operations SET status = 'canceled', finished_at = ? WHERE id = ? AND status IN ('queued','failed','blocked')"
+      ).run(now, op)
+      db.prepare(
+        "UPDATE operation_steps SET status = 'failed', finished_at = ?, sanitized_error = ? WHERE operation_id = ? AND status = 'queued'"
+      ).run(now, JSON.stringify({ code: "canceled", summary: "operation was canceled before this step ran", details: {} }), op)
+      return "canceled"
+    })
+    .immediate()
+  console.log(result)
+  show(op)
+}
+db.close()
+JS
+```
+
+2. 未完了 Operation を読む (read-only)。表示された `id` を控える:
+
+```sh
+ssh apphost.kisen.one "kubectl -n inucon exec -i deploy/inucon-portal -- node - list" \
+  < /tmp/inucon-cancel-operation.cjs
+```
+
+3. cancel する。`OP` は remote shell の文字列に展開されるので、先に UUID 形式か
+   確かめる (script 側でも確かめる):
+
+```sh
+OP=<operationId>
+printf '%s\n' "$OP" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+  && ssh apphost.kisen.one "kubectl -n inucon exec -i deploy/inucon-portal -- node - cancel $OP" \
+    < /tmp/inucon-cancel-operation.cjs
+```
+
+4. 出力の 1 行目が `canceled` で、続く表示が `status: 'canceled'` と
+   `finished_at` 入りになり、step 表に `queued` が残っていないことを確かめる。
+   `refused: ...` なら何も書き換えていない。状況が変わっているので 2 から
+   読み直す (`running` なら前提の確認に戻って待つ)。`not found` なら id を
+   取り違えている。
 
 ---
 
