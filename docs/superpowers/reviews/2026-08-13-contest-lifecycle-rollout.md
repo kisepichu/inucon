@@ -8,17 +8,19 @@ reconciliation)。本 report は Task 15 Step 12 の deliverable。
 runbook / verification (Task 15 Step 1-3) の完了、および人手フェーズ (Task
 15 Step 4-11) の rollout evidence を残す。
 
-**状態 (2026-10-01):** Step 6 (merge / image import / manifest apply)、
+**状態 (2026-10-02):** Step 6 (merge / image import / manifest apply)、
 Step 7 (benchvm 起動 / agenix 切替 / 旧 token revoke)、Step 8 (突合 +
 archive Operation + off-host verified 化)、Step 9 (reconciliation
 apply)、Step 10 (cleanup + 再監査) が完了し、readiness
-`previous_cleanup` が pass した。**Step 4 / Step 5 は実施できなかった**
-(§B-1 / §B-2 — 値を埋めず「実施せず」として確定)。Step 11 (edition2
-draft) は実開催日程が決まるまで未実施。未実施項目には実行コマンドと期待
-結果を書いてあり、`TBD: <human>` は**人手でまだ実施していない値にのみ**
-残す。
+`previous_cleanup` が pass した。edition2 を Admin Web だけで start まで
+進めるための起動経路 (競技モード切替 / インスタンス準備 / rehearsal /
+Operation cancel) も 2026-10-02 にデプロイした (§B-18)。**Step 4 / Step 5
+は実施できなかった** (§B-1 / §B-2 — 値を埋めず「実施せず」として確定)。
+Step 11 (edition2 draft) は実開催日程が決まるまで未実施。未実施項目には
+実行コマンドと期待結果を書いてあり、`TBD: <human>` は**人手でまだ実施して
+いない値にのみ**残す。
 
-**値の扱い:** 本 report の実測値は 2026-09-22 / 09-23 / 10-01 に実機
+**値の扱い:** 本 report の実測値は 2026-09-22 / 09-23 / 10-01 / 10-02 に実機
 (apphost `192.0.2.20` / eevee `192.0.2.10` / 公開 API
 `http://192.0.2.20:30080`) から取得したもので、各節に再導出コマンドを
 併記した。再導出して値が変わったら、変わったこと自体を追記する。
@@ -221,6 +223,11 @@ operator が実施した結果の記録。
 | 11 | 欠陥 (修復済) | adopt が必要な reconcile apply が Admin Web から必ず `StaleReconciliationPlan` (409) になっていた (PR #82) | §B-16 |
 | 12 | 欠陥 (修復済) | Cleanup Operation を起動するボタンが Admin Web に存在しなかった (PR #82) | §B-16 |
 | 13 | 欠陥 (未発火・修復済) | Proxmox inventory の onBoot が実値によらず常に false と観測され、portal 経由の mode 遷移が onboot を片側しか切り替えない状態だった (PR #81) | §B-17 |
+| 14 | 欠陥 (修復済) | enter_contest_mode と prepare の Operation を起動する経路 (endpoint / UI) が無かった (PR #85) | §B-18 |
+| 15 | 欠陥 (未発火・修復済) | Operation worker が retry 待ちの先行 step を追い越して後続 step を実行しうる状態だった (PR #86) | §B-18 |
+| 16 | 欠陥 (未発火・修復済) | enter_contest_mode / return_normal_mode の memory_check が、目的の VM が既に running でも起動用の空きを要求していた (PR #85 / #88) | §B-18 |
+| 17 | 欠陥 (修復済) | Admin Web に Operation の cancel が無く、runbook の代替手順も portal image に無い `sqlite3` を前提にしていた (PR #87) | §B-18 |
+| 18 | 欠陥 (修復済) | rehearsal を起動する経路が Admin Web に無く、edition2 を start できない状態だった (PR #88) | §B-18 |
 
 逸脱 1・2 は同一原因 (§B-1) で、**値を後から埋めることは原理的に不可能**。
 `TBD: <human>` を残さず「実施せず」と確定させる。
@@ -1568,6 +1575,58 @@ onboot 管理は memory guard の前提 (常にどちらか一方だけ onboot=1
 | 未観測でもショートカットする (4 箇所) | 4 件 |
 | return_normal_mode で未観測を「既に 0」とみなす (独立検証) | 1 件 |
 
+### B-18. edition2 の起動経路の欠落と Operation 基盤の欠陥 (2026-10-01〜02、修復済)
+
+Step 10 の後、edition2 を Admin Web だけで「準備開始 → 競技モード切替 →
+インスタンス準備 → rehearsal → 開始」まで進められるかを確認したところ、
+起動経路の欠落と Operation 基盤の欠陥が見つかった。いずれも本番では
+未発火。
+
+#### 見つけ方
+
+usecase の export のうち、テストを除くコードでコメントを外すと定義行
+以外に参照が無いものを機械的に洗い出した。起動経路の欠落はこの 2 件だけ
+だった: `buildEnterContestModeSteps` (enter_contest_mode) と
+`prepareContest` (prepare)。handler は OperationHandlerRegistry に登録済み
+だったが、enqueue される kind は backup / cleanup / finish /
+return_normal_mode / revoke_access / reconcile / start の 7 つだけだった。
+残りは修正の過程で sub-agent が実測で見つけた。
+
+#### 内容と修正
+
+| PR | 欠陥 | 修正 |
+| --- | --- | --- |
+| #85 | enter_contest_mode / prepare の endpoint と UI が無い | AdminOnly の `POST .../enter-contest-mode` / `POST .../prepare-instances` / `GET .../preparation-plan` と Overview のボタン (影響 VMID / hostname 表示 + 確認 checkbox)。prepare は競技モード (devvm stopped / benchvm running) でなければ `ContestModeNotActive` で拒否し、inventory が読めなければ fail closed。VMID は `modeVmIds.ts`、作成枠は `planPrepareSlots` を server だけが持つ |
+| #86 | `claimNext` は先行 step が blocked / halting-failed のときしか後続を止めず、先行 step が retry 待ち (queued + 未来の `retry_at`) でも後続を渡していた。enter_contest_mode では devvm の shutdown の retry 中に benchvm を起動しうる。finish では job の終了待ちの retry 中に scoreboard / snapshot を書き出し、公式結果が確定前の値になりうる | 先行 step が `succeeded` か `continue_on_error=1` の `failed` で終わるまで後続を渡さない |
+| #85 / #88 | memory_check が目的の VM が既に running でも起動用の空きを要求した。その VM の RAM は node free から引かれ済みなので二重控除になり、押し直すと blocked で global lock を握ったまま後続を止める | enter は benchvm running、return は devvm running なら短絡。後続 step が新たにメモリを確保しないことを step 順で確認してコメントに記載 |
+| #87 | Operation の cancel が Admin Web に無い。global lock は `failed` / `blocked` でも外れない。runbook の代替手順は `sqlite3` CLI を使うが portal image に無い (本番 pod で実測) | AdminOnly の `POST /api/admin/operations/:operationId/cancel` と OperationDetail のボタン (`queued` / `failed` / `blocked` のみ)。break-glass 手順は pod 内の node + better-sqlite3 版に置き換え (`docs/runbooks/contest-recovery.md` §13) |
+| #88 | rehearsal の API はあるが web から呼ぶ経路が無い。rehearsal は start の必須項目 | Overview の「インスタンス準備」と「開始」の間に rehearsal 操作。job 詳細に readiness と同じ合否 (finished かつ passed) を表示 |
+
+各 PR で、修正を巻き戻すと対応するテストが落ちることを確認した
+(claimNext の旧条件 2 件、prepare の競技モード前提 7 件、enter / return の
+短絡各 1 件、cancel の AdminOnly 1 件ほか)。
+
+#### デプロイ (2026-10-02)
+
+release PR #89 → main `1cfa137`。image `sha256:b09443e7…`
+(`b09443e79f216c3184eaacf7f106adb178952c3ea8273980680614be3b042f49`)。
+tarball SHA-256 `ea1ecd1a…` は workstation と apphost で一致。operator の
+import 後に rollout restart し、新 pod の imageID が上記と一致した
+(restart 0)。migration の追加は無い (7 のまま)。
+
+デプロイ後の確認:
+
+| 項目 | 結果 |
+| --- | --- |
+| `/api/health` (LAN / `inucon.kisen.one`) | ok / 200 |
+| 公開 scoreboard | team1 1077 / 910 (不変) |
+| 公開 artifact list | scoreboard / scoreboard_csv のみ (snapshot は出ない) |
+| 新 endpoint 5 本を未認証で叩く | すべて 401 |
+| DB | edition1 `finished` / revision 2 / cleanup 完了、active Instance 0、snapshot `verified`、未完了 Operation 0 |
+| eevee | benchvm running / onboot=1、devvm stopped / onboot=0、`inucon-team-isolation` active、FORWARD DROP ルールあり |
+| runner | benchvm `a2c6b6b`、`bench_ready=1`、heartbeat 1 秒前 |
+| 起動後 5 分のログ | error / defect 0 件 |
+
 ---
 
 ## Section C: 残っている human check / 未解決事項
@@ -1583,7 +1642,7 @@ onboot 管理は memory guard の前提 (常にどちらか一方だけ onboot=1
 | edition1 の archive Operation | operator | readiness 全 pass 後 | **実施済** 2026-10-01、off-host verified 化まで (§B-5-6) |
 | 初回 reconciliation apply | operator | archive 後 | **実施済** 2026-10-01 (§B-6) |
 | cleanup 後の再監査 | operator | reconciliation 後 | **実施済** 2026-10-01、`previous_cleanup` pass (§B-7) |
-| enter contest mode / prepare の起動経路の追加とデプロイ | 実装 → operator (image import) | edition2 の rehearsal 前 | 未実施 (§C-3 #14) |
+| enter contest mode / prepare の起動経路の追加とデプロイ | 実装 → operator (image import) | edition2 の rehearsal 前 | **実施済** 2026-10-02 (rehearsal / Operation cancel も含む、§B-18) |
 | edition2 draft 作成 | operator | 実開催日程の決定後 | 未実施 (§B-8) |
 | edition2 rehearsal で 3 台目の払い出しが memory 判定を通るかの実測 | operator | edition2 preparing 中 | 未実施 (§C-3 #13) |
 | 参加者ブラウザでの実 Access 認証 | operator | edition2 preparing → running の直前 | 未実施 |
@@ -1763,7 +1822,9 @@ read-only な `Bash(...)` 群 / `--disallowedTools "Edit,Write,Agent"`。
 | 11 | Proxmox role / ACL が repo 外 (eevee のローカル状態) にしか無く、Task 14 の分割時に旧 `InuconPortal` から `SDN.Use` / `VM.Config.CDROM` が落ちたことが**どの検証にも引っかからなかった** | §B-13 | `pveum role list` / `pveum acl list` の期待値を `nixos-config-private` 側に置き、`eevee-ops-test.sh` 相当で突合する |
 | 12 | readiness `capacity_estimate` が「team ごとの `instanceQuota` × 4 GiB」で計算しており**チーム数を掛けていない**。複数チームの開催では必要 RAM を過小に見積もる。warn 専用で、実際の安全判定は Task 9 の 1 台ごとの判定 (`PROVISION_MIN_FREE_MEM_BYTES`、既定 5,000,000,000 B) なので過剰に詰め込む害は無い | `readiness.ts` の `capacityEstimateCheck` (`desiredTotal = contest.instanceQuota * estimatedPerVm`)、`domain/contest.ts` の「チームごとのインスタンス上限」 | Σ team の `desiredInstanceCount` × template の割当 RAM で見積もる |
 | 13 | メモリ判定が ZFS ARC (上限 4096 MiB、2026-10-01 実測 3948 MiB) を空きとして数えない。return normal mode の memory_check (node free ≥ 13312 MiB) は現状ほぼ確実に blocked。edition2 計画 (1 チーム × 3 台) の 3 台目も clone 直前の空き 4768 MiB を満たすかが KSM による共有量次第。物理的には 3 台入る | §B-7-1、2026-10-01 の `free -m` / `arcstats` / `pvesh get /nodes/eevee/status` | edition2 の rehearsal で 3 台目が通るかを実測する。通らなければ ARC 上限を下げる (`/sys/module/zfs/parameters/zfs_arc_max`、再起動不要) か `PROVISION_MIN_FREE_MEM_BYTES` を見直す |
-| 14 | enter_contest_mode (Task 8) と prepare (Task 9) の Operation を**起動する経路が無い**。handler・step・テストは実装済みで、OperationHandlerRegistry にも登録されているが、HTTP endpoint・UI・scheduler のどこからも enqueue されない (enqueue される kind は backup / cleanup / finish / return_normal_mode / revoke_access / reconcile / start の 7 つだけ)。edition2 の rehearsal 前に prepare が必須。spec L262 と plan L1199 は mode 切替を operator が確認付きで起動する操作として要求している。あわせて readiness.ts の `PREPARATION_REQUIRED_CHECK_KEYS` / `PREPARATION_BLOCK_KEYS` も参照ゼロ (gate 自体は `beginContestPreparation` が同じトランザクション内で直接判定しているので安全上の穴ではない) | 2026-10-01 のコード走査 (usecase の export のうちコメントを除いたコードで参照が定義行だけのもの: `buildEnterContestModeSteps` / `prepareContest` / 上記 2 定数) | AdminOnly endpoint と Overview のボタン (影響 VMID / hostname 表示 + 確認 checkbox) を追加する。修正は別 PR で進行中 |
+| 14 | ~~enter_contest_mode (Task 8) と prepare (Task 9) の Operation を起動する経路が無い~~ → **修復済** (PR #85、2026-10-02 デプロイ、§B-18)。あわせて rehearsal の起動経路 (PR #88) と Operation の cancel (PR #87) も追加した。readiness.ts の `PREPARATION_REQUIRED_CHECK_KEYS` / `PREPARATION_BLOCK_KEYS` が参照ゼロである点は未対応 (gate 自体は `beginContestPreparation` が同じトランザクション内で直接判定しているので安全上の穴ではない) | 2026-10-01 のコード走査 (usecase の export のうちコメントを除いたコードで参照が定義行だけのもの) | 残る 2 定数は削除するか gate から参照する |
+| 15 | `runner/test/loop.test.ts` の 1-2 件が `pnpm -r test` の並行実行時だけ落ちる (2026-10-01〜02 に 5 回中 2 回など)。runner 単独では通る。固定 500ms の窓で子 node を起動するテストで、負荷で窓を超える | PR #85 / #87 / #88 の検証時の実測 | 窓を固定時間ではなく子プロセスの完了待ちにする |
+| 16 | rehearsal job を Contest 単位で一覧する API が無い。Admin Web の job 詳細へのリンクは enqueue した画面にしか出ず、画面を離れると成功件数は Readiness タブの `rehearsal` 行でしか分からない | PR #88 の sub-agent 報告 | Contest の rehearsal job 一覧 endpoint と表示を追加する |
 
 ---
 
