@@ -1,5 +1,10 @@
 # INUCON
 
+> **アーカイブ**: ISUCON 本番前の練習用に、自宅サーバー (Proxmox) で動かすために作ったものです。
+> 稼働は終了しており、メンテナンスもしていません。自宅の環境 (Proxmox / Cloudflare / 非公開の
+> NixOS 構成) が前提なので、そのままでは他の環境で動きません。公開にあたり、ホスト名・IP・
+> 各種 ID は置き換えています。
+
 INUCON (Isucon aNd Unified Compute Operations Node) は、自宅の Proxmox サーバー上に
 複数チーム参加型の ISUCON 競技環境(ポータル・ベンチマーカー・参加者サーバー払い出し)を
 構築するプロジェクトです。副次目的として、参加者サーバー払い出し層を汎用の「ミニ IaaS」
@@ -8,9 +13,9 @@ INUCON (Isucon aNd Unified Compute Operations Node) は、自宅の Proxmox サ�
 設計の背景・全体アーキテクチャ・フェーズ計画は設計ドキュメントを参照してください:
 [docs/superpowers/specs/2026-07-04-inucon-design.md](docs/superpowers/specs/2026-07-04-inucon-design.md)
 
-## 現状: Phase 3(セルフサービス + 招待自動化)完了・本番稼働中 (2026-07-18)
+## 経緯: Phase 3(セルフサービス + 招待自動化)まで完了 (2026-07-18)
 
-ポータルが https://inucon.kisen.one で稼働しています(GitHub OAuth ログイン)。
+ポータルは https://inucon.kisen.one で稼働していました(GitHub OAuth ログイン。現在は停止済み)。
 
 - **Phase 1**(2026-07-08): Terraform + 手動オペレーションで全インフラ要素を検証
   (問題テンプレート・チーム VM 払い出し・SDN 分離・Cloudflare Tunnel/Access 経由の

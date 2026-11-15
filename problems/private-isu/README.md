@@ -8,7 +8,8 @@ private-isu(Pixiv 社内 ISUCON 2016)の問題テンプレート VM を構築す
 
 | ファイル | 役割 |
 | --- | --- |
-| `user-data.build.yaml` | matsuu の `app.cfg` に qemu-guest-agent(packages 追加 + runcmd 先頭で enable --now)を統合した cloud-config |
+| `user-data.build.yaml` | matsuu の `app.cfg` に qemu-guest-agent(packages 追加 + runcmd 先頭で enable --now)を統合した cloud-config。元の `app.cfg` は MIT License(Copyright (c) 2022 MATSUU Takuto、全文は `LICENSE.cloud-init-isucon`) |
+| `LICENSE.cloud-init-isucon` | matsuu/cloud-init-isucon の LICENSE(MIT)の写し |
 | `build-template.sh` | eevee 上で実行。tpl-ubuntu-noble (9000) を full clone して 9100 を作り、cloud-init 完了までポーリング |
 | `patch-app.sh` | eevee 上で実行。ベンチ失敗の恒久修正(下記)を nginx 設定へ適用して reload。冪等 |
 | `finalize-template.sh` | eevee 上で実行。cloud-init clean 等のクリーンアップ後にテンプレート化 |
